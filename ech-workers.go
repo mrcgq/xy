@@ -1,4 +1,4 @@
-// ech-workers.exe 内核代码 (最终智能分流单文件版 - 兼容 v2ray-core v4 路由引擎)
+// ech-workers.exe 内核代码 (最终智能分流单文件版 - 兼容 v2ray-core/v5 最新 API)
 package main
 
 import (
@@ -24,21 +24,27 @@ import (
 
 	"github.com/gorilla/websocket"
 	
-	// --- 全新的、稳定的 v4 路由库依赖 ---
-	"github.com/v2fly/v2ray-core/v4/app/dispatcher"
-	"github.com/v2fly/v2ray-core/v4/app/proxyman"
-	router "github.com/v2fly/v2ray-core/v4/app/router/router"
-	"github.com/v2fly/v2ray-core/v4/common/net"
-	"github.com/v2fly/v2ray-core/v4/common/session"
-	"github.com/v2fly/v2ray-core/v4/features/routing"
-	// v4 的 geodata 加载器
-	_ "github.com/v2fly/v2ray-core/v4/infra/conf/geodata/standard"
+	// --- v5 路由库依赖 ---
+	core "github.com/v2fly/v2ray-core/v5"
+	"github.com/v2fly/v2ray-core/v5/app/router"
+	v2net "github.com/v2fly/v2ray-core/v5/common/net"
+	"github.com/v2fly/v2ray-core/v5/features/routing"
+	"github.com/v2fly/v2ray-core/v5/infra/conf/geodata"
 )
 
 //go:embed geoip.dat
 var geoipBytes []byte
 //go:embed geosite.dat
 var geositeBytes []byte
+
+// --- 自定义内存加载器 (v5 兼容版) ---
+type memoryLoader struct{}
+func (l *memoryLoader) LoadGeoIP(code string, path string) (*router.GeoIP, error) {
+	return router.LoadGeoIPFromBytes(geoipBytes)
+}
+func (l *memoryLoader) LoadGeosite(code string, path string) (*router.GeoSite, error) {
+	return router.LoadGeositeFromBytes(geositeBytes)
+}
 
 
 var (
@@ -57,69 +63,60 @@ func init() {
 	flag.StringVar(&echDomain, "ech", "cloudflare-ech.com", "ECH 查询域名")
 }
 
-// --- 基于 v4 API 重写的路由初始化函数 ---
+// --- 基于 v5 最新 API 重写的路由初始化函数 ---
 func initRouter() error {
 	if len(geoipBytes) == 0 || len(geositeBytes) == 0 {
 		return errors.New("嵌入的路由规则文件为空")
 	}
+
+	geodata.SetGeoDataLoader(&memoryLoader{})
 	
-	// v4 的路由配置方式
 	config := &router.Config{
-		DomainStrategy: router.Config_IpIfNonMatch,
+		DomainStrategy: router.DomainStrategy_IpIfNonMatch,
 		Rule: []*router.RoutingRule{
 			{
-				Geoip: []*router.GeoIP{
-					{CountryCode: "cn", AssetPath: "geoip.dat", Data: geoipBytes},
-				},
-				TargetTag: &router.RoutingRule_Tag{Tag: "direct"},
+				Geoip: []*router.GeoIP{{Code: "cn"}},
+				TargetTag: &router.RouteTarget{Tag: "direct"},
 			},
 			{
-				Geosite: []*router.GeoSite{
-					{CountryCode: "cn", AssetPath: "geosite.dat", Data: geositeBytes},
-				},
-				TargetTag: &router.RoutingRule_Tag{Tag: "direct"},
+				Geosite: []*router.Geosite{{Code: "cn"}},
+				TargetTag: &router.RouteTarget{Tag: "direct"},
 			},
 		},
 	}
 	
-	r, err := router.New(context.Background(), config)
-	if err != nil {
-		return fmt.Errorf("创建 v4 路由引擎失败: %w", err)
-	}
+	r, err := core.CreateObject(context.Background(), config)
+	if err != nil { return fmt.Errorf("创建 v5 路由引擎失败: %w", err) }
 	
-	routerInstance = r
-	log.Println("[路由] v4 嵌入式路由引擎初始化成功，已加载 CN 分流规则")
+	routerInstance = r.(routing.Router)
+	log.Println("[路由] v5 嵌入式路由引擎初始化成功，已加载 CN 分流规则")
 	return nil
 }
 
-// --- 基于 v4 API 重写的路由决策函数 ---
+// --- 基于 v5 最新 API 重写的路由决策函数 ---
 func shouldProxy(target string) bool {
 	if routerInstance == nil { return true }
 	
-	host, portStr, _ := net.SplitHostPort(target)
-	if host == "" { host = target }
+	host, portStr, _ := net.SplitHostPort(target); if host == "" { host = target }
+	port, _ := v2net.PortFromString(portStr); if port == 0 { port = 80 }
 	
-	port, _ := net.PortFromString(portStr)
-	if port == 0 { port = 80 }
-	
-	dest := net.Destination{Network: net.Network_TCP}
+	var dest v2net.Destination
 	ip := net.ParseIP(host)
 	if ip != nil {
-		dest.Address = net.IPAddress(ip)
+		dest = v2net.UDPDestination(v2net.IPAddress(ip), port)
 	} else {
-		dest.Address = net.DomainAddress(host)
+		dest = v2net.UDPDestination(v2net.DomainAddress(host), port)
 	}
-	dest.Port = port
 	
-	// v4 使用 session.Context
-	ctx := session.ContextWithOutbound(context.Background(), &session.Outbound{Target: dest})
+	ctx := routing.ContextWithDestination(context.Background(), dest)
 	
-	tag, err := routerInstance.PickRoute(ctx)
+	route, err := routerInstance.PickRoute(ctx)
 	if err != nil { return true }
 	
-	return tag != "direct"
+	return route.GetTag() != "direct"
 }
 
+// (后续所有代码与之前版本完全相同，无需修改)
 func pipeConnections(client, target net.Conn) { defer client.Close(); defer target.Close(); var wg sync.WaitGroup; wg.Add(2); go func() { defer wg.Done(); io.Copy(target, client) }(); go func() { defer wg.Done(); io.Copy(client, target) }(); wg.Wait() }
 func main() { flag.Parse(); if serverAddr == "" { log.Fatal("必须指定服务端地址 -f") }; if err := initRouter(); err != nil { log.Printf("[路由] 警告: %v", err); log.Printf("[路由] 所有流量将默认通过代理。") }; log.Printf("[启动] 正在获取 ECH 配置 (双轨模式)..."); if err := prepareECH(); err != nil { log.Fatalf("[启动] 所有 ECH 配置获取方式均失败: %v", err) }; runProxyServer(listenAddr) }
 func handleSOCKS5(conn net.Conn, clientAddr string, firstByte byte) { if firstByte != 0x05 { return }; buf := make([]byte, 1); if _, err := io.ReadFull(conn, buf); err != nil { return }; nmethods := buf[0]; methods := make([]byte, nmethods); if _, err := io.ReadFull(conn, methods); err != nil { return }; if _, err := conn.Write([]byte{0x05, 0x00}); err != nil { return }; buf = make([]byte, 4); if _, err := io.ReadFull(conn, buf); err != nil { return }; if buf[0] != 5 { return }; command := buf[1]; atyp := buf[3]; var host string; switch atyp { case 0x01: buf = make([]byte, 4); if _, err := io.ReadFull(conn, buf); err != nil { return }; host = net.IP(buf).String(); case 0x03: buf = make([]byte, 1); if _, err := io.ReadFull(conn, buf); err != nil { return }; domainBuf := make([]byte, buf[0]); if _, err := io.ReadFull(conn, domainBuf); err != nil { return }; host = string(domainBuf); case 0x04: buf = make([]byte, 16); if _, err := io.ReadFull(conn, buf); err != nil { return }; host = net.IP(buf).String(); default: conn.Write([]byte{0x05, 0x08, 0, 1, 0, 0, 0, 0, 0, 0}); return }; buf = make([]byte, 2); if _, err := io.ReadFull(conn, buf); err != nil { return }; port := int(buf[0])<<8 | int(buf[1]); var target string; if atyp == 0x04 { target = fmt.Sprintf("[%s]:%d", host, port) } else { target = fmt.Sprintf("%s:%d", host, port) }; if command != 0x01 { conn.Write([]byte{0x05, 0x07, 0, 1, 0, 0, 0, 0, 0, 0}); return }; if !shouldProxy(target) { log.Printf("[分流] SOCKS5 直连 -> %s", target); targetConn, err := net.DialTimeout("tcp", target, 5*time.Second); if err != nil { conn.Write([]byte{0x05, 0x04, 0, 1, 0, 0, 0, 0, 0, 0}); return }; defer targetConn.Close(); conn.Write([]byte{0x05, 0, 0, 1, 0, 0, 0, 0, 0, 0}); pipeConnections(conn, targetConn); return }; log.Printf("[分流] SOCKS5 代理 -> %s", target); if err := handleTunnel(conn, target, clientAddr, 1, nil); err != nil { if !isNormalCloseError(err) { log.Printf("[SOCKS5] %s 代理失败: %v", clientAddr, err) } } }
