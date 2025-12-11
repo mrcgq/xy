@@ -13,17 +13,19 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 步骤2: 设置 Go 语言环境 (!!! 核心修复 !!!)
+      # 步骤2: 设置 Go 语言环境
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          # 升级到 1.25，以满足新版 xray-core 依赖的要求
-          go-version: '1.25'
+          # 使用 1.23 即可，xray-core v1.8.11 不需要更高版本
+          go-version: '1.23'
 
-      # 步骤3: 初始化 Go 模块并下载依赖 (恢复为标准流程)
-      - name: Initialize and Tidy Go Modules
+      # 步骤3: 初始化并强制锁定依赖版本 (最终修复)
+      - name: Initialize and Force Dependency Version
         run: |
           go mod init github.com/your-repo/ech-workers
+          # 关键修复：使用 replace 强制锁定 xray-core 版本
+          echo "replace github.com/xtls/xray-core => github.com/xtls/xray-core v1.8.11" >> go.mod
           go mod tidy
 
       # 步骤4: 编译 Windows 可执行文件
