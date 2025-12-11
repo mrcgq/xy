@@ -1,18 +1,15 @@
-# 工作流名称，可以自己取
-name: Manual Build ech-workers.exe
+# 工作流名称
+name: Build ECH Workers (with Routing Rules)
 
-# 触发条件：只允许手动触发
 on:
   workflow_dispatch:
 
 jobs:
-  build:
-    # 使用最新的 ubuntu 虚拟环境来执行任务
+  build-windows-package:
     runs-on: ubuntu-latest
 
     steps:
       # 步骤1: 检出代码
-      # 即使是手动触发，也需要先检出你想要编译的那个版本的代码
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -20,29 +17,33 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.23' # ECH 功能需要 Go 1.23+
 
-      # 步骤3: 初始化 Go 模块 (如果 go.mod 不存在)
-      - name: Initialize Go module
-        run: go mod init github.com/soha0219/ech-s2
+      # 步骤3: 初始化 Go 模块并下载依赖
+      - name: Initialize and Tidy Go Modules
+        run: |
+          # 初始化模块 (如果 go.mod 不存在)
+          go mod init github.com/your-repo/ech-workers || true
+          # 自动整理和下载依赖
+          go mod tidy
 
-      # 步骤4: 自动整理和下载依赖
-      # Actions 的服务器网络很好，可以直接运行 go mod tidy
-      - name: Tidy and download dependencies
-        run: go mod tidy
-
-      # 步骤5: 编译 Windows 可执行文件
-      # GOOS=windows 告诉编译器目标是 Windows
-      # -o ech-workers.exe 指定输出文件名为 ech-workers.exe
-      # ./ech-workers.go 指定要编译的源文件
+      # 步骤4: 编译 Windows 可执行文件
       - name: Build Windows executable
         run: GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o ech-workers.exe ./ech-workers.go
 
-      # 步骤6: 上传编译好的 .exe 文件作为产物
-      - name: Upload Artifact
+      # 步骤5: 下载最新的路由规则文件
+      - name: Download routing assets
+        run: |
+          echo "Downloading latest geoip.dat and geosite.dat..."
+          curl -L -o geoip.dat https://github.com/loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat
+          curl -L -o geosite.dat https://github.com/loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
+
+      # 步骤6: 上传包含所有文件的完整软件包
+      - name: Upload full package as artifact
         uses: actions/upload-artifact@v4
         with:
-          # 上传的压缩包名字
-          name: ech-workers-binary
-          # 要上传的文件路径
-          path: ech-workers.exe
+          name: ech-workers-full-package-windows
+          path: |
+            ech-workers.exe
+            geoip.dat
+            geosite.dat
