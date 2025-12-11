@@ -116,45 +116,28 @@ const (
 
 func runProxyServer(addr string) {
 	l, err := net.Listen("tcp", addr)
-	if err != nil {
-		log.Fatalf("监听失败: %v", err)
-	}
-	log.Printf("[服务] 监听地址: %s", addr)
-	log.Printf("[服务] 后端服务器: %s", serverAddr)
-	for {
-		conn, err := l.Accept()
-		if err == nil {
-			go handleConnection(conn)
-		}
-	}
+	if err != nil { log.Fatalf("监听失败: %v", err) }
+	log.Printf("[服务] 监听地址: %s", addr); log.Printf("[服务] 后端服务器: %s", serverAddr)
+	for { conn, err := l.Accept(); if err == nil { go handleConnection(conn) } }
 }
 
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
-	buf := make([]byte, 1)
-	if _, err := conn.Read(buf); err != nil {
-		return
-	}
 	clientAddr := conn.RemoteAddr().String()
+	buf := make([]byte, 1); if _, err := conn.Read(buf); err != nil { return }
 	switch buf[0] {
-	case 0x05:
-		handleSOCKS5(conn, clientAddr)
-	case 'C', 'G', 'P', 'H', 'D', 'O', 'T':
-		handleHTTP(conn, clientAddr, buf[0])
-	default:
-		log.Printf("[代理] %s 未知协议: 0x%02x", clientAddr, buf[0])
+	case 0x05: handleSOCKS5(conn, clientAddr)
+	case 'C', 'G', 'P', 'H', 'D', 'O', 'T': handleHTTP(conn, clientAddr, buf[0])
+	default: log.Printf("[代理] %s 未知协议: 0x%02x", clientAddr, buf[0])
 	}
 }
 
 func handleSOCKS5(conn net.Conn, clientAddr string) {
-	if _, err := conn.Read(make([]byte, 1)); err != nil { return } // nmethods
-	if _, err := conn.Read(make([]byte, 1)); err != nil { return } // methods
+	if _, err := conn.Read(make([]byte, 1)); err != nil { return }
+	if _, err := conn.Read(make([]byte, 1)); err != nil { return }
 	if _, err := conn.Write([]byte{0x05, 0x00}); err != nil { return }
-
-	header := make([]byte, 4)
-	if _, err := io.ReadFull(conn, header); err != nil { return }
-	cmd, atyp := header[1], header[3]
-	var host string
+	header := make([]byte, 4); if _, err := io.ReadFull(conn, header); err != nil { return }
+	cmd, atyp := header[1], header[3]; var host string
 	switch atyp {
 	case 1: b := make([]byte, 4); io.ReadFull(conn, b); host = net.IP(b).String()
 	case 3: b := make([]byte, 1); io.ReadFull(conn, b); d := make([]byte, b[0]); io.ReadFull(conn, d); host = string(d)
@@ -163,24 +146,21 @@ func handleSOCKS5(conn net.Conn, clientAddr string) {
 	}
 	portBytes := make([]byte, 2); io.ReadFull(conn, portBytes); port := binary.BigEndian.Uint16(portBytes)
 	target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
-
 	switch cmd {
 	case 0x01: // CONNECT
 		log.Printf("[SOCKS5] %s -> %s", clientAddr, target)
 		if err := handleTunnel(conn, target, nil, modeSOCKS5); err != nil {
 			log.Printf("[SOCKS5] %s 代理失败: %v", clientAddr, err)
 		}
-	case 0x03: // UDP ASSOCIATE (Feature restored)
+	case 0x03: // UDP ASSOCIATE
 		handleUDPAssociate(conn, clientAddr)
-	default:
-		conn.Write([]byte{5, 7, 0, 1, 0, 0, 0, 0, 0, 0})
+	default: conn.Write([]byte{5, 7, 0, 1, 0, 0, 0, 0, 0, 0})
 	}
 }
 
 func handleHTTP(conn net.Conn, clientAddr string, firstByte byte) {
 	reader := bufio.NewReader(io.MultiReader(bytes.NewReader([]byte{firstByte}), conn))
 	req, err := http.ReadRequest(reader); if err != nil { return }
-
 	if req.Method == "CONNECT" {
 		log.Printf("[HTTP] %s -> CONNECT %s", clientAddr, req.Host)
 		if err := handleTunnel(conn, req.Host, nil, modeHTTPConnect); err != nil {
@@ -195,78 +175,80 @@ func handleHTTP(conn net.Conn, clientAddr string, firstByte byte) {
 	}
 }
 
-// Correct handleTunnel logic
+// 【【【最终修复的关键函数】】】
 func handleTunnel(clientConn net.Conn, target string, firstFrame []byte, mode int) error {
 	host, _, _ := net.SplitHostPort(target); if host == "" { host = target }
-
 	if shouldBypassProxy(host) {
 		log.Printf("[分流] %s 直连", target)
 		return startDirect(clientConn, target, firstFrame, mode)
 	}
-
-	wsConn, err := dialWebSocketWithECH(2); if err != nil {
-		sendErrorResponse(clientConn, mode); return err
-	}
+	wsConn, err := dialWebSocketWithECH(2); if err != nil { sendErrorResponse(clientConn, mode); return err }
 	defer wsConn.Close()
-
 	connectMsg := fmt.Sprintf("CONNECT:%s|%s", target, base64.StdEncoding.EncodeToString(firstFrame))
-	if err := wsConn.WriteMessage(websocket.TextMessage, []byte(connectMsg)); err != nil {
-		sendErrorResponse(clientConn, mode); return err
-	}
-	_, msg, err := wsConn.ReadMessage(); if err != nil || string(msg) != "CONNECTED" {
-		sendErrorResponse(clientConn, mode); return fmt.Errorf("握手失败: %s", string(msg))
-	}
-
-	if err := sendSuccessResponse(clientConn, mode); err != nil {
-		return err
-	}
+	if err := wsConn.WriteMessage(websocket.TextMessage, []byte(connectMsg)); err != nil { sendErrorResponse(clientConn, mode); return err }
+	_, msg, err := wsConn.ReadMessage(); if err != nil || string(msg) != "CONNECTED" { sendErrorResponse(clientConn, mode); return fmt.Errorf("握手失败: %s", string(msg)) }
+	if err := sendSuccessResponse(clientConn, mode); err != nil { return err }
 	log.Printf("[代理] %s 已连接", target)
 
-	var wg sync.WaitGroup; wg.Add(2)
-	go func() { defer wg.Done(); io.Copy(wsConn, clientConn) }()
-	go func() { defer wg.Done(); io.Copy(clientConn, wsConn) }()
-	wg.Wait()
+	// 使用正确的手动循环，而不是 io.Copy
+	done := make(chan bool, 2)
+	go func() {
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := clientConn.Read(buf)
+			if err != nil {
+				wsConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+				done <- true; return
+			}
+			if err := wsConn.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
+				done <- true; return
+			}
+		}
+	}()
+	go func() {
+		for {
+			_, msg, err := wsConn.ReadMessage()
+			if err != nil {
+				clientConn.Close()
+				done <- true; return
+			}
+			if _, err := clientConn.Write(msg); err != nil {
+				done <- true; return
+			}
+		}
+	}()
+	<-done
 	log.Printf("[代理] %s 已断开", target)
 	return nil
 }
 
 func startDirect(clientConn net.Conn, target string, firstFrame []byte, mode int) error {
-	remote, err := net.DialTimeout("tcp", target, 5*time.Second); if err != nil {
-		sendErrorResponse(clientConn, mode); return err
-	}
+	remote, err := net.DialTimeout("tcp", target, 5*time.Second); if err != nil { sendErrorResponse(clientConn, mode); return err }
 	defer remote.Close()
-	if err := sendSuccessResponse(clientConn, mode); err != nil {
-		return err
-	}
+	if err := sendSuccessResponse(clientConn, mode); err != nil { return err }
 	if len(firstFrame) > 0 { remote.Write(firstFrame) }
-	var wg sync.WaitGroup; wg.Add(2)
-	go func() { defer wg.Done(); io.Copy(remote, clientConn) }()
-	go func() { defer wg.Done(); io.Copy(clientConn, remote) }()
-	wg.Wait()
+	done := make(chan bool, 2)
+	go func() { io.Copy(remote, clientConn); done <- true }()
+	go func() { io.Copy(clientConn, remote); done <- true }()
+	<-done
 	return nil
 }
 
 func sendErrorResponse(conn net.Conn, mode int) {
 	switch mode {
-	case modeSOCKS5, modeHTTPConnect:
-		conn.Write([]byte{5, 1, 0, 1, 0, 0, 0, 0, 0, 0})
-	case modeHTTPProxy:
-		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+	case modeSOCKS5, modeHTTPConnect: conn.Write([]byte{5, 1, 0, 1, 0, 0, 0, 0, 0, 0})
+	case modeHTTPProxy: conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 	}
 }
 
 func sendSuccessResponse(conn net.Conn, mode int) error {
+	var err error
 	switch mode {
-	case modeSOCKS5:
-		_, err := conn.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
-		return err
-	case modeHTTPConnect:
-		_, err := conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-		return err
-	case modeHTTPProxy:
-		return nil // No response, just forward
+	case modeSOCKS5: _, err = conn.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
+	case modeHTTPConnect: _, err = conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	case modeHTTPProxy: return nil
 	}
-	return nil
+	return err
 }
 
 // UDP feature restored
@@ -282,10 +264,8 @@ func handleUDPAssociate(tcpConn net.Conn, clientAddr string) {
 		go processUDP(udpConn, addr, buf[:n], clientAddr)
 	}
 }
-
 func processUDP(conn *net.UDPConn, clientAddr *net.UDPAddr, data []byte, tcpClientAddr string) {
-	if len(data) < 6 || data[2] != 0 { return }
-	pos := 3; atyp := data[pos]; pos++; var host string
+	if len(data) < 6 || data[2] != 0 { return }; pos := 3; atyp := data[pos]; pos++; var host string
 	switch atyp {
 	case 1: host = net.IP(data[pos : pos+4]).String(); pos += 4
 	case 3: host = string(data[pos+1 : pos+1+int(data[pos])]); pos += 1 + int(data[pos])
@@ -301,7 +281,6 @@ func processUDP(conn *net.UDPConn, clientAddr *net.UDPAddr, data []byte, tcpClie
 		}()
 	}
 }
-
 func queryDoHForProxy(dnsQuery []byte) ([]byte, error) {
 	echBytes, err := getECHList(); if err != nil { return nil, err }; tlsCfg, _ := buildTLSConfigWithECH("cloudflare-dns.com", echBytes); tr := &http.Transport{TLSClientConfig: tlsCfg}
 	if serverIP != "" { tr.DialContext = func(ctx context.Context, n, a string) (net.Conn, error) { _, p, _ := net.SplitHostPort(a); return net.DialTimeout(n, net.JoinHostPort(serverIP, p), 10*time.Second) } }
