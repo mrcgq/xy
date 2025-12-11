@@ -1,3 +1,4 @@
+
 package main
 
 import (
@@ -92,13 +93,10 @@ const typeHTTPS = 65
 
 func getExeDir() string {
 	exePath, err := os.Executable()
-	if err != nil {
-		return "."
-	}
+	if err != nil { return "." }
 	return filepath.Dir(exePath)
 }
 
-// [修改] 强制 IPv4 下载的 HTTP Client
 var httpClient = &http.Client{
 	Timeout: 30 * time.Second,
 	Transport: &http.Transport{
@@ -106,7 +104,7 @@ var httpClient = &http.Client{
 			return (&net.Dialer{
 				Timeout:   15 * time.Second,
 				KeepAlive: 30 * time.Second,
-			}).DialContext(ctx, "tcp4", addr) // 强制使用 IPv4
+			}).DialContext(ctx, "tcp4", addr)
 		},
 	},
 }
@@ -114,7 +112,15 @@ var httpClient = &http.Client{
 func prepareECH() error { var echBase64 string; var err error; if dnsWorker != "" { echBase64, err = queryHTTPSRecord(echDomain, dnsWorker); if err == nil && echBase64 != "" { goto Decode }; log.Printf("[ECH] 首选源失败: %v...", err) }; if dnsPublic != "" { echBase64, err = queryHTTPSRecord(echDomain, dnsPublic); if err != nil { return err }; if echBase64 == "" { return errors.New("备用源未返回 ECH") } } else { return errors.New("未配置 ECH 获取源") }; Decode: raw, err := base64.StdEncoding.DecodeString(echBase64); if err != nil { return err }; echListMu.Lock(); echList = raw; echListMu.Unlock(); log.Printf("[ECH] 配置已加载，长度: %d 字节", len(raw)); return nil }
 func getECHList() ([]byte, error) { echListMu.RLock(); defer echListMu.RUnlock(); if len(echList) == 0 { return nil, errors.New("ECH 配置为空") }; return echList, nil }
 func refreshECH() { if err := prepareECH(); err != nil { log.Printf("[警告] ECH 刷新失败: %v", err) } }
-func queryHTTPSRecord(domain, dnsServer string) (string, error) { if !strings.HasPrefix(dnsServer, "https://") && !strings.HasPrefix(dnsServer, "http://") { dnsServer = "https://" + dnsServer }; return queryDoH(domain, dohURL) }
+
+// 【【【已修复】】】
+func queryHTTPSRecord(domain, dnsServer string) (string, error) { 
+    if !strings.HasPrefix(dnsServer, "https://") && !strings.HasPrefix(dnsServer, "http://") { 
+        dnsServer = "https://" + dnsServer 
+    }
+    return queryDoH(domain, dnsServer) // 使用正确的 dnsServer 变量
+}
+
 func queryDoH(domain, dohURL string) (string, error) { u, err := url.Parse(dohURL); if err != nil { return "", err }; dnsQuery := buildDNSQuery(domain, typeHTTPS); q := u.Query(); q.Set("dns", base64.RawURLEncoding.EncodeToString(dnsQuery)); u.RawQuery = q.Encode(); req, err := http.NewRequest("GET", u.String(), nil); if err != nil { return "", err }; req.Header.Set("Accept", "application/dns-message"); resp, err := httpClient.Do(req); if err != nil { return "", err }; defer resp.Body.Close(); if resp.StatusCode != http.StatusOK { return "", fmt.Errorf("HTTP %d", resp.StatusCode) }; body, err := io.ReadAll(resp.Body); if err != nil { return "", err }; return parseDNSResponse(body) }
 func buildDNSQuery(domain string, qtype uint16) []byte { var q []byte; q = append(q, []byte{0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0} ...); for _, label := range strings.Split(domain, ".") { q = append(q, byte(len(label))); q = append(q, label...) }; q = append(q, 0); q = binary.BigEndian.AppendUint16(q, qtype); q = binary.BigEndian.AppendUint16(q, 1); return q }
 func parseDNSResponse(r []byte) (string, error) { if len(r) < 12 || binary.BigEndian.Uint16(r[6:8]) == 0 { return "", errors.New("无应答记录") }; offset := 12; for r[offset] != 0 { offset += int(r[offset]) + 1 }; offset += 5; for { if offset+10 > len(r) { break }; offset += 2; if r[offset-2]&0xC0 == 0xC0 { } else { for r[offset-1] != 0 { offset += int(r[offset-1]) + 1 } }; rrType := binary.BigEndian.Uint16(r[offset : offset+2]); offset += 8; dataLen := binary.BigEndian.Uint16(r[offset : offset+2]); offset += 2; if offset+int(dataLen) > len(r) { break }; data := r[offset : offset+int(dataLen)]; offset += int(dataLen); if rrType == typeHTTPS { if ech := parseHTTPSRecord(data); ech != "" { return ech, nil } } }; return "", errors.New("未找到HTTPS记录") }
@@ -122,12 +128,12 @@ func parseHTTPSRecord(data []byte) string { if len(data) < 2 { return "" }; offs
 func buildTLSConfigWithECH(serverName string, echList []byte) (*tls.Config, error) { roots, err := x509.SystemCertPool(); if err != nil { return nil, err }; config := &tls.Config{MinVersion: tls.VersionTLS13, ServerName: serverName, RootCAs: roots}; v := reflect.ValueOf(config).Elem(); f := v.FieldByName("EncryptedClientHelloConfigList"); if !f.IsValid() || !f.CanSet() { return nil, errors.New("不支持 ECH") }; f.Set(reflect.ValueOf(echList)); return config, nil }
 func loadChinaLists() { if err := loadIPList("chn_ip.txt", &chinaIPRanges, &chinaIPRangesMu, false); err == nil { chinaIPRangesMu.RLock(); log.Printf("[IP库] 已加载 %d 个 IPv4 段", len(chinaIPRanges)); chinaIPRangesMu.RUnlock() } else { log.Printf("[警告] 加载 IPv4 列表失败: %v", err) }; if err := loadIPList("chn_ip_v6.txt", &chinaIPV6Ranges, &chinaIPV6RangesMu, true); err == nil { chinaIPV6RangesMu.RLock(); log.Printf("[IP库] 已加载 %d 个 IPv6 段", len(chinaIPV6Ranges)); chinaIPV6RangesMu.RUnlock() } else { log.Printf("[警告] 加载 IPv6 列表失败: %v", err) } }
 func loadIPList(filename string, target interface{}, mu *sync.RWMutex, isV6 bool) error { 
-	filePath := filepath.Join(getExeDir(), filename)
+	filePath := filepath.Join(getExeDir(), filename);
 	if _, err := os.Stat(filePath); os.IsNotExist(err) { 
 		url := "https://mirror.ghproxy.com/https://raw.githubusercontent.com/mayaxcn/china-ip-list/master/" + filename; log.Printf("[下载] 正在下载 IP 列表: %s", filename); 
 		if err := downloadFile(url, filePath); err != nil { return err } 
 	}
-	file, err := os.Open(filePath); if err != nil { return err }; defer file.Close()
+	file, err := os.Open(filePath); if err != nil { return err }; defer file.Close();
 	var rangesV4 []ipRange; var rangesV6 []ipRangeV6; scanner := bufio.NewScanner(file); for scanner.Scan() { parts := strings.Fields(scanner.Text()); if len(parts) < 2 { continue }; startIP, endIP := net.ParseIP(parts[0]), net.ParseIP(parts[1]); if startIP == nil || endIP == nil { continue }; if isV6 { var s, e [16]byte; copy(s[:], startIP.To16()); copy(e[:], endIP.To16()); rangesV6 = append(rangesV6, ipRangeV6{start: s, end: e}) } else { s, e := ipToUint32(startIP), ipToUint32(endIP); if s > 0 && e > 0 { rangesV4 = append(rangesV4, ipRange{start: s, end: e}) } } }; mu.Lock(); defer mu.Unlock(); if isV6 { reflect.ValueOf(target).Elem().Set(reflect.ValueOf(rangesV6)) } else { reflect.ValueOf(target).Elem().Set(reflect.ValueOf(rangesV4)) }; return nil 
 }
 func downloadFile(url, path string) error { resp, err := httpClient.Get(url); if err != nil { return err }; defer resp.Body.Close(); if resp.StatusCode != 200 { return fmt.Errorf("HTTP status %d", resp.StatusCode) }; data, err := io.ReadAll(resp.Body); if err != nil { return err }; return os.WriteFile(path, data, 0644) }
