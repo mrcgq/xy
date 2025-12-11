@@ -26,7 +26,11 @@ jobs:
           curl -L -o geoip.dat https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
           curl -L -o geosite.dat https://github.com/v2fly/domain-list-community/releases/latest/download/geosite.dat
 
-      # 步骤4: 下载 Go 模块 (go mod download 会严格遵循 go.mod)
+      # ⭐ 修复 google/pprof 失效版本（必须加）
+      - name: Fix broken pprof version
+        run: go get github.com/google/pprof@v0.0.0-20240308175358-30a5e420f0f2
+
+      # 步骤4: 下载 Go 模块
       - name: Download Go Modules
         run: go mod download
 
