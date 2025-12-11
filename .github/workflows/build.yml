@@ -1,5 +1,5 @@
 # 工作流名称
-name: Build Single-File ECH Workers with Embedded Routing (v5 Engine)
+name: Build Single-File ECH Workers (Final)
 
 on:
   workflow_dispatch:
@@ -9,28 +9,26 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 步骤1: 检出代码
+      # 步骤1: 检出代码 (包含 go.mod)
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 步骤2: 设置 Go 语言环境 (升级以兼容 v5 库)
+      # 步骤2: 设置 Go 语言环境
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22' # v5 库在 1.22 上稳定
+          go-version: '1.22'
 
-      # 步骤3: 下载路由规则文件 (必须在编译前完成)
+      # 步骤3: 下载路由规则文件
       - name: Download routing assets for embedding
         run: |
           echo "Downloading latest geoip.dat and geosite.dat..."
           curl -L -o geoip.dat https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
           curl -L -o geosite.dat https://github.com/v2fly/domain-list-community/releases/latest/download/geosite.dat
 
-      # 步骤4: 初始化 Go 模块并整理依赖 (标准流程)
-      - name: Initialize and Tidy Go Modules
-        run: |
-          go mod init github.com/your-repo/ech-workers-v5
-          go mod tidy
+      # 步骤4: 下载 Go 模块 (go mod download 会严格遵循 go.mod)
+      - name: Download Go Modules
+        run: go mod download
 
       # 步骤5: 编译 Windows 可执行文件
       - name: Build Windows executable with embedded assets
