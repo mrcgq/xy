@@ -1,5 +1,5 @@
 # 工作流名称
-name: Build Single-File ECH Workers with Embedded Routing
+name: Build Single-File ECH Workers with Embedded Routing (v4 Engine)
 
 on:
   workflow_dispatch:
@@ -19,23 +19,22 @@ jobs:
         with:
           go-version: '1.22'
 
-      # 步骤3: 下载路由规则文件 (!!! 关键修复 !!!)
+      # 步骤3: 下载路由规则文件 (必须在编译前完成)
       - name: Download routing assets for embedding
         run: |
           echo "Downloading latest geoip.dat and geosite.dat..."
-          # 从 v2fly 的官方源下载
           curl -L -o geoip.dat https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
-          
-          # 关键修复：新的下载地址直接就是 geosite.dat，不再需要重命名
           curl -L -o geosite.dat https://github.com/v2fly/domain-list-community/releases/latest/download/geosite.dat
 
-      # 步骤4: 初始化 Go 模块并整理依赖
-      - name: Initialize and Tidy Go Modules
+      # 步骤4: 初始化并强制锁定 v4 依赖 (最终修复)
+      - name: Initialize and Force V4 Dependency
         run: |
-          go mod init github.com/your-repo/ech-workers-singlefile
+          go mod init github.com/your-repo/ech-workers-v4
+          # 关键修复：使用 replace 强制锁定 v2ray-core 版本到 v4
+          echo "replace github.com/v2fly/v2ray-core/v4 => github.com/v2fly/v2ray-core/v4 v4.45.2" >> go.mod
           go mod tidy
 
-      # 步骤5: 编译 Windows 可执行文件 (此时 .dat 文件会被嵌入)
+      # 步骤5: 编译 Windows 可执行文件
       - name: Build Windows executable with embedded assets
         run: GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o ech-workers.exe ./ech-workers.go
 
@@ -43,6 +42,5 @@ jobs:
       - name: Upload single-file artifact
         uses: actions/upload-artifact@v4
         with:
-          # 产物就是一个独立的 .exe 文件
           name: ech-workers-single-file-package
           path: ech-workers.exe
