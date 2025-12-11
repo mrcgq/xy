@@ -1,33 +1,48 @@
-name: Manual Build ech-workers
+# 工作流名称
+name: Build Single-File ECH Workers with Embedded Routing
 
 on:
   workflow_dispatch:
 
 jobs:
-  build:
+  build-windows-package:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout
+      # 步骤1: 检出代码
+      - name: Checkout repository
         uses: actions/checkout@v4
 
+      # 步骤2: 设置 Go 语言环境
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          # 对于这个纯净版代码，1.23 就足够了
-          go-version: '1.23' 
+          go-version: '1.22'
 
-      - name: Initialize and Tidy
+      # 步骤3: 下载路由规则文件 (必须在编译前完成)
+      - name: Download routing assets for embedding
         run: |
-          go mod init github.com/your-repo/ech-workers
+          echo "Downloading latest geoip.dat and geosite.dat..."
+          # 从 v2fly 的官方源下载
+          curl -L -o geoip.dat https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
+          curl -L -o geosite.dat https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
+          # 注意：v2fly 的域名文件名为 dlc.dat，Go embed 需要文件名精确匹配，所以我们将其重命名
+          mv dlc.dat geosite.dat
+
+      # 步骤4: 初始化 Go 模块并整理依赖
+      - name: Initialize and Tidy Go Modules
+        run: |
+          go mod init github.com/your-repo/ech-workers-singlefile
           go mod tidy
 
-      - name: Build Windows
-        run: |
-          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o ech-workers.exe ./ech-workers.go
+      # 步骤5: 编译 Windows 可执行文件 (此时 .dat 文件会被嵌入)
+      - name: Build Windows executable with embedded assets
+        run: GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o ech-workers.exe ./ech-workers.go
 
-      - name: Upload
+      # 步骤6: 上传最终的单文件产物
+      - name: Upload single-file artifact
         uses: actions/upload-artifact@v4
         with:
-          # 上传产物只包含 exe
-          name: ech-workers-package
+          # 产物就是一个独立的 .exe 文件
+          name: ech-workers-single-file-package
           path: ech-workers.exe
