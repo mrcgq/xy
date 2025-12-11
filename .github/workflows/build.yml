@@ -1,52 +1,61 @@
-name: Build Single-File ECH Workers (Final)
+name: Build Ultimate ech-proxy
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: # 仅手动触发，方便控制
 
 jobs:
-  build-windows-package:
+  build:
+    name: Build for ${{ matrix.os }}
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          # Windows (最常用)
+          - os: windows
+            goos: windows
+            goarch: amd64
+            ext: .exe
+          # Linux (用于服务器或软路由)
+            # goos: linux
+            # goarch: amd64
+            # ext: ""
+          # macOS (可选，M1/M2/M3芯片)
+            # goos: darwin
+            # goarch: arm64
+            # ext: ""
 
     steps:
-      # 步骤1: 检出代码 (包含 go.mod)
-      - name: Checkout repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 步骤2: 设置 Go 语言环境
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          # 终极版使用了 reflect 来设置 ECH，必须使用 1.23 或更高版本
+          go-version: '1.23' 
 
-      # 步骤3: 下载路由规则文件
-      - name: Download routing assets for embedding
+      - name: Initialize Module
         run: |
-          echo "Downloading latest geoip.dat and geosite.dat..."
-          curl -L -o geoip.dat https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
-          curl -L -o geosite.dat https://github.com/v2fly/domain-list-community/releases/latest/download/geosite.dat
+          # 自动初始化 module，防止因缺少 go.mod 导致编译失败
+          if [ ! -f go.mod ]; then
+            go mod init ech-proxy
+            go get github.com/gorilla/websocket
+            go mod tidy
+          fi
 
-      # ⭐ 预先将 google/pprof 设为最新版本，避免 CI 报 unknown revision
-      - name: Ensure google/pprof is available (use latest)
+      - name: Build Binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0 # 静态编译，无需依赖系统库
         run: |
-          go env
-          go get github.com/google/pprof@latest
+          # -s -w 去除调试信息，减小体积
+          # "." 表示编译当前目录下的所有 main 包文件
+          go build -trimpath -ldflags="-s -w" -o ech-proxy-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} .
 
-      # 步骤3.5: 清理 / 整理模块文件
-      - name: Tidy modules
-        run: |
-          go mod tidy
-
-      # 步骤4: 下载 Go 模块 (go mod download 会严格遵循 go.mod)
-      - name: Download Go Modules
-        run: go mod download
-
-      # 步骤5: 编译 Windows 可执行文件
-      - name: Build Windows executable with embedded assets
-        run: GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o ech-workers.exe ./ech-workers.go
-
-      # 步骤6: 上传最终的单文件产物
-      - name: Upload single-file artifact
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ech-workers-single-file-package
-          path: ech-workers.exe
+          # 上传产物命名格式：ech-proxy-windows-amd64
+          name: ech-proxy-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ech-proxy-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
