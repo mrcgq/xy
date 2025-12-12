@@ -1,4 +1,4 @@
-// ech-proxy-core.go - v4.0 Unified Engine (Full-Featured & Complete)
+// ech-proxy-core.go - v4.0.1 Unified Engine (Build Fix)
 package main
 
 import (
@@ -77,6 +77,9 @@ var (
 	chinaIPV6RangesMu sync.RWMutex
 )
 
+// 【【【已修复】】】 重新声明常量
+const typeHTTPS = 65
+
 type ipRange struct { start uint32; end uint32 }
 type ipRangeV6 struct { start [16]byte; end [16]byte }
 
@@ -123,7 +126,7 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	defer conn.Close()
 	clientAddr := conn.RemoteAddr().String()
 	
-	buf := make([]byte, 1); if _, err := conn.Read(buf); err != nil { return }
+	buf := make([]byte, 1); if _, err := io.ReadFull(conn, buf); err != nil { return }
 
 	var target string
 	var err error
@@ -134,9 +137,9 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	case 0x05:
 		err = handleSOCKS5(conn, clientAddr, inboundTag)
 		if err != nil { log.Printf("[Error] [%s] SOCKS5 handling failed: %v", inboundTag, err) }
-		return // SOCKS5 handler manages its own tunnel
+		return
 	case 'C', 'G', 'P', 'H', 'D', 'O', 'T':
-		target, firstFrame, mode, err = parseHTTP(conn, clientAddr, buf[0])
+		target, firstFrame, mode, err = parseHTTP(conn, clientAddr, buf[0], inboundTag)
 	default:
 		log.Printf("[Error] [%s] Unknown protocol from %s", inboundTag, clientAddr)
 		return
@@ -167,15 +170,15 @@ func route(target, inboundTag string) string {
 		if rule.GeoIP == "cn" {
 			if isChinaIPForRouter(net.ParseIP(host)) { return rule.OutboundTag }
 			ips, err := net.LookupIP(host)
-			if err == nil && len(ips) > 0 && isChinaIPForRouter(ips[0]) { return rule.OutboundTag }
+			if err == nil && len(ips) > 0 && isChinaIPForRouter(ips[0]) {
+				return rule.OutboundTag
+			}
 		}
-		// If a rule has no conditions, it's a final/default rule for that inbound
 		if len(rule.Domain) == 0 && rule.GeoIP == "" && len(rule.Port) == 0 {
 			return rule.OutboundTag
 		}
 	}
 	
-	// Default fallback if no rules match
 	return "direct" 
 }
 
@@ -201,15 +204,13 @@ func dispatch(conn net.Conn, target, outboundTag string, firstFrame []byte, mode
 }
 
 
-// ======================== Full Protocol Handlers (Restored from v3.x) ========================
+// ======================== Full Protocol Handlers ========================
 
 const ( modeSOCKS5 = 1; modeHTTPConnect = 2; modeHTTPProxy = 3 )
 
 func handleSOCKS5(conn net.Conn, clientAddr, inboundTag string) error {
-	if _, err := conn.Read(make([]byte, 1)); err != nil { return err } // nmethods
-	if _, err := conn.Read(make([]byte, 1)); err != nil { return err } // methods
+	if _, err := io.ReadFull(conn, make([]byte, 1)); err != nil { return err } 
 	if _, err := conn.Write([]byte{0x05, 0x00}); err != nil { return err }
-
 	header := make([]byte, 4); if _, err := io.ReadFull(conn, header); err != nil { return err }
 	cmd, atyp := header[1], header[3]; var host string
 	switch atyp {
@@ -235,20 +236,25 @@ func handleSOCKS5(conn net.Conn, clientAddr, inboundTag string) error {
 	return nil
 }
 
-func parseHTTP(conn net.Conn, clientAddr string, firstByte byte) (string, []byte, int, error) {
-	reader := bufio.NewReader(io.MultiReader(bytes.NewReader([]byte{firstByte}), conn))
+func parseHTTP(conn net.Conn, clientAddr string, firstByte byte, inboundTag string) (string, []byte, int, error) {
+	reader := bufio.NewReader(io.MultiReader(bytes.NewReader([]byte{firstByte}), conn)); 
 	req, err := http.ReadRequest(reader); if err != nil { return "", nil, 0, err }
 	if req.Method == "CONNECT" {
-		log.Printf("[%s] HTTP: %s -> CONNECT %s", conn.LocalAddr().(*net.TCPAddr).Port, clientAddr, req.Host)
+		log.Printf("[%s] HTTP: %s -> CONNECT %s", inboundTag, clientAddr, req.Host)
 		return req.Host, nil, modeHTTPConnect, nil
 	}
-	log.Printf("[%s] HTTP: %s -> %s %s", conn.LocalAddr().(*net.TCPAddr).Port, clientAddr, req.Method, req.URL.Host)
+	log.Printf("[%s] HTTP: %s -> %s %s", inboundTag, clientAddr, req.Method, req.URL.Host)
 	var buf bytes.Buffer
 	if err := req.WriteProxy(&buf); err != nil { return "", nil, 0, err }
+	// We need to read the body if it exists
+	if req.ContentLength > 0 {
+		body, _ := io.ReadAll(req.Body)
+		buf.Write(body)
+	}
 	return req.URL.Host, buf.Bytes(), modeHTTPProxy, nil
 }
 
-// ======================== Tunneling and Dispatch Logic (Restored from v3.x) ========================
+// ======================== Tunneling and Dispatch Logic ========================
 
 func handleDirect(clientConn net.Conn, target string, firstFrame []byte, mode int) error {
 	remote, err := net.DialTimeout("tcp", target, 5*time.Second); if err != nil { sendErrorResponse(clientConn, mode); return err }
@@ -275,8 +281,7 @@ func handleProxy(clientConn net.Conn, target, outboundTag string, firstFrame []b
 	return nil
 }
 
-
-// ======================== Full Helper Functions (Restored & Adapted) ========================
+// ======================== Full Helper Functions ========================
 
 func findOutbound(tag string) (Outbound, bool) { for _, ob := range globalConfig.Outbounds { if ob.Tag == tag { return ob, true } }; return Outbound{}, false }
 func sendErrorResponse(conn net.Conn, mode int) { switch mode { case modeSOCKS5, modeHTTPConnect: conn.Write([]byte{5, 1, 0, 1, 0, 0, 0, 0, 0, 0}); case modeHTTPProxy: conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n")) } }
@@ -293,7 +298,7 @@ func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) { settin
 func prepareAllECHConfigs() { for _, outbound := range globalConfig.Outbounds { if outbound.Protocol == "ech-proxy" { var settings ECHProxySettings; if err := json.Unmarshal(outbound.Settings, &settings); err != nil { log.Printf("[Error] Failed to parse settings for outbound '%s'", outbound.Tag); continue }; echSettingsMap[outbound.Tag] = settings; log.Printf("[ECH] Preparing config for outbound '%s'...", outbound.Tag); var echBase64 string; var err error; if settings.DNSWorker != "" { echBase64, err = queryHTTPSRecord(settings.ECHDomain, settings.DNSWorker) }; if err != nil || echBase64 == "" { if settings.DNSPublic != "" { echBase64, err = queryHTTPSRecord(settings.ECHDomain, settings.DNSPublic) } }; if err != nil { log.Printf("[Error] Failed to get ECH for outbound '%s': %v", outbound.Tag, err); continue }; raw, err := base64.StdEncoding.DecodeString(echBase64); if err != nil { log.Printf("[Error] Failed to decode ECH for outbound '%s': %v", outbound.Tag, err); continue }; echConfigs[outbound.Tag] = raw; log.Printf("[ECH] Config loaded for outbound '%s', length: %d", outbound.Tag, len(raw)) } } }
 func parseServerAddr(addr string) (host, port, path string, err error) { path = "/"; if idx := strings.Index(addr, "/"); idx != -1 { path = addr[idx:]; addr = addr[:idx] }; host, port, err = net.SplitHostPort(addr); return }
 func queryHTTPSRecord(domain, dnsServer string) (string, error) { if !strings.HasPrefix(dnsServer, "https://") && !strings.HasPrefix(dnsServer, "http://") { dnsServer = "https://" + dnsServer }; return queryDoH(domain, dnsServer) }
-func queryDoH(domain, dohURL string) (string, error) { u, err := url.Parse(dohURL); if err != nil { return "", err }; dnsQuery := buildDNSQuery(domain, typeHTTPS); q := u.Query(); q.Set("dns", base64.RawURLEncoding.EncodeToString(dnsQuery)); u.RawQuery = q.Encode(); req, err := http.NewRequest("GET", u.String(), nil); if err != nil { return "", err }; req.Header.Set("Accept", "application/dns-message"); resp, err := httpClient.Do(req); if err != nil { return "", err }; defer resp.Body.Close(); if resp.StatusCode != http.StatusOK { return "", fmt.Errorf("HTTP %d", resp.StatusCode) }; body, err := io.ReadAll(resp.Body); if err != nil { return "", err }; return parseDNSResponse(body) }
+func queryDoH(domain, dohURL string) (string, error) { u, err := url.Parse(dohURL); if err != nil { return "", err }; dnsQuery := buildDNSQuery(domain, typeHTTPS); q := u.Query(); q.Set("dns", base64.RawURLEncoding.EncodeToString(dnsQuery)); u.RawQuery = q.Encode(); req, err := http.NewRequest("GET", u.String(), nil); if err != nil { return "", err }; req.Header.Set("Accept", "application/dns-message"); resp, err := httpClient.Do(req); if err != nil { return "", err }; defer resp.Body.Close(); if resp.StatusCode != http.StatusOK { return "", fmt.Errorf("HTTP status %d", resp.StatusCode) }; body, err := io.ReadAll(resp.Body); if err != nil { return "", err }; return parseDNSResponse(body) }
 func buildDNSQuery(domain string, qtype uint16) []byte { var q []byte; q = append(q, []byte{0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0} ...); for _, label := range strings.Split(domain, ".") { q = append(q, byte(len(label))); q = append(q, label...) }; q = append(q, 0); q = binary.BigEndian.AppendUint16(q, qtype); q = binary.BigEndian.AppendUint16(q, 1); return q }
 func parseDNSResponse(r []byte) (string, error) { if len(r) < 12 || binary.BigEndian.Uint16(r[6:8]) == 0 { return "", errors.New("no answer records") }; offset := 12; for r[offset] != 0 { offset += int(r[offset]) + 1 }; offset += 5; for { if offset+10 > len(r) { break }; offset += 2; if r[offset-2]&0xC0 == 0xC0 { } else { for r[offset-1] != 0 { offset += int(r[offset-1]) + 1 } }; rrType := binary.BigEndian.Uint16(r[offset : offset+2]); offset += 8; dataLen := binary.BigEndian.Uint16(r[offset : offset+2]); offset += 2; if offset+int(dataLen) > len(r) { break }; data := r[offset : offset+int(dataLen)]; offset += int(dataLen); if rrType == typeHTTPS { if ech := parseHTTPSRecord(data); ech != "" { return ech, nil } } }; return "", errors.New("no HTTPS record found") }
 func parseHTTPSRecord(data []byte) string { if len(data) < 2 { return "" }; offset := 2; for offset < len(data) && data[offset] != 0 { offset += int(data[offset]) + 1 }; offset++; for offset+4 <= len(data) { key := binary.BigEndian.Uint16(data[offset:offset+2]); length := binary.BigEndian.Uint16(data[offset+2:offset+4]); offset += 4; if offset+int(length) > len(data) { break }; value := data[offset : offset+int(length)]; offset += int(length); if key == 5 { return base64.StdEncoding.EncodeToString(value) } }; return "" }
