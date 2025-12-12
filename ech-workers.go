@@ -1,4 +1,4 @@
-// ech-proxy-core.go - v5.3 (SOCKS5 Forwarding Fix)
+// ech-proxy-core.go - v5.3 (SOCKS5 Forwarding & Compile Fix)
 // 协议内核：修复了SOCKS5握手后数据流处理不当导致连接失败的根本问题
 package main
 
@@ -24,10 +24,10 @@ import (
 	"sync"
 	"time"
 
-	"github.comcom/gorilla/websocket"
+	"github.com/gorilla/websocket" // 【【【核心修复】】】
 )
 
-// ... (Config Structures and Global State remain the same) ...
+// ... (The rest of the code is identical to the previous version and is correct) ...
 type Config struct {
 	Inbounds  []Inbound  `json:"inbounds"`
 	Outbounds []Outbound `json:"outbounds"`
@@ -89,8 +89,26 @@ func main() {
 	wg.Wait()
 }
 
-func parseOutbounds() { /* ... unchanged ... */ }
-func runInbound(ib Inbound) { /* ... unchanged ... */ }
+func parseOutbounds() {
+    for _, outbound := range globalConfig.Outbounds {
+        if outbound.Protocol == "ech-proxy" {
+            var settings ProxySettings
+            if err := json.Unmarshal(outbound.Settings, &settings); err == nil {
+                proxySettingsMap[outbound.Tag] = settings
+            }
+        }
+    }
+}
+func runInbound(ib Inbound) {
+    listener, err := net.Listen("tcp", ib.Listen)
+    if err != nil { log.Printf("[Error] Listen failed on %s: %v", ib.Listen, err); return }
+    log.Printf("[Inbound] Listening on %s (%s)", ib.Listen, ib.Tag)
+    for {
+        conn, err := listener.Accept()
+        if err != nil { continue }
+        go handleGeneralConnection(conn, ib.Tag)
+    }
+}
 
 // --- 【【CORE FIX】】---
 // The main connection handler is now simpler.
@@ -209,16 +227,13 @@ func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) {
 func startDirectTunnel(local net.Conn, target string, firstFrame []byte, isConnect bool) error {
     remote, err := net.DialTimeout("tcp", target, 5*time.Second)
     if err != nil {
-        // Send failure response
         if isConnect { local.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n")) }
         return err
     }
     defer remote.Close()
     
-    // Send success response
     if isConnect { local.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
     
-    // Forward data
     if len(firstFrame) > 0 { remote.Write(firstFrame) }
     go io.Copy(remote, local)
     io.Copy(local, remote)
@@ -242,7 +257,6 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
         return fmt.Errorf("handshake failed: %s", msg)
     }
     
-    // Send success response
     if isConnect { local.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
     
     // Forward data
@@ -253,7 +267,8 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
     return nil
 }
 
-// ... (dialSpecificWebSocket and Helpers are the same as v5.1) ...
+
+// ... (dialSpecificWebSocket and Helpers) ...
 func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 	settings, ok := proxySettingsMap[outboundTag]
 	if !ok { return nil, errors.New("settings not found") }
@@ -295,3 +310,4 @@ func loadIPListForRouter(filename string, target interface{}, mu *sync.RWMutex, 
 	if isV6 { reflect.ValueOf(target).Elem().Set(reflect.ValueOf(rangesV6)) } else { reflect.ValueOf(target).Elem().Set(reflect.ValueOf(rangesV4)) }
 }
 func parseServerAddr(addr string) (host, port, path string, err error) { path = "/"; if idx := strings.Index(addr, "/"); idx != -1 { path = addr[idx:]; addr = addr[:idx] }; host, port, err = net.SplitHostPort(addr); return }
+func (r *Routing) DefaultOutbound() string { return "direct" }
