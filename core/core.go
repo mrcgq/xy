@@ -1,4 +1,4 @@
-// core/core.go
+// core/core.go (v1.2 - JSON Envelope)
 // 这是重构后的内核库，不再是可执行文件
 package core
 
@@ -26,6 +26,14 @@ import (
 
 	"github.com/gorilla/websocket"
 )
+
+// JsonEnvelope 定义了伪装用的JSON结构体
+type JsonEnvelope struct {
+	ID   string `json:"id"`
+	Type string `json:"type"`
+	TS   int64  `json:"ts"`
+	Data string `json:"data"` // Base64 编码的原始数据
+}
 
 // ======================== Config Structures ========================
 type Config struct {
@@ -70,7 +78,33 @@ var (
 type ipRange struct{ start uint32; end uint32 }
 type ipRangeV6 struct{ start [16]byte; end [16]byte }
 
+
 // ======================== Core Logic ========================
+
+// wrapAsJson 将原始二进制数据封装成JSON消息
+func wrapAsJson(payload []byte) ([]byte, error) {
+	idBytes := make([]byte, 4)
+	rand.Read(idBytes)
+	envelope := JsonEnvelope{
+		ID:   fmt.Sprintf("msg_%x", idBytes),
+		Type: "sync_data",
+		TS:   time.Now().UnixMilli(),
+		Data: base64.StdEncoding.EncodeToString(payload),
+	}
+	return json.Marshal(envelope)
+}
+
+// unwrapFromJson 从JSON消息中解析出原始二进制数据
+func unwrapFromJson(rawMsg []byte) ([]byte, error) {
+	var envelope JsonEnvelope
+	if err := json.Unmarshal(rawMsg, &envelope); err != nil {
+		return nil, fmt.Errorf("not a valid json envelope: %w", err)
+	}
+	if envelope.Type != "sync_data" {
+		return nil, errors.New("not a sync_data type message")
+	}
+	return base64.StdEncoding.DecodeString(envelope.Data)
+}
 
 // StartInstance 是内核库的入口函数
 func StartInstance(configContent []byte) (net.Listener, error) {
@@ -103,7 +137,6 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 	return listener, nil
 }
 
-// ... (以下所有函数都是从 ech-proxy-core.go 完整复制而来) ...
 func parseOutbounds() {
 	for _, outbound := range globalConfig.Outbounds {
 		if outbound.Protocol == "ech-proxy" {
@@ -114,6 +147,7 @@ func parseOutbounds() {
 		}
 	}
 }
+
 func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	defer conn.Close()
 	buf := make([]byte, 1)
@@ -141,6 +175,7 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	log.Printf("[%s] %s -> %s | Routed to [%s]", inboundTag, conn.RemoteAddr().String(), target, outboundTag)
 	dispatch(conn, target, outboundTag, firstFrame, mode)
 }
+
 func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) {
 	handshakeBuf := make([]byte, 2)
 	if _, err := io.ReadFull(conn, handshakeBuf); err != nil {
@@ -181,6 +216,7 @@ func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) {
 	log.Printf("[%s] SOCKS5: %s -> %s", inboundTag, conn.RemoteAddr().String(), target)
 	return target, nil
 }
+
 func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) (string, []byte, int, error) {
 	reader := bufio.NewReader(io.MultiReader(bytes.NewReader(initialData), conn))
 	req, err := http.ReadRequest(reader)
@@ -199,6 +235,7 @@ func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) (string, [
 	req.WriteProxy(&buf)
 	return target, buf.Bytes(), mode, nil
 }
+
 func route(target, inboundTag string) string {
 	host, _, _ := net.SplitHostPort(target)
 	if host == "" {
@@ -239,6 +276,7 @@ func route(target, inboundTag string) string {
 	}
 	return "direct"
 }
+
 func dispatch(conn net.Conn, target, outboundTag string, firstFrame []byte, mode int) {
 	outbound, ok := findOutbound(outboundTag)
 	if !ok {
@@ -258,11 +296,13 @@ func dispatch(conn net.Conn, target, outboundTag string, firstFrame []byte, mode
 		log.Printf("Tunnel failed for %s: %v", target, err)
 	}
 }
+
 const (
 	modeSOCKS5      = 1
 	modeHTTPConnect = 2
 	modeHTTPProxy   = 3
 )
+
 func startDirectTunnel(local net.Conn, target string, firstFrame []byte, mode int) error {
 	remote, err := net.DialTimeout("tcp", target, 5*time.Second)
 	if err != nil {
@@ -288,18 +328,16 @@ func startDirectTunnel(local net.Conn, target string, firstFrame []byte, mode in
 	io.Copy(local, remote)
 	return nil
 }
+
 func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []byte, mode int) error {
 	wsConn, err := dialSpecificWebSocket(outboundTag)
 	if err != nil {
-		if mode == modeSOCKS5 {
-			local.Write([]byte{0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-		}
-		if mode == modeHTTPConnect {
-			local.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
-		}
+		if mode == modeSOCKS5 { local.Write([]byte{0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}) }
+		if mode == modeHTTPConnect { local.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n")) }
 		return err
 	}
 	defer wsConn.Close()
+
 	noiseCount := mathrand.Intn(4) + 1
 	for i := 0; i < noiseCount; i++ {
 		noiseSize := mathrand.Intn(201) + 50
@@ -310,23 +348,31 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
 		}
 		time.Sleep(time.Duration(mathrand.Intn(51)+10) * time.Millisecond)
 	}
+
 	connectMsg := fmt.Sprintf("X-LINK:%s|%s", target, base64.StdEncoding.EncodeToString(firstFrame))
-	if err := wsConn.WriteMessage(websocket.TextMessage, []byte(connectMsg)); err != nil {
+	jsonHandshake, err := wrapAsJson([]byte(connectMsg))
+	if err != nil {
+		return fmt.Errorf("failed to wrap handshake in json: %w", err)
+	}
+	if err := wsConn.WriteMessage(websocket.TextMessage, jsonHandshake); err != nil {
 		return err
 	}
+
 	_, msg, err := wsConn.ReadMessage()
-	if err != nil || string(msg) != "X-LINK-OK" {
-		return fmt.Errorf("handshake failed: %s", msg)
+	if err != nil {
+		return err
 	}
-	if mode == modeSOCKS5 {
-		local.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+	okPayload, err := unwrapFromJson(msg)
+	if err != nil || string(okPayload) != "X-LINK-OK" {
+		return fmt.Errorf("handshake failed or unexpected response: %s", msg)
 	}
-	if mode == modeHTTPConnect {
-		local.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-	}
+    
+	if mode == modeSOCKS5 { local.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}) }
+	if mode == modeHTTPConnect { local.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
+	
 	done := make(chan bool, 2)
 	go func() {
-		buf := make([]byte, 32*1024)
+		buf := make([]byte, 16*1024)
 		for {
 			n, err := local.Read(buf)
 			if err != nil {
@@ -334,7 +380,9 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
 				done <- true
 				return
 			}
-			if err := wsConn.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
+			jsonData, err := wrapAsJson(buf[:n])
+			if err != nil { continue }
+			if err := wsConn.WriteMessage(websocket.TextMessage, jsonData); err != nil {
 				done <- true
 				return
 			}
@@ -348,7 +396,11 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
 				done <- true
 				return
 			}
-			if _, err := local.Write(msg); err != nil {
+			payload, err := unwrapFromJson(msg)
+			if err != nil {
+				continue
+			}
+			if _, err := local.Write(payload); err != nil {
 				done <- true
 				return
 			}
@@ -357,6 +409,7 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
 	<-done
 	return nil
 }
+
 func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 	settings, ok := proxySettingsMap[outboundTag]
 	if !ok {
@@ -375,6 +428,7 @@ func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 	conn, _, err := dialer.Dial(wsURL, nil)
 	return conn, err
 }
+
 func findOutbound(tag string) (Outbound, bool) {
 	for _, ob := range globalConfig.Outbounds {
 		if ob.Tag == tag {
@@ -383,10 +437,12 @@ func findOutbound(tag string) (Outbound, bool) {
 	}
 	return Outbound{}, false
 }
+
 func getExeDir() string {
 	exePath, _ := os.Executable()
 	return filepath.Dir(exePath)
 }
+
 func ipToUint32(ip net.IP) uint32 {
 	ip = ip.To4()
 	if ip == nil {
@@ -394,6 +450,7 @@ func ipToUint32(ip net.IP) uint32 {
 	}
 	return binary.BigEndian.Uint32(ip)
 }
+
 func isChinaIPForRouter(ip net.IP) bool {
 	if ip == nil {
 		return false
@@ -420,10 +477,12 @@ func isChinaIPForRouter(ip net.IP) bool {
 	}
 	return false
 }
+
 func loadChinaListsForRouter() {
 	loadIPListForRouter("chn_ip.txt", &chinaIPRanges, &chinaIPRangesMu, false)
 	loadIPListForRouter("chn_ip_v6.txt", &chinaIPV6Ranges, &chinaIPV6RangesMu, true)
 }
+
 func loadIPListForRouter(filename string, target interface{}, mu *sync.RWMutex, isV6 bool) {
 	file, err := os.Open(filepath.Join(getExeDir(), filename))
 	if err != nil {
@@ -462,6 +521,7 @@ func loadIPListForRouter(filename string, target interface{}, mu *sync.RWMutex, 
 		reflect.ValueOf(target).Elem().Set(reflect.ValueOf(rangesV4))
 	}
 }
+
 func parseServerAddr(addr string) (host, port, path string, err error) {
 	path = "/"
 	if idx := strings.Index(addr, "/"); idx != -1 {
