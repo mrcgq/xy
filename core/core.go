@@ -1,5 +1,4 @@
-// core/core.go (v1.2 - JSON Envelope)
-// 这是重构后的内核库，不再是可执行文件
+// core/core.go (v1.3 - Advanced Behavior Mimicry)
 package core
 
 import (
@@ -100,8 +99,10 @@ func unwrapFromJson(rawMsg []byte) ([]byte, error) {
 	if err := json.Unmarshal(rawMsg, &envelope); err != nil {
 		return nil, fmt.Errorf("not a valid json envelope: %w", err)
 	}
+	// 只有当类型是我们约定的类型时才解码
 	if envelope.Type != "sync_data" {
-		return nil, errors.New("not a sync_data type message")
+		// 忽略 ping/pong 等心跳消息
+		return nil, fmt.Errorf("not a sync_data type message: %s", envelope.Type)
 	}
 	return base64.StdEncoding.DecodeString(envelope.Data)
 }
@@ -348,7 +349,6 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
 		}
 		time.Sleep(time.Duration(mathrand.Intn(51)+10) * time.Millisecond)
 	}
-
 	connectMsg := fmt.Sprintf("X-LINK:%s|%s", target, base64.StdEncoding.EncodeToString(firstFrame))
 	jsonHandshake, err := wrapAsJson([]byte(connectMsg))
 	if err != nil {
@@ -357,7 +357,6 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
 	if err := wsConn.WriteMessage(websocket.TextMessage, jsonHandshake); err != nil {
 		return err
 	}
-
 	_, msg, err := wsConn.ReadMessage()
 	if err != nil {
 		return err
@@ -366,28 +365,69 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
 	if err != nil || string(okPayload) != "X-LINK-OK" {
 		return fmt.Errorf("handshake failed or unexpected response: %s", msg)
 	}
-    
 	if mode == modeSOCKS5 { local.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}) }
 	if mode == modeHTTPConnect { local.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
 	
 	done := make(chan bool, 2)
+
 	go func() {
-		buf := make([]byte, 16*1024)
+		lastSendTime := time.Now()
+		heartbeatTicker := time.NewTicker(15 * time.Second)
+		defer heartbeatTicker.Stop()
+		buf := make([]byte, 32*1024)
 		for {
+			local.SetReadDeadline(time.Now().Add(1 * time.Second))
 			n, err := local.Read(buf)
-			if err != nil {
-				wsConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-				done <- true
-				return
+			if n > 0 {
+				lastSendTime = time.Now()
+				remainingData := buf[:n]
+				for len(remainingData) > 0 {
+					chunkSize := mathrand.Intn(2501) + 500
+					if chunkSize > len(remainingData) {
+						chunkSize = len(remainingData)
+					}
+					chunk := remainingData[:chunkSize]
+					remainingData = remainingData[chunkSize:]
+					jsonData, err := wrapAsJson(chunk)
+					if err != nil { continue }
+					if err := wsConn.WriteMessage(websocket.TextMessage, jsonData); err != nil {
+						done <- true
+						return
+					}
+					if len(remainingData) > 0 {
+						time.Sleep(time.Duration(mathrand.Intn(46)+5) * time.Millisecond)
+					}
+				}
 			}
-			jsonData, err := wrapAsJson(buf[:n])
-			if err != nil { continue }
-			if err := wsConn.WriteMessage(websocket.TextMessage, jsonData); err != nil {
+			if err != nil {
+				if os.IsTimeout(err) {
+					select {
+					case <-heartbeatTicker.C:
+						if time.Since(lastSendTime) > 15*time.Second {
+							pingEnvelope := JsonEnvelope{
+								ID:   fmt.Sprintf("ping_%x", time.Now().Unix()),
+								Type: "ping",
+								TS:   time.Now().UnixMilli(),
+								Data: "",
+							}
+							pingJson, _ := json.Marshal(pingEnvelope)
+							if err := wsConn.WriteMessage(websocket.TextMessage, pingJson); err != nil {
+								done <- true
+								return
+							}
+							lastSendTime = time.Now()
+						}
+					default:
+					}
+					continue
+				}
+				wsConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 				done <- true
 				return
 			}
 		}
 	}()
+
 	go func() {
 		for {
 			_, msg, err := wsConn.ReadMessage()
@@ -530,4 +570,262 @@ func parseServerAddr(addr string) (host, port, path string, err error) {
 	}
 	host, port, err = net.SplitHostPort(addr)
 	return
+}```
+
+---
+
+### **2. `X-Link 服务器 (v1.6 - Advanced Behavior Mimicry)` - 完整无省略代码版**
+
+**文件: `x私有协议 去指纹版.js`**
+
+```javascript
+/**
+ * X-Link 服务器 (v1.6 - Advanced Behavior Mimicry)
+ * 协议特征：JSON内容伪装 + 高级行为伪装
+ * 升级：
+ * 1. [行为伪装] 实现数据帧分片和随机延迟，模拟真实应用的数据传输节奏。
+ * 2. [行为伪装] 支持并响应客户端的 "ping" 心跳消息，维持连接活性假象。
+ * 3. 保持了 v1.5 的所有伪装和安全特性。
+ */
+
+// ================= [ 配置区域 ] =================
+const SECRET_KEY = "my-secret-key-888";  
+const AUTH_PASSWORD = "my-password";     
+const DEFAULT_FALLBACK = "proxy.xxxxxxxx.tk:50001"; 
+// ===============================================
+
+import { connect } from 'cloudflare:sockets';
+
+// 辅助函数：将 ArrayBuffer 转换为 Base64 字符串
+function arrayBufferToBase64(buffer) {
+    let binary = '';
+    const bytes = new Uint8Array(buffer);
+    const len = bytes.byteLength;
+    for (let i = 0; i < len; i++) {
+        binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
+}
+
+function wrapInJson(data) { // data is Uint8Array
+    const id = `msg_${Math.random().toString(16).slice(2, 10)}`;
+    const envelope = {
+        id: id,
+        type: 'sync_data',
+        ts: Date.now(),
+        data: arrayBufferToBase64(data)
+    };
+    return JSON.stringify(envelope);
+}
+
+function unwrapFromJson(jsonString) {
+    try {
+        const envelope = JSON.parse(jsonString);
+        if (envelope.type === 'ping') {
+            return { isHeartbeat: true, id: envelope.id };
+        }
+        if (envelope.type === 'sync_data' && envelope.data) {
+            const decodedStr = atob(envelope.data);
+            const bytes = new Uint8Array(decodedStr.length);
+            for (let i = 0; i < decodedStr.length; i++) {
+                bytes[i] = decodedStr.charCodeAt(i);
+            }
+            return { payload: bytes };
+        }
+    } catch (e) {}
+    return null;
+}
+
+function xorDecrypt(input, key) {
+  let output = new Uint8Array(input.length);
+  for (let i = 0; i < input.length; i++) {
+    output[i] = input[i] ^ key.charCodeAt(i % key.length);
+  }
+  return output;
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    try {
+      const upgradeHeader = request.headers.get('Upgrade');
+      if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
+        return new Response('X-Link 网关在线 (v1.6)', { status: 200 });
+      }
+      const rawToken = request.headers.get('Sec-WebSocket-Protocol') || "";
+      let dynamicFallbackIP = null;
+      if (!rawToken) { return new Response('缺少令牌', { status: 401 }); }
+      try {
+        const decoded = atob(rawToken);
+        const decodedBytes = new Uint8Array(decoded.length);
+        for(let i=0; i<decoded.length; i++) decodedBytes[i] = decoded.charCodeAt(i);
+        const decryptedBytes = xorDecrypt(decodedBytes, SECRET_KEY);
+        const decryptedStr = new TextDecoder().decode(decryptedBytes);
+        const config = JSON.parse(decryptedStr); 
+        if (config.p !== AUTH_PASSWORD) return new Response('认证失败', { status: 403 });
+        if (config.fb && config.fb.trim() !== "") {
+          dynamicFallbackIP = config.fb.trim().replace(/^https?:\/\//, '');
+        }
+      } catch (e) { return new Response('令牌错误', { status: 400 }); }
+      const webSocketPair = new WebSocketPair();
+      const [client, server] = Object.values(webSocketPair);
+      server.accept();
+      handleSession(server, dynamicFallbackIP);
+      return new Response(null, { status: 101, webSocket: client });
+    } catch (err) { return new Response('内部服务器错误', { status: 500 }); }
+  },
+};
+
+async function handleSession(webSocket, dynamicFallbackIP) {
+    let remoteSocket = null;
+    let state = 'HANDSHAKING';
+
+    const handshakeTimeout = setTimeout(() => {
+        if (state === 'HANDSHAKING') {
+            try {
+                const fakeError = { error: "Authentication failed", code: 401, message: "Invalid session token or handshake timeout." };
+                webSocket.send(JSON.stringify(fakeError));
+                webSocket.close(1000, "Fake Auth Error");
+            } catch (e) {}
+        }
+    }, 5000);
+
+    const closeAll = () => {
+        clearTimeout(handshakeTimeout);
+        try { webSocket.close(1011, "Internal Error"); } catch (err) {}
+        try { remoteSocket?.close(); } catch (err) {}
+    };
+    
+    webSocket.addEventListener('message', async (event) => {
+        if (state === 'RELAYING') {
+            if (typeof event.data === 'string') {
+                const unwrapped = unwrapFromJson(event.data);
+                if (unwrapped) {
+                    if (unwrapped.isHeartbeat) {
+                        const pongEnvelope = { id: unwrapped.id, type: 'pong', ts: Date.now(), data: '' };
+                        webSocket.send(JSON.stringify(pongEnvelope));
+                        return;
+                    }
+                    if (unwrapped.payload && remoteSocket && remoteSocket.writable) {
+                        const writer = remoteSocket.writable.getWriter();
+                        writer.write(unwrapped.payload).catch(err => {});
+                        writer.releaseLock();
+                    }
+                }
+            }
+            return; 
+        }
+
+        try {
+            if (event.data instanceof ArrayBuffer) { return; }
+            if (typeof event.data !== 'string') { return; }
+
+            const rawHandshakeBytes = unwrapFromJson(event.data)?.payload;
+            if (!rawHandshakeBytes) { return; }
+
+            const handshakeText = new TextDecoder().decode(rawHandshakeBytes);
+            if (!handshakeText.startsWith('X-LINK:')) { return; }
+
+            clearTimeout(handshakeTimeout);
+            state = 'RELAYING';
+
+            const separatorIndex = handshakeText.indexOf('|');
+            if (separatorIndex === -1) { throw new Error("Handshake format error"); }
+
+            const targetAddress = handshakeText.substring(7, separatorIndex);
+            const firstFrameBase64 = handshakeText.substring(separatorIndex + 1);
+            
+            const target = parseAddress(targetAddress);
+            
+            const attempts = [];
+            attempts.push({ name: 'Direct', host: target.host, port: target.port });
+            if (dynamicFallbackIP) {
+                const fb = parseAddress(dynamicFallbackIP);
+                attempts.push({ name: 'ClientFallback', host: fb.host, port: fb.port });
+            } else if (DEFAULT_FALLBACK) {
+                const fb = parseAddress(DEFAULT_FALLBACK);
+                attempts.push({ name: 'DefaultFallback', host: fb.host, port: fb.port });
+            }
+
+            let connectionSuccessful = false;
+            for (const attempt of attempts) {
+                try {
+                    remoteSocket = connect({ hostname: attempt.host, port: attempt.port });
+                    await remoteSocket.opened;
+                    connectionSuccessful = true;
+                    
+                    if (firstFrameBase64.length > 0) {
+                        const firstFrameStr = atob(firstFrameBase64);
+                        const firstFrameBytes = new Uint8Array(firstFrameStr.length);
+                        for (let i = 0; i < firstFrameStr.length; i++) {
+                            firstFrameBytes[i] = firstFrameStr.charCodeAt(i);
+                        }
+                        const writer = remoteSocket.writable.getWriter();
+                        await writer.write(firstFrameBytes);
+                        writer.releaseLock();
+                    }
+                    
+                    const okBytes = new TextEncoder().encode('X-LINK-OK');
+                    webSocket.send(wrapInJson(okBytes));
+                    
+                    (async () => {
+                        const reader = remoteSocket.readable.getReader();
+                        try {
+                            while (true) {
+                                const { done, value } = await reader.read(); // value is Uint8Array
+                                if (done) break;
+                                
+                                let remainingData = value;
+                                while (remainingData.length > 0) {
+                                    let chunkSize = Math.floor(Math.random() * 2501) + 500;
+                                    if (chunkSize > remainingData.length) {
+                                        chunkSize = remainingData.length;
+                                    }
+                                    const chunk = remainingData.slice(0, chunkSize);
+                                    remainingData = remainingData.slice(chunkSize);
+                                    if (webSocket.readyState === 1) {
+                                        webSocket.send(wrapInJson(chunk));
+                                    } else {
+                                        break;
+                                    }
+                                    if (remainingData.length > 0) {
+                                        await new Promise(resolve => setTimeout(resolve, Math.random() * 45 + 5));
+                                    }
+                                }
+                            }
+                        } catch(e) {} finally {
+                           closeAll();
+                        }
+                    })();
+                    break;
+                } catch (err) {
+                    try { remoteSocket?.close(); } catch {}
+                    if (attempts.indexOf(attempt) === attempts.length - 1) {
+                        throw new Error("All connection attempts failed.");
+                    }
+                }
+            }
+            if (!connectionSuccessful) {
+                throw new Error("Could not establish remote connection.");
+            }
+        } catch (err) {
+            closeAll();
+        }
+    });
+    webSocket.addEventListener('close', closeAll);
+    webSocket.addEventListener('error', closeAll);
+}
+
+function parseAddress(addrStr) {
+    if (!addrStr) throw new Error('Empty address');
+    addrStr = addrStr.trim();
+    const match = addrStr.match(/^\[(.+)\]:(\d+)$/);
+    if (match) return { host: match[1], port: parseInt(match[2]) };
+    if (addrStr.startsWith('[') && addrStr.endsWith(']')) return { host: addrStr.slice(1, -1), port: 443 };
+    const parts = addrStr.split(':');
+    if (parts.length > 1 && /^\d+$/.test(parts[parts.length - 1])) {
+        const port = parseInt(parts.pop());
+        const host = parts.join(':');
+        return { host, port };
+    } 
+    return { host: addrStr, port: 443 };
 }
