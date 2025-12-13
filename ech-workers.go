@@ -1,5 +1,5 @@
-// ech-proxy-core.go - v5.4 (Final Forwarding Fix)
-// 协议内核：修复了 WebSocket 数据流转发的根本性错误。
+// ech-proxy-core.go - v5.5 (Final Compile & Forwarding Fix)
+// 协议内核：修复了 import 路径笔误，并保持了 v5.4 的稳定转发逻辑。
 package main
 
 import (
@@ -23,7 +23,8 @@ import (
 	"sync"
 	"time"
 
-	"github.comcom/gorilla/websocket"
+	// 【【【核心修复】】】 修正了错误的 import 路径
+	"github.com/gorilla/websocket"
 )
 
 // ======================== Config Structures ========================
@@ -75,7 +76,7 @@ type ipRangeV6 struct { start [16]byte; end [16]byte }
 func main() {
 	configPath := flag.String("c", "config.json", "Path to config")
 	flag.Parse()
-	log.Println("[Core] X-Link Kernel v1.3 Starting...")
+	log.Println("[Core] X-Link Kernel v1.4 Starting...")
 	file, err := os.ReadFile(*configPath)
 	if err != nil { log.Fatalf("Failed to read config: %v", err) }
 	if err := json.Unmarshal(file, &globalConfig); err != nil { log.Fatalf("Config parse error: %v", err) }
@@ -143,6 +144,7 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
     dispatch(conn, target, outboundTag, firstFrame, mode)
 }
 
+
 // --- Protocol Handlers ---
 
 func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) {
@@ -192,6 +194,7 @@ func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) (string, [
     req.WriteProxy(&buf)
     return target, buf.Bytes(), mode, nil
 }
+
 
 // --- Routing & Dispatch ---
 
@@ -281,9 +284,7 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
     if mode == modeSOCKS5 { local.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}) }
     if mode == modeHTTPConnect { local.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
     
-    // 【【【核心修复】】】 使用正确的 WebSocket 消息转发，而不是 io.Copy
     done := make(chan bool, 2)
-    
     go func() { 
         buf := make([]byte, 32*1024)
         for { 
@@ -361,4 +362,4 @@ func loadIPListForRouter(filename string, target interface{}, mu *sync.RWMutex, 
 	mu.Lock(); defer mu.Unlock()
 	if isV6 { reflect.ValueOf(target).Elem().Set(reflect.ValueOf(rangesV6)) } else { reflect.ValueOf(target).Elem().Set(reflect.ValueOf(rangesV4)) }
 }
-func parseServerAddr(addr string) (host, port, path string, err error) { path = "/"; if idx := strings.Index(addr, "/"); idx != -1 { path = addr[idx:]; addr = addr[:idx] }; host, port, err = net.SplitHostPort(addr); return }```
+func parseServerAddr(addr string) (host, port, path string, err error) { path = "/"; if idx := strings.Index(addr, "/"); idx != -1 { path = addr[idx:]; addr = addr[:idx] }; host, port, err = net.SplitHostPort(addr); return }
