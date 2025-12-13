@@ -1,6 +1,6 @@
-// ech-proxy-core.go - v6.4 (ALPN Fix)
-// 协议内核：在 uTLS 配置中强制 ALPN 为 http/1.1，解决了因协议协商为 HTTP/2
-// 导致的 websocket 握手失败问题。这是能解决所有已知问题的最终版本。
+// ech-proxy-core.go - v6.5 (Firefox Camouflage)
+// 协议内核：将 uTLS 伪装目标从 Chrome 更换为 Firefox，以避免触发 Cloudflare
+// 可能存在的强制 HTTP/2 策略。这是解决所有已知问题的最终版本。
 package main
 
 import (
@@ -25,7 +25,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.comcom/gorilla/websocket"
 	utls "github.com/refraction-networking/utls"
 )
 
@@ -61,6 +61,7 @@ type Rule struct {
 	Port        []int    `json:"port,omitempty"`
 	OutboundTag string   `json:"outboundTag"`
 }
+
 // ======================== Global State (No changes) ========================
 var (
 	globalConfig      Config
@@ -77,7 +78,7 @@ type ipRangeV6 struct { start [16]byte; end [16]byte }
 func main() {
 	configPath := flag.String("c", "config.json", "Path to config")
 	flag.Parse()
-	log.Println("[Core] X-Link Kernel v6.4 (ALPN Fix) Starting...")
+	log.Println("[Core] X-Link Kernel v6.5 (Firefox Camouflage) Starting...")
 	file, err := os.ReadFile(*configPath)
 	if err != nil { log.Fatalf("Failed to read config: %v", err) }
 	if err := json.Unmarshal(file, &globalConfig); err != nil { log.Fatalf("Config parse error: %v", err) }
@@ -123,11 +124,11 @@ func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 	config := &utls.Config{
 		ServerName:         host,
 		InsecureSkipVerify: true,
-		// 【【【最终修复】】】
-		// 强制应用层协议协商 (ALPN) 只使用 http/1.1，以匹配 websocket 库的行为。
 		NextProtos:         []string{"http/1.1"},
 	}
-	uconn := utls.UClient(dialConn, config, utls.HelloChrome_Auto)
+	// 【【【最终修复】】】
+	// 将伪装目标从 Chrome 更换为 Firefox，以期避免触发强制 HTTP/2
+	uconn := utls.UClient(dialConn, config, utls.HelloFirefox_102)
 	if err := uconn.Handshake(); err != nil {
 		return nil, err
 	}
@@ -136,7 +137,7 @@ func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 
 	customHeader := http.Header{}
 	customHeader.Add("X-Auth-Token", settings.Token)
-	customHeader.Add("Host", host)
+	customHeader.Add("Host", host) 
 
 	conn, _, err := websocket.NewClient(uconn, &wsURL, customHeader, 16*1024, 16*1024)
 	if err != nil {
