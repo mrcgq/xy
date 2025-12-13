@@ -10,8 +10,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"context"
-	"crypto/tls" // 用于 standard config 结构
 	"encoding/binary"
 	"encoding/json"
 	"errors"
