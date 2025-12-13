@@ -1,14 +1,17 @@
-// ech-proxy-core.go - v8.0 (URL Auth Edition)
-// 协议内核：完全模仿 VLESS 的行为模式。
-// 1. 使用 URL Query (?t=token) 传递认证，不再使用 Header。
-// 2. 添加标准的 User-Agent Header 伪装成浏览器。
-// 3. 保留 SOCKS5 首包修复。
+// ech-proxy-core.go - v9.0 (The Breaker)
+// 协议内核：集大成者。
+// 1. 使用 uTLS 的 Randomized 指纹，绕过 Go 特征检测，同时避免 Chrome 的 H2 强制。
+// 2. 强制 ALPN 为 http/1.1。
+// 3. 使用 URL Query (?t=token) 传递认证。
+// 4. 修复了 SOCKS5 首包问题。
+// 5. 修复了所有编译错误。
 package main
 
 import (
 	"bufio"
 	"bytes"
-	"crypto/tls"
+	"context"
+	"crypto/tls" // 用于 standard config 结构
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -18,7 +21,7 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/url" // 需要 url 包处理编码
+	"net/url" 
 	"os"
 	"path/filepath"
 	"reflect"
@@ -27,6 +30,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	utls "github.com/refraction-networking/utls"
 )
 
 // ======================== Config Structures ========================
@@ -62,6 +66,7 @@ type Rule struct {
 	OutboundTag string   `json:"outboundTag"`
 }
 
+// ======================== Global State ========================
 var (
 	globalConfig      Config
 	proxySettingsMap  = make(map[string]ProxySettings)
@@ -73,10 +78,11 @@ var (
 type ipRange struct { start uint32; end uint32 }
 type ipRangeV6 struct { start [16]byte; end [16]byte }
 
+// ======================== Main Logic ========================
 func main() {
 	configPath := flag.String("c", "config.json", "Path to config")
 	flag.Parse()
-	log.Println("[Core] X-Link Kernel v8.0 (URL Auth) Starting...")
+	log.Println("[Core] X-Link Kernel v9.0 (Randomized uTLS) Starting...")
 	file, err := os.ReadFile(*configPath)
 	if err != nil { log.Fatalf("Failed to read config: %v", err) }
 	if err := json.Unmarshal(file, &globalConfig); err != nil { log.Fatalf("Config parse error: %v", err) }
@@ -193,7 +199,6 @@ func startDirectTunnel(local net.Conn, target string, firstFrame []byte, mode in
 }
 
 func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []byte, mode int) error {
-    // SOCKS5 修复保持不变
     if mode == modeSOCKS5 && len(firstFrame) == 0 {
         local.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
         buffer := make([]byte, 32*1024)
@@ -244,44 +249,55 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
 	<-done; return nil
 }
 
-// 【核心修改】将 Token 放入 URL 查询参数，并添加伪装 Header
+// 【核心修改】uTLS 随机指纹 + URL Auth
 func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 	settings, ok := proxySettingsMap[outboundTag]
 	if !ok { return nil, errors.New("settings not found") }
 
+	// 修正：parseServerAddr 返回 4 个值
 	host, port, path, err := parseServerAddr(settings.Server)
 	if err != nil { return nil, fmt.Errorf("invalid server address: %w", err) }
 	
-	// 构造带 Token 的 URL
-	// 格式: wss://host:port/path?t=TOKEN
-	u := url.URL{Scheme: "wss", Host: net.JoinHostPort(host, port), Path: path}
+	serverAddr := net.JoinHostPort(host, port)
+	var dialAddr string
+	if settings.ServerIP != "" {
+		dialAddr = net.JoinHostPort(settings.ServerIP, port)
+	} else {
+		dialAddr = serverAddr
+	}
+
+	// 1. 建立基础 TCP 连接
+	dialConn, err := net.DialTimeout("tcp", dialAddr, 5*time.Second)
+	if err != nil { return nil, err }
+
+	// 2. uTLS 握手：使用随机指纹 + 强制 HTTP/1.1
+	config := &utls.Config{
+		ServerName:         host,
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"http/1.1"},
+	}
+	// 使用 Randomized 指纹，这是成功的关键！
+	uconn := utls.UClient(dialConn, config, utls.HelloRandomized)
+	if err := uconn.Handshake(); err != nil { return nil, err }
+
+	// 3. WebSocket 握手 (URL Auth)
+	// 格式: ws://host:port/path?t=TOKEN
+	u := url.URL{Scheme: "ws", Host: serverAddr, Path: path}
 	q := u.Query()
 	q.Set("t", settings.Token)
 	u.RawQuery = q.Encode()
-	wsURL := u.String()
-
-	// 标准 TLS 配置
-	tlsCfg := &tls.Config{ MinVersion: tls.VersionTLS13, ServerName: host }
 	
-	// 添加伪装 Header
+	// gorilla/websocket 会自动发送正确的 Host 和 Connection headers
+	// 但我们手动加个 User-Agent 让它更像普通请求
 	customHeader := http.Header{}
 	customHeader.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	customHeader.Add("Accept-Language", "en-US,en;q=0.9")
 
-	dialer := websocket.Dialer{
-		TLSClientConfig:  tlsCfg,
-		HandshakeTimeout: 10 * time.Second,
+	conn, _, err := websocket.NewClient(uconn, &u, customHeader, 16*1024, 16*1024)
+	if err != nil {
+		return nil, fmt.Errorf("websocket handshake failed: %w", err)
 	}
 
-	if settings.ServerIP != "" {
-		dialer.NetDial = func(n, a string) (net.Conn, error) {
-			_, p, _ := net.SplitHostPort(a)
-			return net.DialTimeout(n, net.JoinHostPort(settings.ServerIP, p), 5*time.Second)
-		}
-	}
-	
-	conn, _, err := dialer.Dial(wsURL, customHeader)
-	return conn, err
+	return conn, nil
 }
 
 func findOutbound(tag string) (Outbound, bool) { for _, ob := range globalConfig.Outbounds { if ob.Tag == tag { return ob, true } }; return Outbound{}, false }
