@@ -1,7 +1,9 @@
-name: Build Ultimate ech-proxy
+# .github/workflows/build.yml (适用于新项目结构)
+
+name: Build X-Link CLI Kernel
 
 on:
-  workflow_dispatch: # 仅手动触发，方便控制
+  workflow_dispatch: # 仅手动触发
 
 jobs:
   build:
@@ -15,14 +17,15 @@ jobs:
             goos: windows
             goarch: amd64
             ext: .exe
-          # Linux (用于服务器或软路由)
-            # goos: linux
-            # goarch: amd64
-            # ext: ""
-          # macOS (可选，M1/M2/M3芯片)
-            # goos: darwin
-            # goarch: arm64
-            # ext: ""
+          # 您可以取消注释来构建其他平台
+          # - os: linux
+          #   goos: linux
+          #   goarch: amd6d64
+          #   ext: ""
+          # - os: darwin-arm64
+          #   goos: darwin
+          #   goarch: arm64
+          #   ext: ""
 
     steps:
       - name: Checkout Code
@@ -31,31 +34,34 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          # 终极版使用了 reflect 来设置 ECH，必须使用 1.23 或更高版本
-          go-version: '1.23' 
+          go-version: '1.23' # 保持您的 Go 版本
 
-      - name: Initialize Module
+      - name: Initialize Module & Tidy
         run: |
-          # 自动初始化 module，防止因缺少 go.mod 导致编译失败
+          # 您的脚本很棒，我们保留它，但修改模块名以保持一致性
           if [ ! -f go.mod ]; then
-            go mod init ech-proxy
+            # 【【【核心改动 1】】】 模块名应与 main.go 中的 import 路径匹配
+            go mod init xlink-project 
             go get github.com/gorilla/websocket
             go mod tidy
           fi
+          # 确保所有依赖都已下载
+          go mod download
 
-      - name: Build Binary
+      - name: Build CLI Binary
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: 0 # 静态编译，无需依赖系统库
+          CGO_ENABLED: 0
         run: |
-          # -s -w 去除调试信息，减小体积
-          # "." 表示编译当前目录下的所有 main 包文件
-          go build -trimpath -ldflags="-s -w" -o ech-proxy-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} .
+          # 【【【核心改动 2】】】 
+          # 1. 输出文件名改为 xlink-cli 以反映新的程序
+          # 2. 编译目标从 "." (当前目录) 改为 "./cmd/xlink-cli" (新的 main 包路径)
+          go build -trimpath -ldflags="-s -w" -o xlink-cli-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} ./cmd/xlink-cli
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          # 上传产物命名格式：ech-proxy-windows-amd64
-          name: ech-proxy-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: ech-proxy-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+          # 【【【核心改动 3】】】 更新上传产物的名称和路径
+          name: xlink-cli-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: xlink-cli-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
