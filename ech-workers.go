@@ -1,6 +1,8 @@
-// ech-proxy-core.go - v10.3 (The Final Apology)
-// 协议内核：修正了 v10.1 中由于拼写错误 ("global" vs "globalConfig") 导致的致命编译错误。
-// 这是集所有已知修复于一身、经过严格审查、可成功编译的最终版本。
+// ech-proxy-core.go - v11.0 (In-Tunnel Handshake)
+// 协议内核：【终极方案】
+// 1. 发起一个完全干净的 WebSocket 握手到根路径 "/"。
+// 2. 在连接建立后，将 Token 和目标地址一起打包成第一个二进制消息发送。
+// 3. 这结合了 v1.2 的握手成功经验和 v2.0 的隧道安全特性。
 package main
 
 import (
@@ -16,7 +18,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -30,9 +31,21 @@ type Config struct {
 	Inbounds  []Inbound  `json:"inbounds"`
 	Outbounds []Outbound `json:"outbounds"`
 }
-type Inbound struct { Tag string `json:"tag"`; Listen string `json:"listen"`; Protocol string `json:"protocol"` }
-type Outbound struct { Tag string `json:"tag"`; Protocol string `json:"protocol"`; Settings json.RawMessage `json:"settings,omitempty"` }
-type ProxySettings struct { Server string `json:"server"`; ServerIP string `json:"server_ip"`; Token string `json:"token"` }
+type Inbound struct {
+	Tag      string `json:"tag"`
+	Listen   string `json:"listen"`
+	Protocol string `json:"protocol"`
+}
+type Outbound struct {
+	Tag      string          `json:"tag"`
+	Protocol string          `json:"protocol"`
+	Settings json.RawMessage `json:"settings,omitempty"`
+}
+type ProxySettings struct {
+	Server    string `json:"server"`
+	ServerIP  string `json:"server_ip"`
+	Token     string `json:"token"`
+}
 
 // ======================== Global State ========================
 var proxySettingsMap = make(map[string]ProxySettings)
@@ -41,17 +54,18 @@ var proxySettingsMap = make(map[string]ProxySettings)
 func main() {
 	configPath := flag.String("c", "config.json", "Path to config")
 	flag.Parse()
-	log.Println("[Core] X-Link Kernel v10.3 (Final Apology) Starting...")
-	
-	file, err := os.ReadFile(*configPath)
-	if err != nil { log.Fatalf("Failed to read config: %v", err) }
+	log.Println("[Core] X-Link Kernel v11.0 (In-Tunnel Handshake) Starting...")
 
-	var globalConfig Config // Correctly scoped variable
+	file, err := os.ReadFile(*configPath)
+	if err != nil {
+		log.Fatalf("Failed to read config: %v", err)
+	}
+
+	var globalConfig Config
 	if err := json.Unmarshal(file, &globalConfig); err != nil {
 		log.Fatalf("Config parse error: %v", err)
 	}
 
-	// 【【【最终修复】】】修正了致命的拼写错误 global -> globalConfig
 	for _, outbound := range globalConfig.Outbounds {
 		if outbound.Protocol == "ech-proxy" {
 			var settings ProxySettings
@@ -64,7 +78,10 @@ func main() {
 	var wg sync.WaitGroup
 	for _, inbound := range globalConfig.Inbounds {
 		wg.Add(1)
-		go func(ib Inbound) { defer wg.Done(); runInbound(ib) }(inbound)
+		go func(ib Inbound) {
+			defer wg.Done()
+			runInbound(ib)
+		}(inbound)
 	}
 	log.Println("[Core] Engine started.")
 	wg.Wait()
@@ -72,11 +89,16 @@ func main() {
 
 func runInbound(ib Inbound) {
 	listener, err := net.Listen("tcp", ib.Listen)
-	if err != nil { log.Printf("[Error] Listen failed on %s: %v", ib.Listen, err); return }
+	if err != nil {
+		log.Printf("[Error] Listen failed on %s: %v", ib.Listen, err)
+		return
+	}
 	log.Printf("[Inbound] Listening on %s (%s)", ib.Listen, ib.Tag)
 	for {
 		conn, err := listener.Accept()
-		if err != nil { continue }
+		if err != nil {
+			continue
+		}
 		go handleGeneralConnection(conn, ib.Tag)
 	}
 }
@@ -84,7 +106,9 @@ func runInbound(ib Inbound) {
 func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	defer conn.Close()
 	buf := make([]byte, 1)
-	if _, err := io.ReadFull(conn, buf); err != nil { return }
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return
+	}
 	var target string
 	var err error
 	var firstFrame []byte
@@ -96,41 +120,78 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	default:
 		target, firstFrame, mode, err = handleHTTP(conn, buf)
 	}
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	outboundTag := "proxy" // Simplified routing
 	log.Printf("[%s] %s -> %s | Routed to [%s]", inboundTag, conn.RemoteAddr().String(), target, outboundTag)
 	dispatch(conn, target, outboundTag, firstFrame, mode)
 }
 
 func handleSOCKS5(conn net.Conn) (string, error) {
-	handshakeBuf := make([]byte, 2); if _, err := io.ReadFull(conn, handshakeBuf); err != nil { return "", err }
+	handshakeBuf := make([]byte, 2)
+	if _, err := io.ReadFull(conn, handshakeBuf); err != nil {
+		return "", err
+	}
 	conn.Write([]byte{0x05, 0x00})
-	header := make([]byte, 4); if _, err := io.ReadFull(conn, header); err != nil { return "", err }
-	if header[1] != 0x01 { conn.Write([]byte{0x05, 0x07, 0x00, 0x01}); return "", errors.New("unsupported command") }
+	header := make([]byte, 4)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		return "", err
+	}
+	if header[1] != 0x01 {
+		conn.Write([]byte{0x05, 0x07, 0x00, 0x01})
+		return "", errors.New("unsupported command")
+	}
 	var host string
 	switch header[3] {
-	case 1: b := make([]byte, 4); io.ReadFull(conn, b); host = net.IP(b).String()
-	case 3: b := make([]byte, 1); io.ReadFull(conn, b); d := make([]byte, b[0]); io.ReadFull(conn, d); host = string(d)
-	case 4: b := make([]byte, 16); io.ReadFull(conn, b); host = net.IP(b).String()
-	default: return "", errors.New("bad addr type")
+	case 1:
+		b := make([]byte, 4)
+		io.ReadFull(conn, b)
+		host = net.IP(b).String()
+	case 3:
+		b := make([]byte, 1)
+		io.ReadFull(conn, b)
+		d := make([]byte, b[0])
+		io.ReadFull(conn, d)
+		host = string(d)
+	case 4:
+		b := make([]byte, 16)
+		io.ReadFull(conn, b)
+		host = net.IP(b).String()
+	default:
+		return "", errors.New("bad addr type")
 	}
-	portBytes := make([]byte, 2); io.ReadFull(conn, portBytes); port := binary.BigEndian.Uint16(portBytes)
+	portBytes := make([]byte, 2)
+	io.ReadFull(conn, portBytes)
+	port := binary.BigEndian.Uint16(portBytes)
 	return net.JoinHostPort(host, fmt.Sprintf("%d", port)), nil
 }
 
 func handleHTTP(conn net.Conn, initialData []byte) (string, []byte, int, error) {
 	reader := bufio.NewReader(io.MultiReader(bytes.NewReader(initialData), conn))
 	req, err := http.ReadRequest(reader)
-	if err != nil { return "", nil, 0, err }
-	if req.Method == "CONNECT" { return req.Host, nil, 2, nil }
-	var buf bytes.Buffer; req.WriteProxy(&buf); return req.Host, buf.Bytes(), 3, nil
+	if err != nil {
+		return "", nil, 0, err
+	}
+	if req.Method == "CONNECT" {
+		return req.Host, nil, 2, nil
+	}
+	var buf bytes.Buffer
+	req.WriteProxy(&buf)
+	return req.Host, buf.Bytes(), 3, nil
 }
 
-const ( modeSOCKS5 = 1; modeHTTPConnect = 2; modeHTTPProxy = 3 )
+const (
+	modeSOCKS5      = 1
+	modeHTTPConnect = 2
+	modeHTTPProxy   = 3
+)
 
 func dispatch(conn net.Conn, target, outboundTag string, firstFrame []byte, mode int) {
 	err := startProxyTunnel(conn, target, outboundTag, firstFrame, mode)
-	if err != nil { log.Printf("Tunnel failed for %s: %v", target, err) }
+	if err != nil {
+		log.Printf("Tunnel failed for %s: %v", target, err)
+	}
 }
 
 func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []byte, mode int) error {
@@ -139,62 +200,109 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
 		buffer := make([]byte, 32*1024)
 		n, readErr := local.Read(buffer)
 		local.SetReadDeadline(time.Time{})
-		if n > 0 { firstFrame = buffer[:n] }
-		if readErr != nil && !os.IsTimeout(readErr) && readErr != io.EOF { return readErr }
+		if n > 0 {
+			firstFrame = buffer[:n]
+		}
+		if readErr != nil && !os.IsTimeout(readErr) && readErr != io.EOF {
+			return readErr
+		}
 	}
 
 	wsConn, err := dialSpecificWebSocket(outboundTag)
 	if err != nil {
-		if mode == modeSOCKS5 { local.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) }
-		if mode == modeHTTPConnect { local.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n")) }
+		if mode == modeSOCKS5 {
+			local.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		}
+		if mode == modeHTTPConnect {
+			local.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		}
 		return err
 	}
 	defer wsConn.Close()
 
 	var handshakeBuf bytes.Buffer
-	addrLen := uint16(len(target)); binary.Write(&handshakeBuf, binary.BigEndian, addrLen)
-	handshakeBuf.WriteString(target)
-	if len(firstFrame) > 0 { handshakeBuf.Write(firstFrame) }
-	if err := wsConn.WriteMessage(websocket.BinaryMessage, handshakeBuf.Bytes()); err != nil { return err }
+	settings, _ := proxySettingsMap[outboundTag]
+	
+	// 从 GUI 加密和 base64 后的 Token 是字符串，直接转为字节
+	tokenBytes := []byte(settings.Token)
 
-	if mode == modeSOCKS5 { local.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) }
-	if mode == modeHTTPConnect { local.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
+	// 1. 写入 Token 长度 (2字节) 和 Token
+	tokenLen := uint16(len(tokenBytes))
+	binary.Write(&handshakeBuf, binary.BigEndian, tokenLen)
+	handshakeBuf.Write(tokenBytes)
+
+	// 2. 写入目标地址长度 (2字节) 和目标地址
+	addrLen := uint16(len(target))
+	binary.Write(&handshakeBuf, binary.BigEndian, addrLen)
+	handshakeBuf.WriteString(target)
+
+	// 3. 写入首包数据
+	if len(firstFrame) > 0 {
+		handshakeBuf.Write(firstFrame)
+	}
+
+	// 将完整的握手包作为第一个二进制消息发送
+	if err := wsConn.WriteMessage(websocket.BinaryMessage, handshakeBuf.Bytes()); err != nil {
+		return err
+	}
+
+	if mode == modeSOCKS5 {
+		local.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	}
+	if mode == modeHTTPConnect {
+		local.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	}
 
 	done := make(chan bool, 2)
 	go func() {
 		buf := make([]byte, 32*1024)
 		for {
 			n, err := local.Read(buf)
-			if err != nil { wsConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")); done <- true; return }
-			if err := wsConn.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil { done <- true; return }
+			if err != nil {
+				wsConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+				done <- true
+				return
+			}
+			if err := wsConn.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
+				done <- true
+				return
+			}
 		}
 	}()
 	go func() {
 		for {
 			_, msg, err := wsConn.ReadMessage()
-			if err != nil { local.Close(); done <- true; return }
-			if _, err := local.Write(msg); err != nil { done <- true; return }
+			if err != nil {
+				local.Close()
+				done <- true
+				return
+			}
+			if _, err := local.Write(msg); err != nil {
+				done <- true
+				return
+			}
 		}
 	}()
-	<-done; return nil
+	<-done
+	return nil
 }
 
 func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 	settings, ok := proxySettingsMap[outboundTag]
-	if !ok { return nil, errors.New("settings not found") }
+	if !ok {
+		return nil, errors.New("settings not found")
+	}
 
 	host, port, _, err := parseServerAddr(settings.Server)
-	if err != nil { return nil, fmt.Errorf("invalid server address: %w", err) }
-
-	u := url.URL{
-		Scheme: "wss",
-		Host:   net.JoinHostPort(host, port),
-		Path:   "/" + url.PathEscape(settings.Token),
+	if err != nil {
+		return nil, fmt.Errorf("invalid server address: %w", err)
 	}
-	wsURL := u.String()
 
-	tlsCfg := &tls.Config{ MinVersion: tls.VersionTLS13, ServerName: host }
-	
+	// 构造一个干净的 URL，路径为 "/"
+	wsURL := fmt.Sprintf("wss://%s:%s/", host, port)
+
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS13, ServerName: host}
+
 	customHeader := http.Header{}
 	customHeader.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
@@ -209,17 +317,17 @@ func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 			return net.DialTimeout(n, net.JoinHostPort(settings.ServerIP, p), 5*time.Second)
 		}
 	}
-	
+
 	conn, _, err := dialer.Dial(wsURL, customHeader)
 	return conn, err
 }
 
-func parseServerAddr(addr string) (host, port, path string, err error) { 
-    path = "/"
-    if idx := strings.Index(addr, "/"); idx != -1 { 
-        path = addr[idx:]
-        addr = addr[:idx] 
-    }
-    host, port, err = net.SplitHostPort(addr)
-    return 
+func parseServerAddr(addr string) (host, port, path string, err error) {
+	path = "/"
+	if idx := strings.Index(addr, "/"); idx != -1 {
+		path = addr[idx:]
+		addr = addr[:idx]
+	}
+	host, port, err = net.SplitHostPort(addr)
+	return
 }
