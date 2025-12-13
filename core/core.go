@@ -1,4 +1,4 @@
-// core/core.go (v1.4 - Binary Mode)
+// core/core.go (v1.4.1 - Import Fix)
 package core
 
 import (
@@ -6,7 +6,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/tls"
-	"encoding/base64"
+	// 【【【核心修正】】】 移除了未使用的 base64 包
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -19,7 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"strconv" // 导入 strconv 用于端口转换
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -70,7 +70,7 @@ var (
 type ipRange struct{ start uint32; end uint32 }
 type ipRangeV6 struct{ start [16]byte; end [16]byte }
 
-// wsWriter 辅助结构体，让 io.Copy 可以直接写入 WebSocket
+// wsWriter 辅助结构体
 type wsWriter struct { *websocket.Conn }
 func (w wsWriter) Write(p []byte) (int, error) {
     err := w.Conn.WriteMessage(websocket.BinaryMessage, p)
@@ -85,33 +85,23 @@ func buildBinaryHandshakeFrame(target string, firstFrame []byte) ([]byte, error)
     if err != nil { return nil, err }
     port, err := strconv.Atoi(portStr)
 	if err != nil { return nil, err }
-
     var addrBuffer bytes.Buffer
-    
     ip := net.ParseIP(host)
     if ip != nil && ip.To4() != nil {
-        addrBuffer.WriteByte(0x01) // Type: IPv4
-        addrBuffer.Write(ip.To4())
+        addrBuffer.WriteByte(0x01); addrBuffer.Write(ip.To4())
     } else if ip != nil && ip.To16() != nil {
-        addrBuffer.WriteByte(0x04) // Type: IPv6
-        addrBuffer.Write(ip.To16())
+        addrBuffer.WriteByte(0x04); addrBuffer.Write(ip.To16())
     } else {
         if len(host) > 255 { return nil, errors.New("domain too long") }
-        addrBuffer.WriteByte(0x03) // Type: Domain
-        addrBuffer.WriteByte(byte(len(host)))
-        addrBuffer.WriteString(host)
+        addrBuffer.WriteByte(0x03); addrBuffer.WriteByte(byte(len(host))); addrBuffer.WriteString(host)
     }
-
     portBytes := make([]byte, 2)
     binary.BigEndian.PutUint16(portBytes, uint16(port))
     addrBuffer.Write(portBytes)
-
     var finalFrame bytes.Buffer
-    finalFrame.WriteByte(0x01) // Version
-    finalFrame.WriteByte(0x01) // Command: New Connect
+    finalFrame.WriteByte(0x01); finalFrame.WriteByte(0x01)
     finalFrame.Write(addrBuffer.Bytes())
     finalFrame.Write(firstFrame)
-    
     return finalFrame.Bytes(), nil
 }
 
@@ -239,7 +229,6 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
 		return err
 	}
 	defer wsConn.Close()
-
 	noiseCount := mathrand.Intn(4) + 1
 	for i := 0; i < noiseCount; i++ {
 		noiseSize := mathrand.Intn(201) + 50
@@ -248,19 +237,13 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
 		if err := wsConn.WriteMessage(websocket.BinaryMessage, noise); err != nil { log.Printf("Warning: failed to send noise packet: %v", err) }
 		time.Sleep(time.Duration(mathrand.Intn(51)+10) * time.Millisecond)
 	}
-
 	handshakeFrame, err := buildBinaryHandshakeFrame(target, firstFrame)
 	if err != nil { return err }
     if err := wsConn.WriteMessage(websocket.BinaryMessage, handshakeFrame); err != nil { return err }
-
 	_, msg, err := wsConn.ReadMessage()
-	if err != nil || len(msg) != 2 || msg[0] != 0x01 || msg[1] != 0x00 {
-		return fmt.Errorf("binary handshake failed")
-	}
-    
+	if err != nil || len(msg) != 2 || msg[0] != 0x01 || msg[1] != 0x00 { return fmt.Errorf("binary handshake failed") }
 	if mode == modeSOCKS5 { local.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}) }
 	if mode == modeHTTPConnect { local.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
-	
 	done := make(chan bool, 2)
 	go func() {
 		io.Copy(wsWriter{wsConn}, local)
