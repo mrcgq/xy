@@ -6,8 +6,7 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"context"
-	"crypto/tls"
+
 	"encoding/binary"
 	"encoding/json"
 	"errors"
