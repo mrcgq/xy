@@ -1,4 +1,4 @@
-// cmd/xlink-cli/main.go (v2.0 - Config File Support)
+// cmd/xlink-cli/main.go (Final Version - Ready for Advanced GUI)
 package main
 
 import (
@@ -9,16 +9,12 @@ import (
 	"path/filepath"
 	"syscall"
 
-	// 確保這個導入路徑與您的項目結構匹配
+	// 确保这个导入路径与您的项目结构匹配
 	"xlink-project/core" 
 )
 
-// parseXlinkURI 函數已經不再需要，可以完全刪除。
-// 我們不再從 URI 生成配置，而是直接讀取配置文件。
-
 func main() {
-	// 1. 修改命令行參數：從 -uri 改為 -c (config)
-	// 默認值可以設置為程序目錄下的 config.json
+	// 命令行参数：-c (config)，默认值为程序目录下的 config.json
 	exePath, _ := os.Executable()
 	defaultConfigPath := filepath.Join(filepath.Dir(exePath), "config.json")
 
@@ -30,13 +26,13 @@ func main() {
 	}
 	log.Printf("[CLI] Loading configuration from: %s", *configFile)
 
-	// 2. 讀取配置文件內容
+	// 读取配置文件内容
 	configBytes, err := os.ReadFile(*configFile)
 	if err != nil {
 		log.Fatalf("[CLI] Failed to read config file: %v", err)
 	}
 
-	// 3. 直接將配置文件內容傳遞給核心
+	// 直接将配置文件内容传递给核心
 	log.Println("[CLI] Starting X-Link Core Engine...")
 	listener, err := core.StartInstance(configBytes)
 	if err != nil {
@@ -45,7 +41,7 @@ func main() {
 
 	log.Println("[CLI] Engine running successfully.")
 
-	// 優雅地關閉進程 (保持不變)
+	// 优雅地关闭进程
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
