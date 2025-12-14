@@ -15,9 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -40,9 +38,9 @@ type Outbound struct {
 	Settings json.RawMessage `json:"settings,omitempty"`
 }
 type ProxySettings struct {
-	Server    string `json:"server"`
-	ServerIP  string `json:"server_ip,omitempty"`
-	Token     string `json:"token"`
+	Server   string `json:"server"`
+	ServerIP string `json:"server_ip,omitempty"`
+	Token    string `json:"token"`
 }
 type Routing struct {
 	Rules           []Rule `json:"rules"`
@@ -54,9 +52,8 @@ type Rule struct {
 }
 
 var (
-	globalConfig      Config
-	proxySettingsMap  = make(map[string]ProxySettings)
-	// 移除 IP 库加载，简化逻辑专注于通
+	globalConfig     Config
+	proxySettingsMap = make(map[string]ProxySettings)
 )
 
 // ======================== Core Logic ========================
@@ -96,13 +93,18 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 }
 
 type multiListener struct{ listeners []net.Listener }
+
 func (ml *multiListener) Accept() (net.Conn, error) { return nil, nil }
 func (ml *multiListener) Close() error {
-	for _, l := range ml.listeners { l.Close() }
+	for _, l := range ml.listeners {
+		l.Close()
+	}
 	return nil
 }
 func (ml *multiListener) Addr() net.Addr {
-	if len(ml.listeners) > 0 { return ml.listeners[0].Addr() }
+	if len(ml.listeners) > 0 {
+		return ml.listeners[0].Addr()
+	}
 	return nil
 }
 
@@ -120,9 +122,11 @@ func parseOutbounds() {
 func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	defer conn.Close()
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	
+
 	buf := make([]byte, 1)
-	if _, err := io.ReadFull(conn, buf); err != nil { return }
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return
+	}
 	conn.SetReadDeadline(time.Time{})
 
 	var target string
@@ -140,7 +144,9 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 		return
 	}
 
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 
 	// 简化的路由逻辑：只看 InboundTag 绑定
 	outboundTag := route(target, inboundTag)
@@ -150,32 +156,41 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 
 func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) {
 	nmethodsBuf := make([]byte, 1)
-	if _, err := io.ReadFull(conn, nmethodsBuf); err != nil { return "", err }
+	if _, err := io.ReadFull(conn, nmethodsBuf); err != nil {
+		return "", err
+	}
 	methods := make([]byte, int(nmethodsBuf[0]))
-	if _, err := io.ReadFull(conn, methods); err != nil { return "", err }
-	conn.Write([]byte{0x05, 0x00}) 
+	if _, err := io.ReadFull(conn, methods); err != nil {
+		return "", err
+	}
+	conn.Write([]byte{0x05, 0x00})
 
 	header := make([]byte, 4)
-	if _, err := io.ReadFull(conn, header); err != nil { return "", err }
-	if header[1] != 0x01 { return "", errors.New("unsupported command") }
+	if _, err := io.ReadFull(conn, header); err != nil {
+		return "", err
+	}
+	if header[1] != 0x01 {
+		return "", errors.New("unsupported command")
+	}
 
 	var host string
 	switch header[3] {
-	case 1: 
+	case 1:
 		b := make([]byte, 4)
 		io.ReadFull(conn, b)
 		host = net.IP(b).String()
-	case 3: 
+	case 3:
 		b := make([]byte, 1)
 		io.ReadFull(conn, b)
 		d := make([]byte, b[0])
 		io.ReadFull(conn, d)
 		host = string(d)
-	case 4: 
+	case 4:
 		b := make([]byte, 16)
 		io.ReadFull(conn, b)
 		host = net.IP(b).String()
-	default: return "", errors.New("unsupported address type")
+	default:
+		return "", errors.New("unsupported address type")
 	}
 	portBytes := make([]byte, 2)
 	io.ReadFull(conn, portBytes)
@@ -187,11 +202,17 @@ func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) {
 func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) (string, []byte, int, error) {
 	reader := bufio.NewReader(io.MultiReader(bytes.NewReader(initialData), conn))
 	req, err := http.ReadRequest(reader)
-	if err != nil { return "", nil, 0, err }
+	if err != nil {
+		return "", nil, 0, err
+	}
 	target := req.Host
-	if !strings.Contains(target, ":") { target += ":80" }
-	mode := 3 
-	if req.Method == "CONNECT" { mode = 2 }
+	if !strings.Contains(target, ":") {
+		target += ":80"
+	}
+	mode := 3
+	if req.Method == "CONNECT" {
+		mode = 2
+	}
 	var firstFrame []byte
 	if mode == 3 {
 		var buf bytes.Buffer
@@ -206,7 +227,9 @@ func route(target, inboundTag string) string {
 	for _, rule := range globalConfig.Routing.Rules {
 		if len(rule.InboundTag) > 0 {
 			for _, t := range rule.InboundTag {
-				if t == inboundTag { return rule.OutboundTag }
+				if t == inboundTag {
+					return rule.OutboundTag
+				}
 			}
 		}
 	}
@@ -215,13 +238,20 @@ func route(target, inboundTag string) string {
 
 func dispatch(conn net.Conn, target, outboundTag string, firstFrame []byte, mode int) {
 	outbound, ok := findOutbound(outboundTag)
-	if !ok { conn.Close(); return }
+	if !ok {
+		conn.Close()
+		return
+	}
 
 	var err error
 	switch outbound.Protocol {
-	case "freedom": err = startDirectTunnel(conn, target, firstFrame, mode)
-	case "ech-proxy": err = startProxyTunnel(conn, target, outboundTag, firstFrame, mode)
-	case "blackhole": conn.Close(); return
+	case "freedom":
+		err = startDirectTunnel(conn, target, firstFrame, mode)
+	case "ech-proxy":
+		err = startProxyTunnel(conn, target, outboundTag, firstFrame, mode)
+	case "blackhole":
+		conn.Close()
+		return
 	}
 	if err != nil && err != io.EOF {
 		// log.Printf("Tunnel error: %v", err)
@@ -230,11 +260,18 @@ func dispatch(conn net.Conn, target, outboundTag string, firstFrame []byte, mode
 
 func startDirectTunnel(local net.Conn, target string, firstFrame []byte, mode int) error {
 	remote, err := net.DialTimeout("tcp", target, 5*time.Second)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	defer remote.Close()
-	if mode == 1 { local.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) } 
-	else if mode == 2 { local.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
-	if len(firstFrame) > 0 { remote.Write(firstFrame) }
+	if mode == 1 {
+		local.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	} else if mode == 2 {
+		local.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	}
+	if len(firstFrame) > 0 {
+		remote.Write(firstFrame)
+	}
 	go io.Copy(remote, local)
 	io.Copy(local, remote)
 	return nil
@@ -243,7 +280,9 @@ func startDirectTunnel(local net.Conn, target string, firstFrame []byte, mode in
 // 【重要修正】改为文本协议 CONNECT:
 func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []byte, mode int) error {
 	wsConn, err := dialSpecificWebSocket(outboundTag)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	defer wsConn.Close()
 
 	// Keep-Alive
@@ -254,33 +293,46 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
 		defer ticker.Stop()
 		for {
 			select {
-			case <-ticker.C: wsConn.WriteMessage(websocket.PingMessage, nil)
-			case <-stopPing: return
+			case <-ticker.C:
+				wsConn.WriteMessage(websocket.PingMessage, nil)
+			case <-stopPing:
+				return
 			}
 		}
 	}()
 
 	// 1. 发送文本握手指令
 	encodedFrame := ""
-	if len(firstFrame) > 0 { encodedFrame = base64.StdEncoding.EncodeToString(firstFrame) }
+	if len(firstFrame) > 0 {
+		encodedFrame = base64.StdEncoding.EncodeToString(firstFrame)
+	}
 	// 协议格式：CONNECT:目标地址|Base64数据
 	connectMsg := fmt.Sprintf("CONNECT:%s|%s", target, encodedFrame)
-	
-	if err := wsConn.WriteMessage(websocket.TextMessage, []byte(connectMsg)); err != nil { return err }
+
+	if err := wsConn.WriteMessage(websocket.TextMessage, []byte(connectMsg)); err != nil {
+		return err
+	}
 
 	// 2. 等待服务端响应 "CONNECTED"
 	_, msg, err := wsConn.ReadMessage()
-	if err != nil { return err }
-	if string(msg) != "CONNECTED" { return fmt.Errorf("proxy error: %s", string(msg)) }
+	if err != nil {
+		return err
+	}
+	if string(msg) != "CONNECTED" {
+		return fmt.Errorf("proxy error: %s", string(msg))
+	}
 
 	// 3. 响应本地客户端
-	if mode == 1 { local.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) } 
-	else if mode == 2 { local.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
+	if mode == 1 {
+		local.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	} else if mode == 2 {
+		local.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	}
 
 	// 4. 双向转发
 	done := make(chan bool, 2)
 	go func() {
-		buf := make([]byte, 32*1024)
+		buf := make([]byte, 32 * 1024)
 		for {
 			n, err := local.Read(buf)
 			if err != nil {
@@ -294,9 +346,17 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
 	go func() {
 		for {
 			mt, message, err := wsConn.ReadMessage()
-			if err != nil { done <- true; return }
-			if mt == websocket.TextMessage && string(message) == "CLOSE" { done <- true; return }
-			if mt == websocket.BinaryMessage { local.Write(message) }
+			if err != nil {
+				done <- true
+				return
+			}
+			if mt == websocket.TextMessage && string(message) == "CLOSE" {
+				done <- true
+				return
+			}
+			if mt == websocket.BinaryMessage {
+				local.Write(message)
+			}
 		}
 	}()
 	<-done
@@ -305,13 +365,15 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
 
 func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 	settings, ok := proxySettingsMap[outboundTag]
-	if !ok { return nil, errors.New("settings not found") }
+	if !ok {
+		return nil, errors.New("settings not found")
+	}
 
 	host, port, path, _ := parseServerAddr(settings.Server)
 	wsURL := fmt.Sprintf("wss://%s:%s%s", host, port, path)
 
 	dialer := websocket.Dialer{
-		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true, ServerName: host}, // InsecureSkipVerify 可选，视情况而定
+		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true, ServerName: host},
 		HandshakeTimeout: 10 * time.Second,
 		Subprotocols:     []string{settings.Token}, // Token 放在子协议头里
 	}
@@ -334,13 +396,24 @@ func parseServerAddr(addr string) (host, port, path string, err error) {
 		addr = addr[:idx]
 	}
 	host, port, err = net.SplitHostPort(addr)
-	if err != nil { host = addr; port = "443"; err = nil }
+	if err != nil {
+		host = addr
+		port = "443"
+		err = nil
+	}
 	return
 }
 
 func findOutbound(tag string) (Outbound, bool) {
 	for _, ob := range globalConfig.Outbounds {
-		if ob.Tag == tag { return ob, true }
+		if ob.Tag == tag {
+			return ob, true
+		}
 	}
 	return Outbound{}, false
+}
+
+func getExeDir() string {
+	exePath, _ := os.Executable()
+	return filepath.Dir(exePath)
 }
