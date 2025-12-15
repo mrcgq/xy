@@ -1,4 +1,3 @@
-// core/core.go (v1.3 - Advanced Behavior Mimicry)
 package core
 
 import (
@@ -26,7 +25,7 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// JsonEnvelope 结构体不变
+// JsonEnvelope 用于 WebSocket 消息封装
 type JsonEnvelope struct {
 	ID   string `json:"id"`
 	Type string `json:"type"`
@@ -35,6 +34,7 @@ type JsonEnvelope struct {
 }
 
 // ======================== Config Structures ========================
+// 这些结构体必须与 C 客户端生成的 JSON 严格对应
 type Config struct {
 	Inbounds  []Inbound  `json:"inbounds"`
 	Outbounds []Outbound `json:"outbounds"`
@@ -50,10 +50,11 @@ type Outbound struct {
 	Protocol string          `json:"protocol"`
 	Settings json.RawMessage `json:"settings,omitempty"`
 }
+// 这里的 Token 是 C 客户端加密后的 Base64 字符串
 type ProxySettings struct {
 	Server   string `json:"server"`
 	ServerIP string `json:"server_ip"`
-	Token    string `json:"token"`
+	Token    string `json:"token"` 
 }
 type Routing struct {
 	Rules           []Rule `json:"rules"`
@@ -66,6 +67,7 @@ type Rule struct {
 	Port        []int    `json:"port,omitempty"`
 	OutboundTag string   `json:"outboundTag"`
 }
+
 var (
 	globalConfig      Config
 	proxySettingsMap  = make(map[string]ProxySettings)
@@ -96,13 +98,8 @@ func unwrapFromJson(rawMsg []byte) ([]byte, error) {
 	if err := json.Unmarshal(rawMsg, &envelope); err != nil {
 		return nil, fmt.Errorf("not a valid json envelope: %w", err)
 	}
-	// 忽略心跳回应包
-	if envelope.Type == "pong" {
-		return nil, nil
-	}
-	if envelope.Type != "sync_data" {
-		return nil, errors.New("not a sync_data type message")
-	}
+	if envelope.Type == "pong" { return nil, nil }
+	if envelope.Type != "sync_data" { return nil, errors.New("not a sync_data type message") }
 	return base64.StdEncoding.DecodeString(envelope.Data)
 }
 
@@ -111,25 +108,24 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 	if err := json.Unmarshal(configContent, &globalConfig); err != nil {
 		return nil, fmt.Errorf("config parse error: %w", err)
 	}
-	loadChinaListsForRouter()
+	// 暂时注释掉加载 IP 库，防止因为文件不存在导致启动失败，你可以把 ip 文件放在同级目录后再开启
+	// loadChinaListsForRouter() 
 	parseOutbounds()
+	
 	if len(globalConfig.Inbounds) == 0 {
 		return nil, errors.New("no inbounds configured")
 	}
 	inbound := globalConfig.Inbounds[0]
 	listener, err := net.Listen("tcp", inbound.Listen)
 	if err != nil {
-		log.Printf("[Error] Listen failed on %s: %v", inbound.Listen, err)
-		return nil, err
+		return nil, fmt.Errorf("listen failed on %s: %v", inbound.Listen, err)
 	}
-	log.Printf("[Inbound] Listening on %s (%s)", inbound.Listen, inbound.Tag)
+	log.Printf("[Core] SOCKS5 Listening on %s", inbound.Listen)
+	
 	go func() {
 		for {
 			conn, err := listener.Accept()
-			if err != nil {
-				log.Printf("[Core] Listener closed on %s: %v", inbound.Listen, err)
-				break
-			}
+			if err != nil { break }
 			go handleGeneralConnection(conn, inbound.Tag)
 		}
 	}()
@@ -150,13 +146,13 @@ func parseOutbounds() {
 func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	defer conn.Close()
 	buf := make([]byte, 1)
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		return
-	}
+	if _, err := io.ReadFull(conn, buf); err != nil { return }
+	
 	var target string
 	var err error
 	var firstFrame []byte
-	var mode int
+	var mode int // 1: SOCKS5, 2: CONNECT, 3: HTTP Proxy
+
 	switch buf[0] {
 	case 0x05:
 		target, err = handleSOCKS5(conn, inboundTag)
@@ -166,224 +162,174 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	default:
 		return
 	}
+
 	if err != nil {
-		log.Printf("[%s] Protocol error: %v", inboundTag, err)
+		log.Printf("[%s] Protocol handshake failed: %v", inboundTag, err)
 		return
 	}
-	outboundTag := route(target, inboundTag)
-	log.Printf("[%s] %s -> %s | Routed to [%s]", inboundTag, conn.RemoteAddr().String(), target, outboundTag)
+
+	// 简单路由：直接查找名为 "proxy" 的 outbound
+	// 因为 V2.0 客户端生成的 config.json 默认只有 "direct", "block", "proxy"
+	outboundTag := "proxy"
+	
+	// 如果需要路由逻辑，可以恢复 route() 函数调用
+	// outboundTag = route(target, inboundTag)
+
+	log.Printf("[%s] %s -> %s | Routed to [%s]", inboundTag, conn.RemoteAddr(), target, outboundTag)
 	dispatch(conn, target, outboundTag, firstFrame, mode)
 }
 
 func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) {
+	// 标准 SOCKS5 握手
 	handshakeBuf := make([]byte, 2)
 	if _, err := io.ReadFull(conn, handshakeBuf); err != nil { return "", err }
-	conn.Write([]byte{0x05, 0x00})
+	conn.Write([]byte{0x05, 0x00}) // 无需认证
+	
 	header := make([]byte, 4)
 	if _, err := io.ReadFull(conn, header); err != nil { return "", err }
-	if header[1] != 0x01 { conn.Write([]byte{0x05, 0x07, 0x00, 0x01}); return "", errors.New("unsupported SOCKS5 command") }
+	
 	var host string
 	switch header[3] {
-	case 1: b := make([]byte, 4); io.ReadFull(conn, b); host = net.IP(b).String()
-	case 3: b := make([]byte, 1); io.ReadFull(conn, b); d := make([]byte, b[0]); io.ReadFull(conn, d); host = string(d)
-	case 4: b := make([]byte, 16); io.ReadFull(conn, b); host = net.IP(b).String()
-	default: return "", errors.New("bad addr type")
+	case 1: // IPv4
+		b := make([]byte, 4); io.ReadFull(conn, b); host = net.IP(b).String()
+	case 3: // Domain
+		b := make([]byte, 1); io.ReadFull(conn, b); 
+		d := make([]byte, b[0]); io.ReadFull(conn, d); host = string(d)
+	case 4: // IPv6
+		b := make([]byte, 16); io.ReadFull(conn, b); host = net.IP(b).String()
+	default: 
+		return "", errors.New("unsupported addr type")
 	}
-	portBytes := make([]byte, 2); io.ReadFull(conn, portBytes); port := binary.BigEndian.Uint16(portBytes)
-	target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
-	log.Printf("[%s] SOCKS5: %s -> %s", inboundTag, conn.RemoteAddr().String(), target)
-	return target, nil
+	
+	portBytes := make([]byte, 2); io.ReadFull(conn, portBytes)
+	port := binary.BigEndian.Uint16(portBytes)
+	
+	return net.JoinHostPort(host, fmt.Sprintf("%d", port)), nil
 }
 
 func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) (string, []byte, int, error) {
+	// 简单的 HTTP 嗅探
 	reader := bufio.NewReader(io.MultiReader(bytes.NewReader(initialData), conn))
 	req, err := http.ReadRequest(reader)
 	if err != nil { return "", nil, 0, err }
+	
 	target := req.Host
-	mode := 2
-	if req.Method == "CONNECT" {
-		log.Printf("[%s] HTTP CONNECT: %s -> %s", inboundTag, conn.RemoteAddr().String(), target)
-		return target, nil, mode, nil
+	if !strings.Contains(target, ":") {
+		if req.Method == "CONNECT" { target += ":443" } else { target += ":80" }
 	}
-	log.Printf("[%s] HTTP Proxy: %s -> %s", inboundTag, conn.RemoteAddr().String(), target)
-	mode = 3
+
+	if req.Method == "CONNECT" {
+		return target, nil, 2, nil
+	}
+	
+	// 普通 HTTP 代理，需要把请求重新写出去
 	var buf bytes.Buffer
 	req.WriteProxy(&buf)
-	return target, buf.Bytes(), mode, nil
-}
-
-func route(target, inboundTag string) string {
-	host, _, _ := net.SplitHostPort(target); if host == "" { host = target }
-	for _, rule := range globalConfig.Routing.Rules {
-		if len(rule.InboundTag) > 0 {
-			match := false; for _, t := range rule.InboundTag { if t == inboundTag { match = true; break } }; if !match { continue }
-		}
-		if len(rule.Domain) > 0 { for _, d := range rule.Domain { if strings.Contains(host, d) { return rule.OutboundTag } } }
-		if rule.GeoIP == "cn" {
-			if isChinaIPForRouter(net.ParseIP(host)) { return rule.OutboundTag }
-			ips, err := net.LookupIP(host); if err == nil && len(ips) > 0 && isChinaIPForRouter(ips[0]) { return rule.OutboundTag }
-		}
-	}
-	if globalConfig.Routing.DefaultOutbound != "" { return globalConfig.Routing.DefaultOutbound }
-	return "direct"
+	return target, buf.Bytes(), 3, nil
 }
 
 func dispatch(conn net.Conn, target, outboundTag string, firstFrame []byte, mode int) {
-	outbound, ok := findOutbound(outboundTag); if !ok { return }
-	var err error
-	switch outbound.Protocol {
-	case "freedom": err = startDirectTunnel(conn, target, firstFrame, mode)
-	case "ech-proxy": err = startProxyTunnel(conn, target, outboundTag, firstFrame, mode)
-	case "blackhole": conn.Close(); return
+	// 如果是直连
+	if outboundTag == "direct" {
+		startDirectTunnel(conn, target, firstFrame, mode)
+		return
 	}
-	if err != nil { log.Printf("Tunnel failed for %s: %v", target, err) }
+	
+	// 代理连接
+	startProxyTunnel(conn, target, outboundTag, firstFrame, mode)
 }
 
-const ( modeSOCKS5 = 1; modeHTTPConnect = 2; modeHTTPProxy = 3 )
-
-func startDirectTunnel(local net.Conn, target string, firstFrame []byte, mode int) error {
+func startDirectTunnel(local net.Conn, target string, firstFrame []byte, mode int) {
 	remote, err := net.DialTimeout("tcp", target, 5*time.Second)
-	if err != nil {
-		if mode == modeSOCKS5 { local.Write([]byte{0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}) }
-		if mode == modeHTTPConnect { local.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n")) }
-		return err
-	}
+	if err != nil { return }
 	defer remote.Close()
-	if mode == modeSOCKS5 { local.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}) }
-	if mode == modeHTTPConnect { local.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
+	
+	if mode == 1 { local.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) }
+	if mode == 2 { local.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
+	
 	if len(firstFrame) > 0 { remote.Write(firstFrame) }
+	
 	go io.Copy(remote, local)
 	io.Copy(local, remote)
-	return nil
 }
 
+// 【关键】此函数必须保留 JSON 消息协议，以配合你的 "Legacy Adapter" JS 服务端
 func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []byte, mode int) error {
 	wsConn, err := dialSpecificWebSocket(outboundTag)
-	if err != nil {
-		if mode == modeSOCKS5 { local.Write([]byte{0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}) }
-		if mode == modeHTTPConnect { local.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n")) }
-		return err
-	}
+	if err != nil { return err }
 	defer wsConn.Close()
 
-	noiseCount := mathrand.Intn(4) + 1
-	for i := 0; i < noiseCount; i++ {
-		noiseSize := mathrand.Intn(201) + 50
-		noise := make([]byte, noiseSize)
-		rand.Read(noise)
-		if err := wsConn.WriteMessage(websocket.BinaryMessage, noise); err != nil {
-			log.Printf("Warning: failed to send noise packet: %v", err)
-		}
-		time.Sleep(time.Duration(mathrand.Intn(51)+10) * time.Millisecond)
-	}
-
+	// 发送握手包 (X-LINK:target|base64_first_frame)
 	connectMsg := fmt.Sprintf("X-LINK:%s|%s", target, base64.StdEncoding.EncodeToString(firstFrame))
-	jsonHandshake, err := wrapAsJson([]byte(connectMsg))
-	if err != nil { return fmt.Errorf("failed to wrap handshake in json: %w", err) }
+	jsonHandshake, _ := wrapAsJson([]byte(connectMsg))
+	
+	// 客户端可以先发送一点噪音，JS 服务端 v2.1 能够忽略它 (可选)
+	// noise := make([]byte, 100); rand.Read(noise); wsConn.WriteMessage(websocket.BinaryMessage, noise)
+
 	if err := wsConn.WriteMessage(websocket.TextMessage, jsonHandshake); err != nil { return err }
 
+	// 等待 "X-LINK-OK"
 	_, msg, err := wsConn.ReadMessage()
 	if err != nil { return err }
+	
 	okPayload, err := unwrapFromJson(msg)
 	if err != nil || string(okPayload) != "X-LINK-OK" {
-		return fmt.Errorf("handshake failed or unexpected response: %s", msg)
+		return fmt.Errorf("handshake failed")
 	}
     
-	if mode == modeSOCKS5 { local.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}) }
-	if mode == modeHTTPConnect { local.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
+	// 响应本地客户端连接成功
+	if mode == 1 { local.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) }
+	if mode == 2 { local.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
 	
+	// 开始 JSON 数据流转发
 	done := make(chan bool, 2)
 
+	// 本地 -> 远程 (JSON 包装)
 	go func() {
-		lastSendTime := time.Now()
-		heartbeatTicker := time.NewTicker(15 * time.Second)
-		defer heartbeatTicker.Stop()
-		buf := make([]byte, 32*1024)
+		buf := make([]byte, 16*1024)
 		for {
-			local.SetReadDeadline(time.Now().Add(1 * time.Second))
 			n, err := local.Read(buf)
 			if n > 0 {
-				lastSendTime = time.Now()
-				remainingData := buf[:n]
-				for len(remainingData) > 0 {
-					chunkSize := mathrand.Intn(2501) + 500
-					if chunkSize > len(remainingData) {
-						chunkSize = len(remainingData)
-					}
-					chunk := remainingData[:chunkSize]
-					remainingData = remainingData[chunkSize:]
-					jsonData, err := wrapAsJson(chunk)
-					if err != nil { continue }
-					if err := wsConn.WriteMessage(websocket.TextMessage, jsonData); err != nil {
-						done <- true
-						return
-					}
-					if len(remainingData) > 0 {
-						time.Sleep(time.Duration(mathrand.Intn(46)+5) * time.Millisecond)
-					}
-				}
+				jsonData, _ := wrapAsJson(buf[:n])
+				wsConn.WriteMessage(websocket.TextMessage, jsonData)
 			}
-			if err != nil {
-				if os.IsTimeout(err) {
-					select {
-					case <-heartbeatTicker.C:
-						if time.Since(lastSendTime) > 15*time.Second {
-							pingEnvelope := JsonEnvelope{ ID: fmt.Sprintf("ping_%x", time.Now().Unix()), Type: "ping", TS: time.Now().UnixMilli(), Data: "" }
-							pingJson, _ := json.Marshal(pingEnvelope)
-							if err := wsConn.WriteMessage(websocket.TextMessage, pingJson); err != nil {
-								done <- true
-								return
-							}
-							lastSendTime = time.Now()
-						}
-					default:
-					}
-					continue
-				}
-				wsConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-				done <- true
-				return
-			}
+			if err != nil { break }
 		}
+		done <- true
 	}()
 
+	// 远程 -> 本地 (JSON 解包)
 	go func() {
 		for {
 			_, msg, err := wsConn.ReadMessage()
-			if err != nil { local.Close(); done <- true; return }
-			payload, err := unwrapFromJson(msg)
-			if err != nil || payload == nil { continue }
-			if _, err := local.Write(payload); err != nil { done <- true; return }
+			if err != nil { break }
+			payload, _ := unwrapFromJson(msg)
+			if payload != nil {
+				local.Write(payload)
+			}
 		}
+		done <- true
 	}()
 
 	<-done
 	return nil
 }
 
-// 找到 dialSpecificWebSocket 函数，替换为以下代码
-
 func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 	settings, ok := proxySettingsMap[outboundTag]
-	if !ok {
-		return nil, errors.New("settings not found")
-	}
+	if !ok { return nil, errors.New("settings not found") }
 
+	// 这里的 settings.Token 已经是 C 客户端生成的 Base64 字符串了
+	// 我们直接把它放入 Sec-WebSocket-Protocol 头部
+	
 	host, port, path, _ := parseServerAddr(settings.Server)
 	wsURL := fmt.Sprintf("wss://%s:%s%s", host, port, path)
 
-	// 【新增】添加伪装 Header，防止被 CF 判定为爬虫/机器人
-	requestHeader := http.Header{}
-	requestHeader.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	requestHeader.Add("Host", host)
-	requestHeader.Add("Origin", fmt.Sprintf("https://%s", host))
-
 	dialer := websocket.Dialer{
-		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true, ServerName: host},
-		HandshakeTimeout: 10 * time.Second,
-		Subprotocols:     []string{settings.Token},
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, ServerName: host},
+		Subprotocols:    []string{settings.Token}, // 关键：Token 放在这里
 	}
-
+	
 	if settings.ServerIP != "" {
 		dialer.NetDial = func(network, addr string) (net.Conn, error) {
 			_, p, _ := net.SplitHostPort(addr)
@@ -391,69 +337,17 @@ func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 		}
 	}
 
-	// 传入 requestHeader
-	conn, resp, err := dialer.Dial(wsURL, requestHeader)
-	if err != nil {
-		// 详细打印 HTTP 状态码，这是排查问题的关键
-		if resp != nil {
-			return nil, fmt.Errorf("connect failed (HTTP %d - %s): %v", resp.StatusCode, resp.Status, err)
-		}
-		return nil, fmt.Errorf("connect failed (Network Error): %v", err)
-	}
-	return conn, nil
-}
-
-func findOutbound(tag string) (Outbound, bool) {
-	for _, ob := range globalConfig.Outbounds { if ob.Tag == tag { return ob, true } }; return Outbound{}, false
-}
-
-func getExeDir() string {
-	exePath, _ := os.Executable(); return filepath.Dir(exePath)
-}
-
-func ipToUint32(ip net.IP) uint32 {
-	ip = ip.To4(); if ip == nil { return 0 }; return binary.BigEndian.Uint32(ip)
-}
-
-func isChinaIPForRouter(ip net.IP) bool {
-	if ip == nil { return false }
-	if ip4 := ip.To4(); ip4 != nil {
-		val := ipToUint32(ip4); chinaIPRangesMu.RLock(); defer chinaIPRangesMu.RUnlock()
-		for _, r := range chinaIPRanges { if val >= r.start && val <= r.end { return true } }
-	} else if ip16 := ip.To16(); ip16 != nil {
-		var val [16]byte; copy(val[:], ip16); chinaIPV6RangesMu.RLock(); defer chinaIPV6RangesMu.RUnlock()
-		for _, r := range chinaIPV6Ranges { if bytes.Compare(val[:], r.start[:]) >= 0 && bytes.Compare(val[:], r.end[:]) <= 0 { return true } }
-	}
-	return false
-}
-
-func loadChinaListsForRouter() {
-	loadIPListForRouter("chn_ip.txt", &chinaIPRanges, &chinaIPRangesMu, false)
-	loadIPListForRouter("chn_ip_v6.txt", &chinaIPV6Ranges, &chinaIPV6RangesMu, true)
-}
-
-func loadIPListForRouter(filename string, target interface{}, mu *sync.RWMutex, isV6 bool) {
-	file, err := os.Open(filepath.Join(getExeDir(), filename)); if err != nil { return }
-	defer file.Close()
-	var rangesV4 []ipRange; var rangesV6 []ipRangeV6
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		parts := strings.Fields(scanner.Text()); if len(parts) < 2 { continue }
-		startIP, endIP := net.ParseIP(parts[0]), net.ParseIP(parts[1]); if startIP == nil || endIP == nil { continue }
-		if isV6 {
-			var s, e [16]byte; copy(s[:], startIP.To16()); copy(e[:], endIP.To16())
-			rangesV6 = append(rangesV6, ipRangeV6{start: s, end: e})
-		} else {
-			s, e := ipToUint32(startIP), ipToUint32(endIP)
-			if s > 0 && e > 0 { rangesV4 = append(rangesV4, ipRange{start: s, end: e}) }
-		}
-	}
-	mu.Lock(); defer mu.Unlock()
-	if isV6 { reflect.ValueOf(target).Elem().Set(reflect.ValueOf(rangesV6)) } else { reflect.ValueOf(target).Elem().Set(reflect.ValueOf(rangesV4)) }
+	conn, _, err := dialer.Dial(wsURL, nil)
+	return conn, err
 }
 
 func parseServerAddr(addr string) (host, port, path string, err error) {
-	path = "/"; if idx := strings.Index(addr, "/"); idx != -1 { path = addr[idx:]; addr = addr[:idx] }
+	path = "/"
+	if idx := strings.Index(addr, "/"); idx != -1 {
+		path = addr[idx:]
+		addr = addr[:idx]
+	}
 	host, port, err = net.SplitHostPort(addr)
+	if err != nil { host = addr; port = "443"; err = nil }
 	return
 }
