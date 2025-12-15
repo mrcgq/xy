@@ -1,4 +1,4 @@
-// core/core.go (Debug Version)
+// core/core.go (Ultimate Performance Edition - Binary Protocol)
 package core
 
 import (
@@ -21,13 +21,7 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-type JsonEnvelope struct {
-	ID   string `json:"id"`
-	Type string `json:"type"`
-	TS   int64  `json:"ts"`
-	Data string `json:"data"`
-}
-
+// 配置结构体保持不变，兼容 C 客户端生成的 config.json
 type Config struct {
 	Inbounds  []Inbound  `json:"inbounds"`
 	Outbounds []Outbound `json:"outbounds"`
@@ -65,28 +59,6 @@ var (
 	proxySettingsMap = make(map[string]ProxySettings)
 )
 
-func wrapAsJson(payload []byte) ([]byte, error) {
-	idBytes := make([]byte, 4)
-	rand.Read(idBytes)
-	envelope := JsonEnvelope{
-		ID:   fmt.Sprintf("msg_%x", idBytes),
-		Type: "sync_data",
-		TS:   time.Now().UnixMilli(),
-		Data: base64.StdEncoding.EncodeToString(payload),
-	}
-	return json.Marshal(envelope)
-}
-
-func unwrapFromJson(rawMsg []byte) ([]byte, error) {
-	var envelope JsonEnvelope
-	if err := json.Unmarshal(rawMsg, &envelope); err != nil {
-		return nil, fmt.Errorf("invalid json: %w", err)
-	}
-	if envelope.Type == "pong" { return nil, nil }
-	if envelope.Type != "sync_data" { return nil, errors.New("not sync_data") }
-	return base64.StdEncoding.DecodeString(envelope.Data)
-}
-
 func StartInstance(configContent []byte) (net.Listener, error) {
 	proxySettingsMap = make(map[string]ProxySettings)
 	if err := json.Unmarshal(configContent, &globalConfig); err != nil {
@@ -98,7 +70,7 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 	inbound := globalConfig.Inbounds[0]
 	listener, err := net.Listen("tcp", inbound.Listen)
 	if err != nil { return nil, err }
-	log.Printf("[Core] Listening on %s", inbound.Listen)
+	log.Printf("[Core] Listening on %s (Binary Mode)", inbound.Listen)
 
 	go func() {
 		for {
@@ -136,17 +108,16 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 		target, err = handleSOCKS5(conn, inboundTag)
 		mode = 1
 	default: 
-		// 简单处理 HTTP/其他
 		target, firstFrame, mode, err = handleHTTP(conn, buf, inboundTag)
 	}
 
 	if err != nil {
-		log.Printf("[ERROR] Protocol error: %v", err)
+		log.Printf("[ERROR] Handshake: %v", err)
 		return
 	}
 
 	log.Printf("[%s] Request -> %s", inboundTag, target)
-	dispatch(conn, target, "proxy", firstFrame, mode)
+	startProxyTunnelBinary(conn, target, "proxy", firstFrame, mode)
 }
 
 func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) {
@@ -175,81 +146,92 @@ func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) (string, [
 	return target, buf.Bytes(), 3, nil
 }
 
-func dispatch(conn net.Conn, target, outboundTag string, firstFrame []byte, mode int) {
-	startProxyTunnel(conn, target, outboundTag, firstFrame, mode)
-}
-
-func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []byte, mode int) {
-	// 1. 连接 WebSocket
+// 【终极性能核心】使用二进制流协议，零拷贝转发
+func startProxyTunnelBinary(local net.Conn, target, outboundTag string, firstFrame []byte, mode int) {
 	wsConn, err := dialSpecificWebSocket(outboundTag)
 	if err != nil {
-		log.Printf("[ERROR] Failed to connect to proxy: %v", err)
-		local.Close()
+		log.Printf("[ERROR] Connect proxy failed: %v", err)
 		return
 	}
 	defer wsConn.Close()
 
-	// 2. 发送握手
-	log.Printf("[Debug] Sending handshake for %s", target)
-	connectMsg := fmt.Sprintf("X-LINK:%s|%s", target, base64.StdEncoding.EncodeToString(firstFrame))
-	jsonHandshake, _ := wrapAsJson([]byte(connectMsg))
-	if err := wsConn.WriteMessage(websocket.TextMessage, jsonHandshake); err != nil {
-		log.Printf("[ERROR] Failed to send handshake: %v", err)
-		return
-	}
+	// 1. 构建二进制握手包 (0x01 0x01 | ADDR)
+	// 格式: [HEAD 2][TYPE 1][HOST VAR][PORT 2][DATA VAR]
+	var buf bytes.Buffer
+	buf.Write([]byte{0x01, 0x01}) // 协议头
 
-	// 3. 等待响应
-	log.Printf("[Debug] Waiting for handshake response...")
-	wsConn.SetReadDeadline(time.Now().Add(10 * time.Second)) // 设置10秒超时
-	_, msg, err := wsConn.ReadMessage()
-	if err != nil {
-		log.Printf("[ERROR] Failed to read response: %v", err)
-		return
-	}
-	wsConn.SetReadDeadline(time.Time{}) // 取消超时
-
-	okPayload, err := unwrapFromJson(msg)
-	if err != nil {
-		log.Printf("[ERROR] Invalid response format: %v", err)
-		return
+	host, portStr, _ := net.SplitHostPort(target)
+	portInt, _ := net.LookupPort("tcp", portStr)
+	
+	ip := net.ParseIP(host)
+	if ip4 := ip.To4(); ip4 != nil {
+		buf.WriteByte(0x01)
+		buf.Write(ip4)
+	} else {
+		buf.WriteByte(0x03)
+		buf.WriteByte(byte(len(host)))
+		buf.WriteString(host)
 	}
 	
-	respStr := string(okPayload)
-	if respStr != "X-LINK-OK" {
-		log.Printf("[ERROR] Handshake rejected by server. Response: %s", respStr)
+	portBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(portBytes, uint16(portInt))
+	buf.Write(portBytes)
+	
+	if len(firstFrame) > 0 {
+		buf.Write(firstFrame)
+	}
+
+	log.Printf("[Debug] Sending Binary Handshake...")
+	if err := wsConn.WriteMessage(websocket.BinaryMessage, buf.Bytes()); err != nil {
+		log.Printf("[ERROR] Write handshake failed: %v", err)
 		return
 	}
 
-	log.Printf("[Success] Tunnel established for %s", target)
+	// 2. 等待二进制响应 (0x01 0x00)
+	_, msg, err := wsConn.ReadMessage()
+	if err != nil {
+		log.Printf("[ERROR] Read response failed: %v", err)
+		return
+	}
+	if len(msg) < 2 || msg[0] != 0x01 || msg[1] != 0x00 {
+		log.Printf("[ERROR] Handshake rejected. Response: %x", msg)
+		return
+	}
 
-	// 4. 响应本地
+	log.Printf("[Success] Tunnel established (Binary Mode)")
+
+	// 3. 响应本地
 	if mode == 1 { local.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) }
 	if mode == 2 { local.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
 
-	// 5. 转发
-	done := make(chan bool, 2)
+	// 4. 极速双向流转发 (Pipe)
+	// 使用 io.Copy 实现内核级数据搬运，无需 JS/JSON 介入
+	
+	// WebSocket -> Local
 	go func() {
-		buf := make([]byte, 16*1024)
 		for {
-			n, err := local.Read(buf)
-			if n > 0 {
-				jsonData, _ := wrapAsJson(buf[:n])
-				if err := wsConn.WriteMessage(websocket.TextMessage, jsonData); err != nil { break }
+			mt, r, err := wsConn.NextReader()
+			if err != nil { break }
+			if mt == websocket.BinaryMessage {
+				if _, err := io.Copy(local, r); err != nil { break }
 			}
-			if err != nil { break }
 		}
-		done <- true
+		local.Close()
 	}()
-	go func() {
-		for {
-			_, msg, err := wsConn.ReadMessage()
+
+	// Local -> WebSocket
+	// 使用 NextWriter 减少内存分配
+	bufCopy := make([]byte, 32*1024)
+	for {
+		n, err := local.Read(bufCopy)
+		if n > 0 {
+			w, err := wsConn.NextWriter(websocket.BinaryMessage)
 			if err != nil { break }
-			payload, _ := unwrapFromJson(msg)
-			if payload != nil { local.Write(payload) }
+			w.Write(bufCopy[:n])
+			w.Close()
 		}
-		done <- true
-	}()
-	<-done
+		if err != nil { break }
+	}
 }
 
 func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
@@ -262,10 +244,9 @@ func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 	requestHeader := http.Header{}
 	requestHeader.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
 	requestHeader.Add("Host", host)
-	// Cloudflare 对 Origin 检查很严格，部分节点需要为空或者与 Host 一致
 	requestHeader.Add("Origin", fmt.Sprintf("https://%s", host))
 
-	log.Printf("[Debug] Dialing WebSocket: %s (IP: %s)", wsURL, settings.ServerIP)
+	log.Printf("[Debug] Dialing: %s (IP: %s)", wsURL, settings.ServerIP)
 
 	dialer := websocket.Dialer{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, ServerName: host},
@@ -283,7 +264,6 @@ func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 	conn, resp, err := dialer.Dial(wsURL, requestHeader)
 	if err != nil {
 		if resp != nil {
-			// 【关键】打印 HTTP 状态码，这是判断失败原因的核心
 			return nil, fmt.Errorf("HTTP %s (Code: %d)", resp.Status, resp.StatusCode)
 		}
 		return nil, err
