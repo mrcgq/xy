@@ -11,23 +11,23 @@ import (
 )
 
 func main() {
-	// 改动：不再接收 -uri，改为接收 -c (config file path)
-	configFile := flag.String("c", "", "path to config.json")
+	// 【核心修正】改为接收 -c 参数，指向配置文件路径
+	configFile := flag.String("c", "config.json", "Path to config file")
 	flag.Parse()
 
 	if *configFile == "" {
-		log.Fatalf("Usage: %s -c <config.json>", os.Args[0])
+		log.Fatal("[CLI] Error: Config file path is required. Usage: -c <path>")
 	}
 
-	log.Printf("[CLI] Loading config from: %s", *configFile)
-
-	// 1. 读取文件内容
+	// 1. 读取 C 客户端生成的 config.json 文件
+	log.Printf("[CLI] Loading configuration from: %s", *configFile)
 	configBytes, err := os.ReadFile(*configFile)
 	if err != nil {
 		log.Fatalf("[CLI] Failed to read config file: %v", err)
 	}
 
-	// 2. 启动核心引擎 (Core 本身就是接收 []byte 的)
+	// 2. 启动核心引擎
+	// core.StartInstance 会解析 JSON 并启动监听
 	log.Println("[CLI] Starting X-Link Core Engine...")
 	listener, err := core.StartInstance(configBytes)
 	if err != nil {
@@ -36,7 +36,7 @@ func main() {
 
 	log.Println("[CLI] Engine running successfully.")
 
-	// 等待退出信号
+	// 3. 阻塞等待退出信号
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
