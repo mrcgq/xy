@@ -1,46 +1,55 @@
-# .github/workflows/build.yml (已修复并优化)
+# .github/workflows/build.yml (v4.0 - Dual Core Build)
 
-name: Build X-Link CLI Kernel
+name: Build X-Link Dual Core Kernels
 
-# 【核心修复】: 
-# 添加 push 事件触发器。
-# 现在，每当有代码被推送到 main 分支时，此工作流程都会自动运行。
-# 同时保留 workflow_dispatch，以便您仍然可以手动触发。
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
 
 jobs:
-  build:
-    name: Build for windows
-    runs-on: ubuntu-latest # 我们只构建 Windows 版本，所以可以简化 strategy
+  build-kernels:
+    name: Build Windows Kernels
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout Code
-        # 使用 v4 版本，确保拉取的是触发本次工作流程的最新代码
         uses: actions/checkout@v4
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23' 
+          go-version: '1.23' # 请根据你的 Go 版本修改
 
-      # 【优化步骤】: 将依赖处理合并到构建前，更加清晰
       - name: Download Go Modules
         run: go mod tidy
 
-      - name: Build CLI Binary
+      - name: Build Binary Core (v3.3)
         env:
           GOOS: windows
           GOARCH: amd64
           CGO_ENABLED: 0
         run: |
-          # 编译目标是 ./cmd/xlink-cli
-          go build -trimpath -ldflags="-s -w" -o xlink-cli.exe ./cmd/xlink-cli
+          echo "Building Binary Kernel..."
+          go build -v -trimpath -ldflags="-s -w" -tags binary -o xlink-cli-binary.exe ./cmd/xlink-cli
 
-      - name: Upload Artifact
+      - name: Build JSON Core (v2.8)
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: |
+          echo "Building JSON Kernel..."
+          go build -v -trimpath -ldflags="-s -w" -tags json -o xlink-cli-json.exe ./cmd/xlink-cli
+          
+      - name: Upload Binary Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: xlink-cli-windows-amd64
-          path: xlink-cli.exe
+          name: xlink-cli-binary-windows
+          path: xlink-cli-binary.exe
+
+      - name: Upload JSON Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xlink-cli-json-windows
+          path: xlink-cli-json.exe
