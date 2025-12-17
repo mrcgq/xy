@@ -132,7 +132,10 @@ func connectGhostTunnel(target, outboundTag string, payload []byte) (*websocket.
 // 发送幽灵协议握手包
 func sendGhostHandshake(wsConn *websocket.Conn, target string, secretKey string, payload []byte) error {
 	// A. 准备时间戳 (8 bytes BigEndian)
-	ts := time.Now().UnixNano() / 1e6 // 毫秒级时间戳，与JS端 Date.now() 对应
+    ts := time.Now().Unix() // 发送秒级时间戳
+	
+	
+	
 	tsBytes := make([]byte, 8)
 	// 注意：JS端解析 BigInt 比较麻烦，这里我们遵循 JS 端的解析逻辑：高4位在前
 	// 简单处理：将 uint64 分拆
