@@ -1,41 +1,52 @@
-- name: Build Windows Kernels
-      runs-on: ubuntu-latest
-      steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3
+# .github/workflows/build.yml
 
-      - name: Set up Go
-        uses: actions/setup-go@v4
-        with:
-          go-version: '1.21' # 或者你需要的 Go 版本
+name: Build X-Link Kernels
 
-      - name: Download Go Modules
-        working-directory: ./cmd/xlink-cli
-        run: go mod tidy
+# This workflow is triggered on pushes to the main branch
+# or can be triggered manually from the Actions tab.
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build-kernels:
+    name: Build Windows Kernels
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v3
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.21'
+
+    - name: Download Go Modules
+      working-directory: ./cmd/xlink-cli
+      run: go mod tidy
       
-      # ======================= 核心修改部分 =======================
-      - name: Build Unified Binary Kernel
-        working-directory: ./cmd/xlink-cli
-        run: |
-          echo "Building Unified Kernel as xlink-cli-binary.exe..."
-          # 直接编译 main.go，输出文件名指定为 xlink-cli-binary.exe
-          go build -ldflags="-s -w" -o xlink-cli-binary.exe .
+    - name: Build Unified Binary Kernel
+      working-directory: ./cmd/xlink-cli
+      run: |
+        echo "Building Unified Kernel as xlink-cli-binary.exe..."
+        go build -ldflags="-s -w" -o xlink-cli-binary.exe .
 
-      - name: Create Dummy JSON Kernel
-        run: |
-          echo "Creating a dummy file for xlink-cli-json.exe to satisfy the GUI..."
-          # 创建一个空的占位文件，防止 C++ 客户端找不到文件而报错
-          echo "This is a dummy file. The real kernel is xlink-cli-binary.exe." > xlink-cli-json.exe
+    - name: Create Dummy JSON Kernel
+      working-directory: ./cmd/xlink-cli
+      run: |
+        echo "Creating a dummy file for xlink-cli-json.exe to satisfy the GUI..."
+        echo "This is a dummy file. The real kernel is xlink-cli-binary.exe." > xlink-cli-json.exe
 
-      - name: Upload Binary Artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: xlink-cli-binary
-          path: ./cmd/xlink-cli/xlink-cli-binary.exe
-          
-      - name: Upload JSON Artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: xlink-cli-json
-          path: ./xlink-cli-json.exe # 注意路径
-      # ==========================================================
+    - name: Upload Binary Artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: xlink-cli-binary-windows
+        path: ./cmd/xlink-cli/xlink-cli-binary.exe
+        
+    - name: Upload JSON Artifact (Dummy)
+      uses: actions/upload-artifact@v3
+      with:
+        name: xlink-cli-json-windows
+        path: ./cmd/xlink-cli/xlink-cli-json.exe
