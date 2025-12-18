@@ -107,23 +107,25 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 }
 
 // 建立 Ghost 协议连接
+// 修改后的 connectGhostTunnel (core-binary.go)
+// 变更点：移除硬编码，恢复使用 settings.Token
+
 func connectGhostTunnel(target, outboundTag string, payload []byte) (*websocket.Conn, error) {
 	settings, ok := proxySettingsMap[outboundTag]
 	if !ok { return nil, errors.New("settings not found") }
 
 	// 1. 建立纯净的 WebSocket 连接
-	// 这里使用 := 是正确的，因为 wsConn 和 err 都是新变量
 	wsConn, err := dialCleanWebSocket(settings)
 	if err != nil { return nil, err }
 
 	// =========================================================
-	// 【关键修正】强制使用明文密钥
+	// 【关键修正】恢复动态配置
+	// 此时 settings.Token 里面存的就是 C++ 传过来的明文 Secret Key
 	// =========================================================
-	const RealSecretKey = "my-secret-key-888" 
-
-	// 2. 发送幽灵握手包
-	// 注意：这里必须用 = (赋值)，因为 err 已经在上面定义过了
-	err = sendGhostHandshake(wsConn, target, RealSecretKey, payload)
+	
+	// 2. 发送幽灵握手包 (使用动态密钥)
+	err = sendGhostHandshake(wsConn, target, settings.Token, payload)
+	
 	if err != nil {
 		wsConn.Close()
 		return nil, err
