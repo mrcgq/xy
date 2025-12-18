@@ -1,4 +1,4 @@
-# .github/workflows/build.yml (v8.0 - Cross-Compilation Fix)
+# .github/workflows/build.yml (v8.0 - Clean Build)
 
 name: Build X-Link Kernels
 
@@ -28,14 +28,10 @@ jobs:
       run: |
         echo "Building Unified Kernel for Windows (amd64)..."
         cd cmd/xlink-cli
-        # 【关键修正】增加了 GOOS 和 GOARCH 环境变量来进行交叉编译
+        # 编译命令：指定 tags binary 确保包含 v7.3 的核心逻辑
         GOOS=windows GOARCH=amd64 go build -tags binary -ldflags="-s -w" -o xlink-cli-binary.exe .
 
-    - name: Create Dummy JSON Kernel
-      run: |
-        echo "Creating a dummy file for xlink-cli-json.exe..."
-        # 同样需要指定目标路径
-        echo "This is a dummy file." > cmd/xlink-cli/xlink-cli-json.exe
+    # [已删除] 创建 Dummy JSON 文件的步骤 (客户端 v8.2 已不再需要)
 
     - name: Upload Binary Artifact
       uses: actions/upload-artifact@v4
@@ -43,8 +39,4 @@ jobs:
         name: xlink-cli-binary-windows
         path: ./cmd/xlink-cli/xlink-cli-binary.exe
         
-    - name: Upload JSON Artifact (Dummy)
-      uses: actions/upload-artifact@v4
-      with:
-        name: xlink-cli-json-windows
-        path: ./cmd/xlink-cli/xlink-cli-json.exe
+    # [已删除] 上传 JSON Artifact 的步骤
