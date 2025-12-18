@@ -1,9 +1,7 @@
-# .github/workflows/build.yml
+# .github/workflows/build.yml (v4 Final)
 
 name: Build X-Link Kernels
 
-# This workflow is triggered on pushes to the main branch
-# or can be triggered manually from the Actions tab.
 on:
   push:
     branches: [ "main" ]
@@ -39,14 +37,16 @@ jobs:
         echo "Creating a dummy file for xlink-cli-json.exe to satisfy the GUI..."
         echo "This is a dummy file. The real kernel is xlink-cli-binary.exe." > xlink-cli-json.exe
 
+    # ======================= 核心修改部分 (v3 -> v4) =======================
     - name: Upload Binary Artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4 # <--- 修改点 1
       with:
         name: xlink-cli-binary-windows
         path: ./cmd/xlink-cli/xlink-cli-binary.exe
         
     - name: Upload JSON Artifact (Dummy)
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4 # <--- 修改点 2
       with:
         name: xlink-cli-json-windows
         path: ./cmd/xlink-cli/xlink-cli-json.exe
+    # ====================================================================
