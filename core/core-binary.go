@@ -1,6 +1,6 @@
-// core/core-binary.go (v6.0 - Ghost Protocol)
-// 职责：实现 Xlink Ghost 协议 (HMAC+TS+二进制流)
-// 兼容：新的 Xlink Ghost Worker 服务端
+// core/core-binary.go (v6.4 Final Fix)
+// 修复编译错误：变量重复声明
+// 功能：强制硬编码密钥，对接 Ghost 服务端
 
 //go:build binary
 // +build binary
@@ -29,7 +29,7 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-// --- 基础结构保持不变 ---
+// --- 基础结构 ---
 type Config struct { Inbounds []Inbound `json:"inbounds"`; Outbounds []Outbound `json:"outbounds"`; Routing Routing `json:"routing"` }
 type Inbound struct { Tag string `json:"tag"`; Listen string `json:"listen"`; Protocol string `json:"protocol"` }
 type Outbound struct { Tag string `json:"tag"`; Protocol string `json:"protocol"`; Settings json.RawMessage `json:"settings,omitempty"` }
@@ -70,11 +70,10 @@ func parseOutbounds() {
 	}
 }
 
-// ======================== 核心连接逻辑 (修改重点) ========================
+// ======================== 核心连接逻辑 ========================
 
 func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	defer conn.Close()
-	// 读取第一个字节来判断是 SOCKS5 还是 HTTP
 	buf := make([]byte, 1)
 	if _, err := io.ReadFull(conn, buf); err != nil { return }
 
@@ -93,15 +92,12 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 
 	if err != nil { return }
 	
-	// 连接 Ghost WebSocket 并执行隧道内握手
+	// 连接 Ghost WebSocket
 	wsConn, err := connectGhostTunnel(target, "proxy", firstFrame)
 	if err != nil {
-		// log.Printf("[ERROR] Ghost connection to %s failed: %v", target, err)
 		return
 	}
 	
-	// log.Printf("[Success] Tunnel established: %s", target)
-
 	// 响应本地客户端连接成功
 	if mode == 1 { conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) }
 	if mode == 2 { conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
@@ -111,43 +107,36 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 }
 
 // 建立 Ghost 协议连接
-
-
 func connectGhostTunnel(target, outboundTag string, payload []byte) (*websocket.Conn, error) {
-    settings, ok := proxySettingsMap[outboundTag]
-    if !ok { return nil, errors.New("settings not found") }
+	settings, ok := proxySettingsMap[outboundTag]
+	if !ok { return nil, errors.New("settings not found") }
 
-    // 1. 建立连接
-    wsConn, err := dialCleanWebSocket(settings)
-    if err != nil { return nil, err }
+	// 1. 建立纯净的 WebSocket 连接
+	// 这里使用 := 是正确的，因为 wsConn 和 err 都是新变量
+	wsConn, err := dialCleanWebSocket(settings)
+	if err != nil { return nil, err }
 
-    // =========================================================
-    // 【关键修正】强制使用明文密钥，无视 C++ 传来的 settings.Token
-    // =========================================================
-    const RealSecretKey = "my-secret-key-888" 
-    
-    // 注意：这里第三个参数必须是 RealSecretKey，绝对不能是 settings.Token
-    err = sendGhostHandshake(wsConn, target, RealSecretKey, payload)
-    
-    if err != nil {
-        wsConn.Close()
-        return nil, err
-    }
+	// =========================================================
+	// 【关键修正】强制使用明文密钥
+	// =========================================================
+	const RealSecretKey = "my-secret-key-888" 
 
-    return wsConn, nil
+	// 2. 发送幽灵握手包
+	// 注意：这里必须用 = (赋值)，因为 err 已经在上面定义过了
+	err = sendGhostHandshake(wsConn, target, RealSecretKey, payload)
+	if err != nil {
+		wsConn.Close()
+		return nil, err
+	}
+
+	return wsConn, nil
 }
 
 // 发送幽灵协议握手包
 func sendGhostHandshake(wsConn *websocket.Conn, target string, secretKey string, payload []byte) error {
-	// A. 准备时间戳 (8 bytes BigEndian)
-    ts := time.Now().Unix() // 发送秒级时间戳
-	ts := time.Now().Unix() // 秒级
-	
-	
-	
+	// A. 准备时间戳 (8 bytes BigEndian) - 秒级
+	ts := time.Now().Unix() 
 	tsBytes := make([]byte, 8)
-	// 注意：JS端解析 BigInt 比较麻烦，这里我们遵循 JS 端的解析逻辑：高4位在前
-	// 简单处理：将 uint64 分拆
 	binary.BigEndian.PutUint64(tsBytes, uint64(ts))
 
 	// B. 准备目标地址 (XOR 加密)
@@ -191,27 +180,24 @@ func sendGhostHandshake(wsConn *websocket.Conn, target string, secretKey string,
 	return wsConn.WriteMessage(websocket.BinaryMessage, packet)
 }
 
-// 拨号器：只负责建立 TCP/TLS 和 WS 握手，不负责业务鉴权
+// 拨号器
 func dialCleanWebSocket(settings ProxySettings) (*websocket.Conn, error) {
 	host, port, path, _ := parseServerAddr(settings.Server)
 	wsURL := fmt.Sprintf("wss://%s:%s%s", host, port, path)
 	
-	// 设置极简 Header，伪装成普通浏览器
 	requestHeader := http.Header{}
 	requestHeader.Add("Host", host)
 	requestHeader.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
 	dialer := websocket.Dialer{
 		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true, // 如果用 IP 直连需要这个，或者设置 ServerName
+			InsecureSkipVerify: true,
 			ServerName:         host,
 		},
 		HandshakeTimeout: 5 * time.Second,
 	}
 
-	// 处理 SOCKS5 前置代理或 IP 直连
 	if settings.ForwarderSettings != nil && settings.ForwarderSettings.Socks5Address != "" {
-		// SOCKS5 逻辑 (省略部分复杂错误处理以保持简洁)
 		proxyAddrStr := settings.ForwarderSettings.Socks5Address
 		if !strings.Contains(proxyAddrStr, "://") { proxyAddrStr = "socks5://" + proxyAddrStr }
 		proxyURL, _ := url.Parse(proxyAddrStr)
@@ -224,14 +210,12 @@ func dialCleanWebSocket(settings ProxySettings) (*websocket.Conn, error) {
 		socks5Dialer, _ := proxy.SOCKS5("tcp", proxyURL.Host, auth, proxy.Direct)
 		dialer.NetDial = socks5Dialer.Dial
 	} else if settings.ServerIP != "" {
-		// 指定 IP 逻辑
 		dialer.NetDial = func(network, addr string) (net.Conn, error) {
 			_, p, _ := net.SplitHostPort(addr)
 			return net.DialTimeout(network, net.JoinHostPort(settings.ServerIP, p), 5*time.Second)
 		}
 	}
 
-	// 注意：这里绝对不要设置 Subprotocols (Token)，那是特征！
 	conn, resp, err := dialer.Dial(wsURL, requestHeader)
 	if err != nil {
 		if resp != nil {
@@ -242,7 +226,7 @@ func dialCleanWebSocket(settings ProxySettings) (*websocket.Conn, error) {
 	return conn, nil
 }
 
-// 直接管道转发 (Binary Message)
+// 直接管道转发
 func pipeDirect(local net.Conn, ws *websocket.Conn) {
 	defer ws.Close()
 	
@@ -251,7 +235,7 @@ func pipeDirect(local net.Conn, ws *websocket.Conn) {
 		for {
 			mt, r, err := ws.NextReader()
 			if err != nil { break }
-			if mt == websocket.BinaryMessage { // 只接受二进制
+			if mt == websocket.BinaryMessage { 
 				io.Copy(local, r)
 			}
 		}
