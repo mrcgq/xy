@@ -1,4 +1,4 @@
-# .github/workflows/build.yml (v7.7 - Final Explicit Build)
+# .github/workflows/build.yml (v7.8 - Final Standard Build)
 
 name: Build X-Link Kernels
 
@@ -20,24 +20,24 @@ jobs:
       uses: actions/setup-go@v4
       with:
         go-version: '1.21'
-
+    
+    # 【修正点 1】go mod tidy 应该在项目根目录运行
     - name: Download Go Modules
-      # 依然在 cmd/xlink-cli 目录下运行 go mod tidy，因为它需要 go.mod 文件
-      working-directory: ./cmd/xlink-cli
       run: go mod tidy
       
     # ======================= 这是唯一修改的部分 =======================
     - name: Build Unified Binary Kernel
       run: |
         echo "Building Unified Kernel as xlink-cli-binary.exe..."
-        # 强制指定所有源文件一起编译，避免包查找问题
-        # 输出文件直接指定到目标目录
-        go build -ldflags="-s -w" -o cmd/xlink-cli/xlink-cli-binary.exe cmd/xlink-cli/main.go core/config_generator.go core/core-binary.go
+        # 【核心修正】进入 main.go 所在的目录，然后编译它
+        # Go 会自动找到它 import 的 core 包
+        cd cmd/xlink-cli
+        go build -ldflags="-s -w" -o xlink-cli-binary.exe .
 
     - name: Create Dummy JSON Kernel
-      # 这个命令在根目录运行，所以输出路径也要写全
       run: |
         echo "Creating a dummy file for xlink-cli-json.exe to satisfy the GUI..."
+        # 在同一个目录下创建虚拟文件
         echo "This is a dummy file." > cmd/xlink-cli/xlink-cli-json.exe
     # ================================================================
 
