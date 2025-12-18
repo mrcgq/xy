@@ -1,3 +1,5 @@
+// cmd/xlink-cli/main.go (Final Fix v7.3)
+
 package main
 
 import (
@@ -7,14 +9,16 @@ import (
 	"os/signal"
 	"syscall"
 
-	"xlink-project/core"
+	// 【关键修正 1】确保 import 路径与你的 go.mod 文件匹配
+	// 根据你的 GitHub 仓库地址，应该是这个
+	"github.com/mrcgq/xy/core" 
 )
 
 func main() {
-    // 【修改点】不再使用 -c，而是直接接收 flag 参数
-	configFile := flag.String("c", "config.json", "Path to config file") // 保留兼容性
-	
-    // 【新增】定义所有需要的命令行参数
+    // 【关键修正 2】移除无用的 configFile 变量
+    // configFile := flag.String("c", "config.json", "Path to config file") // DELETED
+
+    // 定义所有需要的命令行参数
     serverAddr := flag.String("server", "", "Server address")
     serverIP := flag.String("ip", "", "Specific server IP")
     secretKey := flag.String("key", "", "Secret key for authentication")
@@ -27,7 +31,9 @@ func main() {
     // 动态生成 JSON 配置
 	configJSON := core.GenerateConfigJSON(*serverAddr, *serverIP, *secretKey, *socks5Addr, *fallbackAddr, *listenAddr)
 
-	log.Println("[CLI] Starting X-Link Ghost Core Engine...")
+	log.Println("[CLI] Starting X-Link Unified Ghost Core Engine...")
+    
+    // 【关键修正 3】确保函数调用正确
 	listener, err := core.StartInstance([]byte(configJSON))
 	if err != nil {
 		log.Fatalf("[CLI] Failed to start core engine: %v", err)
