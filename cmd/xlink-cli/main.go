@@ -1,4 +1,3 @@
-
 package main
 
 import (
@@ -12,21 +11,24 @@ import (
 )
 
 func main() {
-	configFile := flag.String("c", "config.json", "Path to config file")
+    // 【修改点】不再使用 -c，而是直接接收 flag 参数
+	configFile := flag.String("c", "config.json", "Path to config file") // 保留兼容性
+	
+    // 【新增】定义所有需要的命令行参数
+    serverAddr := flag.String("server", "", "Server address")
+    serverIP := flag.String("ip", "", "Specific server IP")
+    secretKey := flag.String("key", "", "Secret key for authentication")
+    socks5Addr := flag.String("s5", "", "SOCKS5 proxy address")
+    fallbackAddr := flag.String("fallback", "", "Fallback address")
+    listenAddr := flag.String("listen", "127.0.0.1:10808", "Local listen address")
+
 	flag.Parse()
 
-	if *configFile == "" {
-		log.Fatal("[CLI] Error: Config file path is required. Usage: -c <path>")
-	}
+    // 动态生成 JSON 配置
+	configJSON := core.GenerateConfigJSON(*serverAddr, *serverIP, *secretKey, *socks5Addr, *fallbackAddr, *listenAddr)
 
-	log.Printf("[CLI] Loading configuration from: %s", *configFile)
-	configBytes, err := os.ReadFile(*configFile)
-	if err != nil {
-		log.Fatalf("[CLI] Failed to read config file: %v", err)
-	}
-
-	log.Println("[CLI] Starting X-Link Core Engine v3.0...")
-	listener, err := core.StartInstance(configBytes)
+	log.Println("[CLI] Starting X-Link Ghost Core Engine...")
+	listener, err := core.StartInstance([]byte(configJSON))
 	if err != nil {
 		log.Fatalf("[CLI] Failed to start core engine: %v", err)
 	}
