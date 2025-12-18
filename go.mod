@@ -1,5 +1,10 @@
-module xlink-project
+// go.mod (Final Fix v7.4)
 
-go 1.24.0
+module github.com/mrcgq/xy
 
-require github.com/gorilla/websocket v1.5.3
+go 1.21
+
+require (
+	github.com/gorilla/websocket v1.5.3
+	golang.org/x/net v0.27.0
+)
