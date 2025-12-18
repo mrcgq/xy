@@ -1,4 +1,4 @@
-# .github/workflows/build.yml (v7.9 - Fix Build Tags)
+# .github/workflows/build.yml (v8.0 - Cross-Compilation Fix)
 
 name: Build X-Link Kernels
 
@@ -24,20 +24,18 @@ jobs:
     - name: Download Go Modules
       run: go mod tidy
       
-    # ======================= 核心修改部分 =======================
     - name: Build Unified Binary Kernel
       run: |
-        echo "Building Unified Kernel as xlink-cli-binary.exe..."
+        echo "Building Unified Kernel for Windows (amd64)..."
         cd cmd/xlink-cli
-        # 【关键修正】增加了 -tags binary 参数
-        # 这样编译器才会读取 core/core-binary.go 文件
-        go build -tags binary -ldflags="-s -w" -o xlink-cli-binary.exe .
+        # 【关键修正】增加了 GOOS 和 GOARCH 环境变量来进行交叉编译
+        GOOS=windows GOARCH=amd64 go build -tags binary -ldflags="-s -w" -o xlink-cli-binary.exe .
 
     - name: Create Dummy JSON Kernel
       run: |
         echo "Creating a dummy file for xlink-cli-json.exe..."
+        # 同样需要指定目标路径
         echo "This is a dummy file." > cmd/xlink-cli/xlink-cli-json.exe
-    # ==========================================================
 
     - name: Upload Binary Artifact
       uses: actions/upload-artifact@v4
