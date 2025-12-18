@@ -1,7 +1,6 @@
-// core/core-binary.go (v7.1 - Final Build Fix)
-// 修复：1. 修正 sendGhostHandshake 的参数传递错误
-//      2. 解决所有编译时变量未定义的问题
-//      3. 整合动态参数与 v7.0 协议
+// core/core-binary.go (v7.2 - Millisecond Fix) 内核代码
+// 修复：1. 修正时间戳单位为毫秒，与 JS 服务端对齐，解决握手失败问题。
+//      2. 整合动态参数与 v7.0 协议。
 
 //go:build binary
 // +build binary
@@ -71,7 +70,7 @@ func parseOutbounds() {
 	}
 }
 
-// ======================== 核心连接逻辑 (已修复) ========================
+// ======================== 核心连接逻辑 (无变动) ========================
 
 func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	defer conn.Close()
@@ -87,7 +86,10 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	}
 	if err != nil { return }
 	wsConn, err := connectGhostTunnel(target, "proxy", firstFrame)
-	if err != nil { return }
+	if err != nil { 
+        log.Printf("[ERROR] Failed to connect Ghost Tunnel: %v", err)
+        return 
+    }
 	if mode == 1 { conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) }
 	if mode == 2 { conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
 	pipeDirect(conn, wsConn)
@@ -95,12 +97,11 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 
 func connectGhostTunnel(target, outboundTag string, payload []byte) (*websocket.Conn, error) {
 	settings, ok := proxySettingsMap[outboundTag]
-	if !ok { return nil, errors.New("settings not found") }
+	if !ok { return nil, errors.New("settings not found for tag: " + outboundTag) }
 
 	wsConn, err := dialCleanWebSocket(settings)
 	if err != nil { return nil, err }
 
-	// 【修复点 1】解析 specialToken, 提取密钥和 fallback
 	parts := strings.SplitN(settings.Token, "|", 2)
 	secretKey := parts[0]
 	fallback := ""
@@ -108,13 +109,11 @@ func connectGhostTunnel(target, outboundTag string, payload []byte) (*websocket.
 		fallback = parts[1]
 	}
     
-    // 提取 socks5
     socks5 := ""
     if settings.ForwarderSettings != nil {
         socks5 = settings.ForwarderSettings.Socks5Address
     }
 
-	// 【修复点 2】调用 sendGhostHandshake 时，传入所有必须的参数
 	err = sendGhostHandshake(wsConn, target, secretKey, payload, socks5, fallback)
 	if err != nil {
 		wsConn.Close()
@@ -124,10 +123,13 @@ func connectGhostTunnel(target, outboundTag string, payload []byte) (*websocket.
 	return wsConn, nil
 }
 
-// v7.0 协议握手包 (函数签名已修正)
+// v7.0 协议握手包 (已修复时间戳单位)
 func sendGhostHandshake(wsConn *websocket.Conn, target string, secretKey string, payload []byte, socks5 string, fallback string) error {
-	// A. 准备时间戳
-	ts := time.Now().Unix() 
+	// A. 准备时间戳 (8 bytes BigEndian)
+    // =========================================================
+	// 【关键修复】使用毫秒级时间戳，与 JS 服务端的 Date.now() 对齐
+    // =========================================================
+	ts := time.Now().UnixNano() / 1e6 
 	tsBytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(tsBytes, uint64(ts))
 
@@ -160,6 +162,7 @@ func sendGhostHandshake(wsConn *websocket.Conn, target string, secretKey string,
 	lenBlob = append(lenBlob, fallbackLenBytes...) // 6 bytes total
 
 	// D. 计算 HMAC 签名
+	// 签名内容: TS(8) + LenBlob(6) + EncryptedData(N)
 	mac := hmac.New(sha256.New, []byte(secretKey))
 	mac.Write(tsBytes)
 	mac.Write(lenBlob)
@@ -167,6 +170,7 @@ func sendGhostHandshake(wsConn *websocket.Conn, target string, secretKey string,
 	signature := mac.Sum(nil)
 
 	// E. 拼装大包
+	// 结构: [TS 8] + [Sig 32] + [LenBlob 6] + [EncData N] + [Payload ...]
 	totalLen := 8 + 32 + 6 + len(encryptedData) + len(payload)
 	packet := make([]byte, totalLen)
 	cursor := 0
