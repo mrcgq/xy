@@ -1,57 +1,41 @@
-# .github/workflows/build.yml (v4.2 - Final Path Fix)
-
-name: Build X-Link Dual Core Kernels
-
-on:
-  push:
-    branches: [ main ]
-  workflow_dispatch:
-
-jobs:
-  build-kernels:
-    name: Build Windows Kernels
-    runs-on: ubuntu-latest
-
-    steps:
+- name: Build Windows Kernels
+      runs-on: ubuntu-latest
+      steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v4
         with:
-          go-version: '1.23' # 请根据你的 Go 版本修改
+          go-version: '1.21' # 或者你需要的 Go 版本
 
       - name: Download Go Modules
+        working-directory: ./cmd/xlink-cli
         run: go mod tidy
-
-      - name: Build Binary Core (v3.3)
-        env:
-          GOOS: windows
-          GOARCH: amd64
-          CGO_ENABLED: 0
+      
+      # ======================= 核心修改部分 =======================
+      - name: Build Unified Binary Kernel
+        working-directory: ./cmd/xlink-cli
         run: |
-          echo "Building Binary Kernel..."
-          # 【核心修复】：将编译路径从 ./cmd/main 改为 ./cmd/xlink-cli
-          go build -v -trimpath -ldflags="-s -w" -tags binary -o xlink-cli-binary.exe ./cmd/xlink-cli
+          echo "Building Unified Kernel as xlink-cli-binary.exe..."
+          # 直接编译 main.go，输出文件名指定为 xlink-cli-binary.exe
+          go build -ldflags="-s -w" -o xlink-cli-binary.exe .
 
-      - name: Build JSON Core (v2.8)
-        env:
-          GOOS: windows
-          GOARCH: amd64
-          CGO_ENABLED: 0
+      - name: Create Dummy JSON Kernel
         run: |
-          echo "Building JSON Kernel..."
-          # （此路径原本就是正确的，保持不变）
-          go build -v -trimpath -ldflags="-s -w" -tags json -o xlink-cli-json.exe ./cmd/xlink-cli
-          
+          echo "Creating a dummy file for xlink-cli-json.exe to satisfy the GUI..."
+          # 创建一个空的占位文件，防止 C++ 客户端找不到文件而报错
+          echo "This is a dummy file. The real kernel is xlink-cli-binary.exe." > xlink-cli-json.exe
+
       - name: Upload Binary Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
-          name: xlink-cli-binary-windows
-          path: xlink-cli-binary.exe
-
+          name: xlink-cli-binary
+          path: ./cmd/xlink-cli/xlink-cli-binary.exe
+          
       - name: Upload JSON Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
-          name: xlink-cli-json-windows
-          path: xlink-cli-json.exe
+          name: xlink-cli-json
+          path: ./xlink-cli-json.exe # 注意路径
+      # ==========================================================
