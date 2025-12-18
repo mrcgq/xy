@@ -135,50 +135,62 @@ func connectGhostTunnel(target, outboundTag string, payload []byte) (*websocket.
 }
 
 // 发送幽灵协议握手包
-func sendGhostHandshake(wsConn *websocket.Conn, target string, secretKey string, payload []byte) error {
-	// A. 准备时间戳 (8 bytes BigEndian) - 秒级
+// sendGhostHandshake (v7.0)
+func sendGhostHandshake(wsConn *websocket.Conn, target string, secretKey string, payload []byte, socks5 string, fallback string) error {
+	// A. 准备时间戳 (秒级)
 	ts := time.Now().Unix() 
 	tsBytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(tsBytes, uint64(ts))
 
-	// B. 准备目标地址 (XOR 加密)
-	// 密钥 = SecretKey + Timestamp字符串
+	// B. 准备数据块 (Target, SOCKS5, Fallback) 并加密
+	targetBytes := []byte(target)
+	socks5Bytes := []byte(socks5)
+	fallbackBytes := []byte(fallback)
+
+	dataBlob := append(targetBytes, socks5Bytes...)
+	dataBlob = append(dataBlob, fallbackBytes...)
+	
 	xorKeyStr := fmt.Sprintf("%s%d", secretKey, ts)
 	xorKey := []byte(xorKeyStr)
-	targetBytes := []byte(target)
-	encryptedTarget := make([]byte, len(targetBytes))
-	for i, b := range targetBytes {
-		encryptedTarget[i] = b ^ xorKey[i%len(xorKey)]
+	encryptedData := make([]byte, len(dataBlob))
+	for i, b := range dataBlob {
+		encryptedData[i] = b ^ xorKey[i%len(xorKey)]
 	}
 
-	// C. 准备目标长度 (2 bytes)
-	targetLen := uint16(len(encryptedTarget))
-	lenBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(lenBytes, targetLen)
+	// C. 准备长度字段
+	targetLenBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(lenBytes, uint16(len(targetBytes)))
+	
+	socks5LenBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(socks5LenBytes, uint16(len(socks5Bytes)))
 
-	// D. 计算 HMAC-SHA256 签名 (32 bytes)
-	// 签名内容 = TS(8) + Len(2) + EncryptedTarget(N)
+	fallbackLenBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(fallbackLenBytes, uint16(len(fallbackBytes)))
+
+	lenBlob := append(targetLenBytes, socks5LenBytes...)
+	lenBlob = append(lenBlob, fallbackLenBytes...) // 6 bytes total
+
+	// D. 计算 HMAC 签名
+	// 签名内容 = TS(8) + LenBlob(6) + EncryptedData(N)
 	mac := hmac.New(sha256.New, []byte(secretKey))
 	mac.Write(tsBytes)
-	mac.Write(lenBytes)
-	mac.Write(encryptedTarget)
+	mac.Write(lenBlob)
+	mac.Write(encryptedData)
 	signature := mac.Sum(nil)
 
 	// E. 拼装大包
-	// 结构: [TS 8] + [Sig 32] + [Len 2] + [EncTarget N] + [Payload ...]
-	totalLen := 8 + 32 + 2 + len(encryptedTarget) + len(payload)
+	totalLen := 8 + 32 + 6 + len(encryptedData) + len(payload)
 	packet := make([]byte, totalLen)
 
 	cursor := 0
 	copy(packet[cursor:], tsBytes); cursor += 8
 	copy(packet[cursor:], signature); cursor += 32
-	copy(packet[cursor:], lenBytes); cursor += 2
-	copy(packet[cursor:], encryptedTarget); cursor += len(encryptedTarget)
+	copy(packet[cursor:], lenBlob); cursor += 6
+	copy(packet[cursor:], encryptedData); cursor += len(encryptedData)
 	if len(payload) > 0 {
 		copy(packet[cursor:], payload)
 	}
 
-	// 发送二进制消息
 	return wsConn.WriteMessage(websocket.BinaryMessage, packet)
 }
 
