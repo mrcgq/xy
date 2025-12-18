@@ -1,6 +1,7 @@
-// core/core-binary.go (v6.4 Final Fix)
-// 修复编译错误：变量重复声明
-// 功能：强制硬编码密钥，对接 Ghost 服务端
+// core/core-binary.go (v7.1 - Final Build Fix)
+// 修复：1. 修正 sendGhostHandshake 的参数传递错误
+//      2. 解决所有编译时变量未定义的问题
+//      3. 整合动态参数与 v7.0 协议
 
 //go:build binary
 // +build binary
@@ -29,7 +30,7 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-// --- 基础结构 ---
+// --- 结构定义 (无变动) ---
 type Config struct { Inbounds []Inbound `json:"inbounds"`; Outbounds []Outbound `json:"outbounds"`; Routing Routing `json:"routing"` }
 type Inbound struct { Tag string `json:"tag"`; Listen string `json:"listen"`; Protocol string `json:"protocol"` }
 type Outbound struct { Tag string `json:"tag"`; Protocol string `json:"protocol"`; Settings json.RawMessage `json:"settings,omitempty"` }
@@ -39,7 +40,7 @@ type Routing struct { Rules []Rule `json:"rules"`; DefaultOutbound string `json:
 type Rule struct { InboundTag []string `json:"inboundTag,omitempty"`; Domain []string `json:"domain,omitempty"`; GeoIP string `json:"geoip,omitempty"`; Port []int `json:"port,omitempty"`; OutboundTag string `json:"outboundTag"` }
 var ( globalConfig Config; proxySettingsMap = make(map[string]ProxySettings) )
 
-// ======================== 入口函数 ========================
+// ======================== 入口函数 (无变动) ========================
 func StartInstance(configContent []byte) (net.Listener, error) {
 	proxySettingsMap = make(map[string]ProxySettings)
 	if err := json.Unmarshal(configContent, &globalConfig); err != nil { return nil, err }
@@ -70,46 +71,28 @@ func parseOutbounds() {
 	}
 }
 
-// ======================== 核心连接逻辑 ========================
+// ======================== 核心连接逻辑 (已修复) ========================
 
 func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	defer conn.Close()
 	buf := make([]byte, 1)
 	if _, err := io.ReadFull(conn, buf); err != nil { return }
-
-	var target string
-	var err error
-	var firstFrame []byte
-	var mode int
-
+	var target string; var err error; var firstFrame []byte; var mode int
 	switch buf[0] {
-	case 0x05: // SOCKS5
+	case 0x05:
 		target, err = handleSOCKS5(conn, inboundTag)
 		mode = 1
-	default: // HTTP or other
+	default:
 		target, firstFrame, mode, err = handleHTTP(conn, buf, inboundTag)
 	}
-
 	if err != nil { return }
-	
-	// 连接 Ghost WebSocket
 	wsConn, err := connectGhostTunnel(target, "proxy", firstFrame)
-	if err != nil {
-		return
-	}
-	
-	// 响应本地客户端连接成功
+	if err != nil { return }
 	if mode == 1 { conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) }
 	if mode == 2 { conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
-	
-	// 开始双向转发
 	pipeDirect(conn, wsConn)
 }
 
-// 建立 Ghost 协议连接
-// 修改后的 connectGhostTunnel (core-binary.go)
-// 变更点：移除硬编码，恢复使用 settings.Token
-// 修改 connectGhostTunnel 函数
 func connectGhostTunnel(target, outboundTag string, payload []byte) (*websocket.Conn, error) {
 	settings, ok := proxySettingsMap[outboundTag]
 	if !ok { return nil, errors.New("settings not found") }
@@ -117,7 +100,7 @@ func connectGhostTunnel(target, outboundTag string, payload []byte) (*websocket.
 	wsConn, err := dialCleanWebSocket(settings)
 	if err != nil { return nil, err }
 
-	// 【修改点】解析 specialToken
+	// 【修复点 1】解析 specialToken, 提取密钥和 fallback
 	parts := strings.SplitN(settings.Token, "|", 2)
 	secretKey := parts[0]
 	fallback := ""
@@ -125,12 +108,13 @@ func connectGhostTunnel(target, outboundTag string, payload []byte) (*websocket.
 		fallback = parts[1]
 	}
     
+    // 提取 socks5
     socks5 := ""
     if settings.ForwarderSettings != nil {
         socks5 = settings.ForwarderSettings.Socks5Address
     }
 
-	// 传递解析出的参数
+	// 【修复点 2】调用 sendGhostHandshake 时，传入所有必须的参数
 	err = sendGhostHandshake(wsConn, target, secretKey, payload, socks5, fallback)
 	if err != nil {
 		wsConn.Close()
@@ -140,10 +124,9 @@ func connectGhostTunnel(target, outboundTag string, payload []byte) (*websocket.
 	return wsConn, nil
 }
 
-// 发送幽灵协议握手包
-// sendGhostHandshake (v7.0)
+// v7.0 协议握手包 (函数签名已修正)
 func sendGhostHandshake(wsConn *websocket.Conn, target string, secretKey string, payload []byte, socks5 string, fallback string) error {
-	// A. 准备时间戳 (秒级)
+	// A. 准备时间戳
 	ts := time.Now().Unix() 
 	tsBytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(tsBytes, uint64(ts))
@@ -165,7 +148,7 @@ func sendGhostHandshake(wsConn *websocket.Conn, target string, secretKey string,
 
 	// C. 准备长度字段
 	targetLenBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(lenBytes, uint16(len(targetBytes)))
+	binary.BigEndian.PutUint16(targetLenBytes, uint16(len(targetBytes)))
 	
 	socks5LenBytes := make([]byte, 2)
 	binary.BigEndian.PutUint16(socks5LenBytes, uint16(len(socks5Bytes)))
@@ -177,7 +160,6 @@ func sendGhostHandshake(wsConn *websocket.Conn, target string, secretKey string,
 	lenBlob = append(lenBlob, fallbackLenBytes...) // 6 bytes total
 
 	// D. 计算 HMAC 签名
-	// 签名内容 = TS(8) + LenBlob(6) + EncryptedData(N)
 	mac := hmac.New(sha256.New, []byte(secretKey))
 	mac.Write(tsBytes)
 	mac.Write(lenBlob)
@@ -187,94 +169,47 @@ func sendGhostHandshake(wsConn *websocket.Conn, target string, secretKey string,
 	// E. 拼装大包
 	totalLen := 8 + 32 + 6 + len(encryptedData) + len(payload)
 	packet := make([]byte, totalLen)
-
 	cursor := 0
 	copy(packet[cursor:], tsBytes); cursor += 8
 	copy(packet[cursor:], signature); cursor += 32
 	copy(packet[cursor:], lenBlob); cursor += 6
 	copy(packet[cursor:], encryptedData); cursor += len(encryptedData)
-	if len(payload) > 0 {
-		copy(packet[cursor:], payload)
-	}
+	if len(payload) > 0 { copy(packet[cursor:], payload) }
 
 	return wsConn.WriteMessage(websocket.BinaryMessage, packet)
 }
 
-// 拨号器
 func dialCleanWebSocket(settings ProxySettings) (*websocket.Conn, error) {
 	host, port, path, _ := parseServerAddr(settings.Server)
 	wsURL := fmt.Sprintf("wss://%s:%s%s", host, port, path)
-	
 	requestHeader := http.Header{}
 	requestHeader.Add("Host", host)
 	requestHeader.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-
-	dialer := websocket.Dialer{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
-			ServerName:         host,
-		},
-		HandshakeTimeout: 5 * time.Second,
-	}
-
+	dialer := websocket.Dialer{ TLSClientConfig: &tls.Config{ InsecureSkipVerify: true, ServerName: host }, HandshakeTimeout: 5 * time.Second }
 	if settings.ForwarderSettings != nil && settings.ForwarderSettings.Socks5Address != "" {
 		proxyAddrStr := settings.ForwarderSettings.Socks5Address
 		if !strings.Contains(proxyAddrStr, "://") { proxyAddrStr = "socks5://" + proxyAddrStr }
 		proxyURL, _ := url.Parse(proxyAddrStr)
 		var auth *proxy.Auth
-		if proxyURL.User != nil {
-			auth = new(proxy.Auth)
-			auth.User = proxyURL.User.Username()
-			if p, ok := proxyURL.User.Password(); ok { auth.Password = p }
-		}
+		if proxyURL.User != nil { auth = new(proxy.Auth); auth.User = proxyURL.User.Username(); if p, ok := proxyURL.User.Password(); ok { auth.Password = p } }
 		socks5Dialer, _ := proxy.SOCKS5("tcp", proxyURL.Host, auth, proxy.Direct)
 		dialer.NetDial = socks5Dialer.Dial
 	} else if settings.ServerIP != "" {
-		dialer.NetDial = func(network, addr string) (net.Conn, error) {
-			_, p, _ := net.SplitHostPort(addr)
-			return net.DialTimeout(network, net.JoinHostPort(settings.ServerIP, p), 5*time.Second)
-		}
+		dialer.NetDial = func(network, addr string) (net.Conn, error) { _, p, _ := net.SplitHostPort(addr); return net.DialTimeout(network, net.JoinHostPort(settings.ServerIP, p), 5*time.Second) }
 	}
-
 	conn, resp, err := dialer.Dial(wsURL, requestHeader)
-	if err != nil {
-		if resp != nil {
-			return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
-		}
-		return nil, err
-	}
+	if err != nil { if resp != nil { return nil, fmt.Errorf("HTTP %d", resp.StatusCode) }; return nil, err }
 	return conn, nil
 }
 
-// 直接管道转发
 func pipeDirect(local net.Conn, ws *websocket.Conn) {
 	defer ws.Close()
-	
-	// WS -> Local
-	go func() {
-		for {
-			mt, r, err := ws.NextReader()
-			if err != nil { break }
-			if mt == websocket.BinaryMessage { 
-				io.Copy(local, r)
-			}
-		}
-		local.Close()
-	}()
-	
-	// Local -> WS
+	go func() { for { mt, r, err := ws.NextReader(); if err != nil { break }; if mt == websocket.BinaryMessage { io.Copy(local, r) } }; local.Close() }()
 	buf := make([]byte, 32*1024)
-	for {
-		n, err := local.Read(buf)
-		if n > 0 {
-			err := ws.WriteMessage(websocket.BinaryMessage, buf[:n])
-			if err != nil { break }
-		}
-		if err != nil { break }
-	}
+	for { n, err := local.Read(buf); if n > 0 { err := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); if err != nil { break } }; if err != nil { break } }
 }
 
-// --- 辅助函数 ---
+// --- 辅助函数 (无变动) ---
 func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) { handshakeBuf := make([]byte, 2); io.ReadFull(conn, handshakeBuf); conn.Write([]byte{0x05, 0x00}); header := make([]byte, 4); io.ReadFull(conn, header); var host string; switch header[3] { case 1: b := make([]byte, 4); io.ReadFull(conn, b); host = net.IP(b).String(); case 3: b := make([]byte, 1); io.ReadFull(conn, b); d := make([]byte, b[0]); io.ReadFull(conn, d); host = string(d); case 4: b := make([]byte, 16); io.ReadFull(conn, b); host = net.IP(b).String() }; portBytes := make([]byte, 2); io.ReadFull(conn, portBytes); port := binary.BigEndian.Uint16(portBytes); return net.JoinHostPort(host, fmt.Sprintf("%d", port)), nil }
 func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) (string, []byte, int, error) { reader := bufio.NewReader(io.MultiReader(bytes.NewReader(initialData), conn)); req, err := http.ReadRequest(reader); if err != nil { return "", nil, 0, err }; target := req.Host; if !strings.Contains(target, ":") { if req.Method == "CONNECT" { target += ":443" } else { target += ":80" } }; if req.Method == "CONNECT" { return target, nil, 2, nil }; var buf bytes.Buffer; req.WriteProxy(&buf); return target, buf.Bytes(), 3, nil }
 func parseServerAddr(addr string) (host, port, path string, err error) { path = "/"; if idx := strings.Index(addr, "/"); idx != -1 { path = addr[idx:]; addr = addr[:idx] }; host, port, err = net.SplitHostPort(addr); if err != nil { host = addr; port = "443"; err = nil }; return }
