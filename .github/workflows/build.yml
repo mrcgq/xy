@@ -1,4 +1,4 @@
-# .github/workflows/build.yml (v4 Final)
+# .github/workflows/build.yml (v7.7 - Final Explicit Build)
 
 name: Build X-Link Kernels
 
@@ -22,31 +22,33 @@ jobs:
         go-version: '1.21'
 
     - name: Download Go Modules
+      # 依然在 cmd/xlink-cli 目录下运行 go mod tidy，因为它需要 go.mod 文件
       working-directory: ./cmd/xlink-cli
       run: go mod tidy
       
+    # ======================= 这是唯一修改的部分 =======================
     - name: Build Unified Binary Kernel
-      working-directory: ./cmd/xlink-cli
       run: |
         echo "Building Unified Kernel as xlink-cli-binary.exe..."
-        go build -ldflags="-s -w" -o xlink-cli-binary.exe .
+        # 强制指定所有源文件一起编译，避免包查找问题
+        # 输出文件直接指定到目标目录
+        go build -ldflags="-s -w" -o cmd/xlink-cli/xlink-cli-binary.exe cmd/xlink-cli/main.go core/config_generator.go core/core-binary.go
 
     - name: Create Dummy JSON Kernel
-      working-directory: ./cmd/xlink-cli
+      # 这个命令在根目录运行，所以输出路径也要写全
       run: |
         echo "Creating a dummy file for xlink-cli-json.exe to satisfy the GUI..."
-        echo "This is a dummy file. The real kernel is xlink-cli-binary.exe." > xlink-cli-json.exe
+        echo "This is a dummy file." > cmd/xlink-cli/xlink-cli-json.exe
+    # ================================================================
 
-    # ======================= 核心修改部分 (v3 -> v4) =======================
     - name: Upload Binary Artifact
-      uses: actions/upload-artifact@v4 # <--- 修改点 1
+      uses: actions/upload-artifact@v4
       with:
         name: xlink-cli-binary-windows
         path: ./cmd/xlink-cli/xlink-cli-binary.exe
         
     - name: Upload JSON Artifact (Dummy)
-      uses: actions/upload-artifact@v4 # <--- 修改点 2
+      uses: actions/upload-artifact@v4
       with:
         name: xlink-cli-json-windows
         path: ./cmd/xlink-cli/xlink-cli-json.exe
-    # ====================================================================
