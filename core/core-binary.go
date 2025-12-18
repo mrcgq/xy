@@ -111,28 +111,37 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 }
 
 // 建立 Ghost 协议连接
+
+
 func connectGhostTunnel(target, outboundTag string, payload []byte) (*websocket.Conn, error) {
-	settings, ok := proxySettingsMap[outboundTag]
-	if !ok { return nil, errors.New("settings not found") }
+    settings, ok := proxySettingsMap[outboundTag]
+    if !ok { return nil, errors.New("settings not found") }
 
-	// 1. 建立纯净的 WebSocket 连接 (不带 Token，不带特殊 Header)
-	wsConn, err := dialCleanWebSocket(settings)
-	if err != nil { return nil, err }
+    // 1. 建立连接
+    wsConn, err := dialCleanWebSocket(settings)
+    if err != nil { return nil, err }
 
-	// 2. 发送幽灵握手包 (鉴权 + 目标 + 首包数据)
-	err = sendGhostHandshake(wsConn, target, settings.Token, payload)
-	if err != nil {
-		wsConn.Close()
-		return nil, err
-	}
+    // =========================================================
+    // 【关键修正】强制使用明文密钥，无视 C++ 传来的 settings.Token
+    // =========================================================
+    const RealSecretKey = "my-secret-key-888" 
+    
+    // 注意：这里第三个参数必须是 RealSecretKey，绝对不能是 settings.Token
+    err = sendGhostHandshake(wsConn, target, RealSecretKey, payload)
+    
+    if err != nil {
+        wsConn.Close()
+        return nil, err
+    }
 
-	return wsConn, nil
+    return wsConn, nil
 }
 
 // 发送幽灵协议握手包
 func sendGhostHandshake(wsConn *websocket.Conn, target string, secretKey string, payload []byte) error {
 	// A. 准备时间戳 (8 bytes BigEndian)
     ts := time.Now().Unix() // 发送秒级时间戳
+	ts := time.Now().Unix() // 秒级
 	
 	
 	
