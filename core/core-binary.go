@@ -1,3 +1,5 @@
+
+
 // core/core-binary.go (v8.1 - Fix Compile Error)
 // 修复: 补齐缺失的 "bufio" 引用
 
@@ -183,15 +185,22 @@ func sendPhantomHandshake(wsConn *websocket.Conn, target string, secretKey strin
 	headerBuf.Write(encryptedData)
 	realHeader := headerBuf.Bytes()
 
-	// --- 6. 构造前置噪声 ---
+// --- 6. 构造前置噪声 (Phantom Noise - 确定性动态长度) ---
 	magicByte := byte(rand.Intn(256))
-	noiseLen := int(magicByte % 32) + 16
+	
+	// [算法] 必须与 JS 端 PHANTOM_CONFIG 完全一致
+	// 公式: Len = (Magic * 17 + 13) % 71 + 20
+	// 这样 JS 端只需要读第一个字节，就知道接下来要跳过多少字节的噪声
+	noiseLen := int(magicByte)*17 + 13
+	noiseLen = noiseLen % 71
+	noiseLen = noiseLen + 20
+	
 	noiseData := make([]byte, noiseLen)
 	rand.Read(noiseData)
 
 	prefixBuf := new(bytes.Buffer)
-	prefixBuf.WriteByte(magicByte)
-	prefixBuf.Write(noiseData)
+	prefixBuf.WriteByte(magicByte) // 写入 Magic Byte
+	prefixBuf.Write(noiseData)     // 写入计算出的长度的噪声
 	noisePacket := prefixBuf.Bytes()
 
 	// --- 7. 发送策略：分裂传输 ---
@@ -242,3 +251,12 @@ func pipeDirect(local net.Conn, ws *websocket.Conn) {
 func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) { handshakeBuf := make([]byte, 2); io.ReadFull(conn, handshakeBuf); conn.Write([]byte{0x05, 0x00}); header := make([]byte, 4); io.ReadFull(conn, header); var host string; switch header[3] { case 1: b := make([]byte, 4); io.ReadFull(conn, b); host = net.IP(b).String(); case 3: b := make([]byte, 1); io.ReadFull(conn, b); d := make([]byte, b[0]); io.ReadFull(conn, d); host = string(d); case 4: b := make([]byte, 16); io.ReadFull(conn, b); host = net.IP(b).String() }; portBytes := make([]byte, 2); io.ReadFull(conn, portBytes); port := binary.BigEndian.Uint16(portBytes); return net.JoinHostPort(host, fmt.Sprintf("%d", port)), nil }
 func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) (string, []byte, int, error) { reader := bufio.NewReader(io.MultiReader(bytes.NewReader(initialData), conn)); req, err := http.ReadRequest(reader); if err != nil { return "", nil, 0, err }; target := req.Host; if !strings.Contains(target, ":") { if req.Method == "CONNECT" { target += ":443" } else { target += ":80" } }; if req.Method == "CONNECT" { return target, nil, 2, nil }; var buf bytes.Buffer; req.WriteProxy(&buf); return target, buf.Bytes(), 3, nil }
 func parseServerAddr(addr string) (host, port, path string, err error) { path = "/"; if idx := strings.Index(addr, "/"); idx != -1 { path = addr[idx:]; addr = addr[:idx] }; host, port, err = net.SplitHostPort(addr); if err != nil { host = addr; port = "443"; err = nil }; return }
+
+
+
+
+
+
+
+
+
