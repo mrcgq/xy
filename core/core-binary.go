@@ -1,5 +1,5 @@
-// core/core-binary.go (v8.0 - PhantomFlow Engine)
-// 行业顶级协议实现：前置噪声 + 动态填充 + 分裂传输
+// core/core-binary.go (v8.1 - Fix Compile Error)
+// 修复: 补齐缺失的 "bufio" 引用
 
 //go:build binary
 // +build binary
@@ -7,6 +7,7 @@
 package core
 
 import (
+	"bufio" // <--- [修复] 补齐了这个缺失的包
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -51,7 +52,7 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 	inbound := globalConfig.Inbounds[0]
 	listener, err := net.Listen("tcp", inbound.Listen)
 	if err != nil { return nil, err }
-	log.Printf("[Core] Xlink PhantomFlow Engine (v8.0) Listening on %s", inbound.Listen)
+	log.Printf("[Core] Xlink PhantomFlow Engine (v8.1) Listening on %s", inbound.Listen)
 	go func() {
 		for {
 			conn, err := listener.Accept()
@@ -116,7 +117,6 @@ func connectPhantomTunnel(target, outboundTag string, payload []byte) (*websocke
     socks5 := ""
     if settings.ForwarderSettings != nil { socks5 = settings.ForwarderSettings.Socks5Address }
 
-	// 调用 v8.0 幽灵握手
 	err = sendPhantomHandshake(wsConn, target, secretKey, payload, socks5, fallback)
 	if err != nil {
 		wsConn.Close()
@@ -137,8 +137,7 @@ func sendPhantomHandshake(wsConn *websocket.Conn, target string, secretKey strin
 	nonceBytes := make([]byte, 4); binary.BigEndian.PutUint32(nonceBytes, nonce)
 
 	// --- 2. 准备动态填充 (Dynamic Padding) ---
-	// 随机生成 0~255 字节的 Padding
-	paddingLen := byte(rand.Intn(128)) // 0-127 bytes padding
+	paddingLen := byte(rand.Intn(128)) 
 	padding := make([]byte, paddingLen)
 	rand.Read(padding)
 
@@ -164,8 +163,6 @@ func sendPhantomHandshake(wsConn *websocket.Conn, target string, secretKey strin
 	lenBlob = append(lenBlob, fallbackLenBytes...) 
 
 	// --- 4. 计算 HMAC ---
-	// 覆盖范围: TS(8) + Nonce(4) + PadLen(1) + Padding(N) + LenBlob(6) + EncData(N)
-	// 这样任何一个比特被篡改（包括Padding）都会导致签名失效
 	mac := hmac.New(sha256.New, []byte(secretKey))
 	mac.Write(tsBytes)
 	mac.Write(nonceBytes)
@@ -175,21 +172,18 @@ func sendPhantomHandshake(wsConn *websocket.Conn, target string, secretKey strin
 	mac.Write(encryptedData)
 	signature := mac.Sum(nil)
 
-	// --- 5. 组装真实协议头 (Header) ---
+	// --- 5. 组装真实协议头 ---
 	headerBuf := new(bytes.Buffer)
-	headerBuf.Write(tsBytes)       // 0-7
-	headerBuf.Write(nonceBytes)    // 8-11
-	headerBuf.Write(signature)     // 12-43 (32 bytes)
-	headerBuf.WriteByte(paddingLen)// 44
-	headerBuf.Write(padding)       // 45...
+	headerBuf.Write(tsBytes)       
+	headerBuf.Write(nonceBytes)    
+	headerBuf.Write(signature)     
+	headerBuf.WriteByte(paddingLen)
+	headerBuf.Write(padding)       
 	headerBuf.Write(lenBlob)       
 	headerBuf.Write(encryptedData)
-	
 	realHeader := headerBuf.Bytes()
 
-	// --- 6. 构造前置噪声 (Pre-flight Noise) ---
-	// 逻辑：MagicByte (1 byte) -> NoiseData (N bytes)
-	// N = (Magic % 32) + 16. 范围 16-47 bytes.
+	// --- 6. 构造前置噪声 ---
 	magicByte := byte(rand.Intn(256))
 	noiseLen := int(magicByte % 32) + 16
 	noiseData := make([]byte, noiseLen)
@@ -198,40 +192,23 @@ func sendPhantomHandshake(wsConn *websocket.Conn, target string, secretKey strin
 	prefixBuf := new(bytes.Buffer)
 	prefixBuf.WriteByte(magicByte)
 	prefixBuf.Write(noiseData)
-	
 	noisePacket := prefixBuf.Bytes()
 
-	// --- 7. 发送策略：分裂传输 (Split Transmission) ---
-	
-	// 阶段 A: 发送噪声 (Noise)
-	// 这看起来完全像随机数据，没有任何固定特征
-	if err := wsConn.WriteMessage(websocket.BinaryMessage, noisePacket); err != nil {
-		return err
-	}
-
-	// 模拟网络延迟 (10-30ms)
+	// --- 7. 发送策略：分裂传输 ---
+	if err := wsConn.WriteMessage(websocket.BinaryMessage, noisePacket); err != nil { return err }
 	time.Sleep(time.Duration(10 + rand.Intn(20)) * time.Millisecond)
 
-	// 阶段 B: 发送真实头部 (Header)
-	// 头部长度也是随机的（因为有 Padding），DPI 无法通过长度判断这是“握手包”
-	if err := wsConn.WriteMessage(websocket.BinaryMessage, realHeader); err != nil {
-		return err
-	}
+	if err := wsConn.WriteMessage(websocket.BinaryMessage, realHeader); err != nil { return err }
 
-	// 阶段 C: 发送 Payload (如果有)
 	if len(payload) > 0 {
-		// 再延迟一下，模拟“请求-响应”的处理间隙
 		time.Sleep(time.Duration(20 + rand.Intn(40)) * time.Millisecond)
-		if err := wsConn.WriteMessage(websocket.BinaryMessage, payload); err != nil {
-			return err
-		}
+		if err := wsConn.WriteMessage(websocket.BinaryMessage, payload); err != nil { return err }
 	}
 
 	return nil
 }
 
-// ... (dialCleanWebSocket, pipeDirect, handleSOCKS5, handleHTTP, parseServerAddr 保持不变) ...
-// 请直接复用 v7.3 中的这些辅助函数，代码完全一致。
+// --- 辅助函数 ---
 func dialCleanWebSocket(settings ProxySettings) (*websocket.Conn, error) {
 	host, port, path, _ := parseServerAddr(settings.Server)
 	wsURL := fmt.Sprintf("wss://%s:%s%s", host, port, path)
