@@ -1,4 +1,5 @@
-// core/core-binary.go (v10.2 - Nano Feature Complete)
+// core/core-binary.go (v10.2 - Nano Feature Complete - Fixed)
+// 修复：添加 bufio 引用，移除未使用的 proxy 引用
 // 适配 v10.2 服务端：支持 URL Token 鉴权，支持发送 SOCKS5 和 Fallback 信息
 
 //go:build binary
@@ -7,6 +8,7 @@
 package core
 
 import (
+	"bufio" // [修复] 添加 bufio
 	"bytes"
 	"crypto/tls"
 	"encoding/binary"
@@ -22,7 +24,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"golang.org/x/net/proxy"
+	// [修复] 移除未使用的 "golang.org/x/net/proxy"
 )
 
 // --- 结构定义 (与 GUI 生成的 config.json 结构匹配) ---
@@ -61,7 +63,7 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 		return nil, err 
 	}
 	
-	log.Printf("[Core] Xlink Nano Engine (v10.2 Complete) Listening on %s", inbound.Listen)
+	log.Printf("[Core] Xlink Nano Engine (v10.2 Fixed) Listening on %s", inbound.Listen)
 	
 	go func() {
 		for {
@@ -107,14 +109,12 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	}
 	
 	if err != nil { 
-		// log.Printf("Handshake failed: %v", err)
 		return 
 	}
 
 	// 建立到 Cloudflare Workers 的 WebSocket 隧道
 	wsConn, err := connectNanoTunnel(target, "proxy", firstFrame)
 	if err != nil { 
-		// log.Printf("Tunnel failed: %v", err)
 		return 
 	}
 	defer wsConn.Close()
@@ -136,7 +136,6 @@ func connectNanoTunnel(target, outboundTag string, payload []byte) (*websocket.C
 	if !ok { return nil, errors.New("settings not found") }
 
 	// 1. 提取 Token 和 Fallback
-	// 兼容处理：用户可能在 Token 字段输入 "mytoken|fallbackIP"
 	parts := strings.SplitN(settings.Token, "|", 2)
 	secretKey := parts[0]
 	fallback := ""
@@ -144,8 +143,7 @@ func connectNanoTunnel(target, outboundTag string, payload []byte) (*websocket.C
 		fallback = parts[1] 
 	}
 
-	// 2. 提取 SOCKS5
-	// GUI 传入的 ForwarderSettings.Socks5Address 意为“让服务端去连接的 S5”
+	// 2. 提取 SOCKS5 (作为协议头数据发送给服务端，不是本地连接用)
 	socks5 := ""
 	if settings.ForwarderSettings != nil { 
 		socks5 = settings.ForwarderSettings.Socks5Address 
@@ -186,10 +184,6 @@ func dialCleanWebSocket(settings ProxySettings, token string) (*websocket.Conn, 
 			return net.DialTimeout(network, net.JoinHostPort(settings.ServerIP, p), 5*time.Second) 
 		}
 	}
-
-	// 注意：此处不处理本地到 CF 的 SOCKS5 前置（Client-Side Proxy），
-	// 因为 GUI 中的 Socks5Address 定义为服务端用的（Server-Side Proxy）。
-	// 如需本地代理，需额外增加配置字段。
 
 	conn, resp, err := dialer.Dial(wsURL, requestHeader)
 	if err != nil { 
