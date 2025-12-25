@@ -1,6 +1,7 @@
 // core/core-binary.go (v12.6 - Hydra Verbose Edition)
-// [基座] v12.2 Hydra (节点池 + 策略 + 换行修复)
-// [新增] 详细日志输出 (Verbose Logging) - 配合客户端显示流量详情
+// [基座] v12.2 Hydra (节点池 + 策略 + 内存池优化)
+// [修复] GenerateConfigJSON 支持逗号、中文逗号、换行符作为分隔符
+// [新增] 详细日志输出 (Traffic -> Target | Node)
 
 //go:build binary
 // +build binary
@@ -112,7 +113,6 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 
 	wsConn, err := connectNanoTunnel(target, "proxy", firstFrame)
 	if err != nil { 
-		// [Log] 连接失败日志
 		log.Printf("[Core] Error connecting to %s: %v", target, err)
 		return 
 	}
@@ -150,7 +150,7 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 		}
 	}
 
-	// [Log] 关键日志：流量去向 + 命中节点
+	// [Log] 关键：输出流量日志供客户端捕获
 	log.Printf("[Core] Traffic -> %s | Node: %s | Algo: %s", target, targetServer, settings.Strategy)
 
 	wsConn, err := dialCleanWebSocket(targetServer, settings.ServerIP, secretKey)
@@ -189,6 +189,7 @@ func dialCleanWebSocket(serverAddr, serverIP, token string) (*websocket.Conn, er
 	return conn, nil
 }
 
+// [修复] 暴力清洗函数，兼容所有常见分隔符
 func GenerateConfigJSON(serverAddr, serverIP, secretKey, socks5Addr, fallbackAddr, listenAddr, strategy string) string {
 	token := secretKey
 	if fallbackAddr != "" { token += "|" + fallbackAddr }
