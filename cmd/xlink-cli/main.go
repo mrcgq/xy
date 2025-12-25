@@ -1,6 +1,3 @@
-
-
-//cmd/xlink-cli/main.go
 package main
 
 import (
@@ -19,23 +16,20 @@ func main() {
 	socks5Addr := flag.String("s5", "", "SOCKS5 proxy address")
 	fallbackAddr := flag.String("fallback", "", "Fallback address")
 	listenAddr := flag.String("listen", "127.0.0.1:10808", "Local listen address")
-	
-	// [v12.1 新增] 策略参数
 	strategy := flag.String("strategy", "random", "Load balance strategy: random, rr, hash")
 
 	flag.Parse()
 
 	if *serverAddr == "" { log.Fatal("[CLI] Error: --server argument is required.") }
 
-	// [v12.1] 传入 strategy
+	// 生成配置 (支持 v12.6 所有特性)
 	configJSON := core.GenerateConfigJSON(*serverAddr, *serverIP, *secretKey, *socks5Addr, *fallbackAddr, *listenAddr, *strategy)
 	
-	log.Println("[CLI] Starting X-Link Hydra Kernel (v12.1 Strategy Edition)...")
+	log.Println("[CLI] Starting X-Link Hydra Kernel (v12.6 Verbose Edition)...")
 
 	listener, err := core.StartInstance([]byte(configJSON))
 	if err != nil { log.Fatalf("[CLI] Failed to start core engine: %v", err) }
 	
-	// 如果是节点池，提示当前策略
 	log.Printf("[CLI] Engine running successfully on %s (Strategy: %s)", *listenAddr, *strategy)
 
 	sigChan := make(chan os.Signal, 1)
