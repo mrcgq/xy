@@ -1,7 +1,7 @@
-// core/core-binary.go (v12.6 - Hydra Verbose Edition)
-// [基座] v12.2 Hydra (节点池 + 策略 + 内存池优化)
-// [修复] GenerateConfigJSON 支持逗号、中文逗号、换行符作为分隔符
-// [新增] 详细日志输出 (Traffic -> Target | Node)
+// core/core-binary.go (v13.0 - Odyssey Edition)
+// [基座] v12.6 Hydra (策略 + 日志 + 修复)
+// [新增] 规则分流引擎 (Rule-Based Routing)，实现指定节点分流
+// [架构] 规则匹配 -> 负载均衡 -> 建立连接
 
 //go:build binary
 // +build binary
@@ -33,13 +33,21 @@ import (
 
 var globalRRIndex uint64
 
+// --- 结构定义 ---
 type ProxySettings struct { 
 	Server     string   `json:"server"`
 	ServerPool []string `json:"server_pool"`
 	Strategy   string   `json:"strategy"`
+	Rules      string   `json:"rules"` // [v13] 新增：规则字符串
 	ServerIP   string   `json:"server_ip"` 
 	Token      string   `json:"token"` 
 	ForwarderSettings *ProxyForwarderSettings `json:"proxy_settings,omitempty"` 
+}
+
+// [v13] 定义规则结构
+type Rule struct {
+	Keyword string // 域名关键词
+	Node    string // 目标节点 (Worker域名)
 }
 
 type Config struct { Inbounds []Inbound `json:"inbounds"`; Outbounds []Outbound `json:"outbounds"`; Routing Routing `json:"routing"` }
@@ -47,20 +55,29 @@ type Inbound struct { Tag string `json:"tag"`; Listen string `json:"listen"`; Pr
 type Outbound struct { Tag string `json:"tag"`; Protocol string `json:"protocol"`; Settings json.RawMessage `json:"settings,omitempty"` }
 type ProxyForwarderSettings struct { Socks5Address string `json:"socks5_address"` }
 type Routing struct { Rules []Rule `json:"rules"`; DefaultOutbound string `json:"defaultOutbound,omitempty"` }
-type Rule struct { InboundTag []string `json:"inboundTag,omitempty"`; Domain []string `json:"domain,omitempty"`; GeoIP string `json:"geoip,omitempty"`; Port []int `json:"port,omitempty"`; OutboundTag string `json:"outboundTag"` }
 
 var ( 
 	globalConfig Config
 	proxySettingsMap = make(map[string]ProxySettings)
+	routingMap       []Rule // [v13] 全局路由表
 )
 
 var bufPool = sync.Pool{ New: func() interface{} { return make([]byte, 32*1024) } }
 
+// ======================== 核心入口 ========================
+
 func StartInstance(configContent []byte) (net.Listener, error) {
 	rand.Seed(time.Now().UnixNano())
 	proxySettingsMap = make(map[string]ProxySettings)
+	routingMap = nil // 清空路由表
+	
 	if err := json.Unmarshal(configContent, &globalConfig); err != nil { return nil, err }
+	
+	// [v13] 解析规则
+	parseRules()
+	
 	parseOutbounds()
+
 	if len(globalConfig.Inbounds) == 0 { return nil, errors.New("no inbounds") }
 	inbound := globalConfig.Inbounds[0]
 	listener, err := net.Listen("tcp", inbound.Listen)
@@ -73,8 +90,11 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 		if len(s.ServerPool) > 1 {
 			mode = fmt.Sprintf("Hydra Pool (%d nodes, Strategy: %s)", len(s.ServerPool), s.Strategy)
 		}
+		if len(routingMap) > 0 {
+			mode += fmt.Sprintf(" + %d Rules", len(routingMap))
+		}
 	}
-	log.Printf("[Core] Xlink Hydra Engine (v12.6) Listening on %s [%s]", inbound.Listen, mode)
+	log.Printf("[Core] Xlink Odyssey Engine (v13.0) Listening on %s [%s]", inbound.Listen, mode)
 	
 	go func() {
 		for {
@@ -84,6 +104,35 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 		}
 	}()
 	return listener, nil
+}
+
+// [v13] 解析规则字符串为路由表
+func parseRules() {
+	if len(globalConfig.Outbounds) == 0 { return }
+	var s ProxySettings
+	if err := json.Unmarshal(globalConfig.Outbounds[0].Settings, &s); err != nil { return }
+	if s.Rules == "" { return }
+
+	// 按换行符分割，兼容各种换行格式
+	rawRules := strings.ReplaceAll(s.Rules, "\r\n", "\n")
+	lines := strings.Split(rawRules, "\n")
+	
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		// 忽略空行和注释
+		if line == "" || strings.HasPrefix(line, "#") { continue }
+		
+		// 按逗号或中文逗号分割
+		line = strings.ReplaceAll(line, "，", ",")
+		parts := strings.SplitN(line, ",", 2)
+		if len(parts) == 2 {
+			keyword := strings.TrimSpace(parts[0])
+			node := strings.TrimSpace(parts[1])
+			if keyword != "" && node != "" {
+				routingMap = append(routingMap, Rule{Keyword: keyword, Node: node})
+			}
+		}
+	}
 }
 
 func parseOutbounds() {
@@ -122,6 +171,7 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	pipeDirect(conn, wsConn)
 }
 
+// [v13 核心] 重写调度器，实现“规则优先”
 func connectNanoTunnel(target string, outboundTag string, payload []byte) (*websocket.Conn, error) {
 	settings, ok := proxySettingsMap[outboundTag]
 	if !ok { return nil, errors.New("settings not found") }
@@ -133,25 +183,46 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 	socks5 := ""
 	if settings.ForwarderSettings != nil { socks5 = settings.ForwarderSettings.Socks5Address }
 
-	targetServer := settings.Server
-	if len(settings.ServerPool) > 0 {
-		poolLen := uint64(len(settings.ServerPool))
-		strategy := settings.Strategy
-		switch strategy {
-		case "rr":
-			idx := atomic.AddUint64(&globalRRIndex, 1)
-			targetServer = settings.ServerPool[idx%poolLen]
-		case "hash":
-			h := md5.Sum([]byte(target))
-			hashVal := binary.BigEndian.Uint64(h[:8])
-			targetServer = settings.ServerPool[hashVal%poolLen]
-		default:
-			targetServer = settings.ServerPool[rand.Intn(int(poolLen))]
+	// ---------------------- Odyssey 调度中心 ----------------------
+	targetServer := ""
+	logMsg := ""
+
+	// 1. 规则匹配 (Rule Matching)
+	// 遍历路由表，如果目标域名包含关键词，则命中
+	for _, rule := range routingMap {
+		if strings.Contains(target, rule.Keyword) {
+			targetServer = rule.Node
+			logMsg = fmt.Sprintf("[Core] Rule Hit -> %s | Node: %s (Rule: %s)", target, targetServer, rule.Keyword)
+			break
 		}
 	}
 
-	// [Log] 关键：输出流量日志供客户端捕获
-	log.Printf("[Core] Traffic -> %s | Node: %s | Algo: %s", target, targetServer, settings.Strategy)
+	// 2. 负载均衡 (Load Balancing) - 如果没有命中规则
+	if targetServer == "" {
+		if len(settings.ServerPool) > 0 {
+			poolLen := uint64(len(settings.ServerPool))
+			strategy := settings.Strategy
+			switch strategy {
+			case "rr":
+				idx := atomic.AddUint64(&globalRRIndex, 1)
+				targetServer = settings.ServerPool[idx%poolLen]
+			case "hash":
+				h := md5.Sum([]byte(target))
+				hashVal := binary.BigEndian.Uint64(h[:8])
+				targetServer = settings.ServerPool[hashVal%poolLen]
+			default:
+				targetServer = settings.ServerPool[rand.Intn(int(poolLen))]
+			}
+			logMsg = fmt.Sprintf("[Core] LB -> %s | Node: %s | Algo: %s", target, targetServer, strategy)
+		} else {
+			// 如果没池也没规则，退回单节点配置
+			targetServer = settings.Server
+			logMsg = fmt.Sprintf("[Core] Direct -> %s | Node: %s", target, targetServer)
+		}
+	}
+	// ---------------------------------------------------------
+	
+	log.Print(logMsg)
 
 	wsConn, err := dialCleanWebSocket(targetServer, settings.ServerIP, secretKey)
 	if err != nil { return nil, err }
@@ -163,6 +234,7 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 
 func dialCleanWebSocket(serverAddr, serverIP, token string) (*websocket.Conn, error) {
 	host, port, path, _ := parseServerAddr(serverAddr)
+	// v12+ 统一使用 URL Query 鉴权，如需 v11 Header 隐写可在此修改
 	wsURL := fmt.Sprintf("wss://%s:%s%s?token=%s", host, port, path, url.QueryEscape(token))
 	
 	requestHeader := http.Header{}
@@ -189,11 +261,12 @@ func dialCleanWebSocket(serverAddr, serverIP, token string) (*websocket.Conn, er
 	return conn, nil
 }
 
-// [修复] 暴力清洗函数，兼容所有常见分隔符
-func GenerateConfigJSON(serverAddr, serverIP, secretKey, socks5Addr, fallbackAddr, listenAddr, strategy string) string {
+// [v13] 配置生成器：支持 Rules 参数
+func GenerateConfigJSON(serverAddr, serverIP, secretKey, socks5Addr, fallbackAddr, listenAddr, strategy, rules string) string {
 	token := secretKey
 	if fallbackAddr != "" { token += "|" + fallbackAddr }
 
+	// 暴力清洗分隔符
 	normalizedAddr := serverAddr
 	replacements := []string{"\r\n", "\n", "，", ",", "；"}
 	for _, r := range replacements { normalizedAddr = strings.ReplaceAll(normalizedAddr, r, ";") }
@@ -206,6 +279,7 @@ func GenerateConfigJSON(serverAddr, serverIP, secretKey, socks5Addr, fallbackAdd
 			trimmed := strings.TrimSpace(node)
 			if trimmed != "" { validPool = append(validPool, trimmed) }
 		}
+		
 		if len(validPool) == 0 {
 			serverJSON = fmt.Sprintf(`"server": ""`)
 		} else if len(validPool) == 1 {
@@ -218,6 +292,9 @@ func GenerateConfigJSON(serverAddr, serverIP, secretKey, socks5Addr, fallbackAdd
 		serverJSON = fmt.Sprintf(`"server": "%s"`, strings.TrimSpace(serverAddr))
 	}
 
+	// [v13] 将 rules 字符串安全编码为 JSON 字符串
+	rulesJSON, _ := json.Marshal(rules)
+
 	config := fmt.Sprintf(`{
 		"inbounds": [{"tag": "socks-in", "listen": "%s", "protocol": "socks"}],
 		"outbounds": [{
@@ -226,7 +303,8 @@ func GenerateConfigJSON(serverAddr, serverIP, secretKey, socks5Addr, fallbackAdd
 			"settings": {
 				%s,
 				"server_ip": "%s",
-				"token": "%s"`, listenAddr, serverJSON, serverIP, token)
+				"token": "%s",
+				"rules": %s`, listenAddr, serverJSON, serverIP, token, string(rulesJSON))
 
 	if socks5Addr != "" {
 		config += fmt.Sprintf(`, "proxy_settings": {"socks5_address": "%s"}`, socks5Addr)
@@ -234,6 +312,8 @@ func GenerateConfigJSON(serverAddr, serverIP, secretKey, socks5Addr, fallbackAdd
 	config += `}}], "routing": {"rules": [{"outboundTag": "proxy", "port": [0, 65535]}]}}`
 	return config
 }
+
+// --- 辅助函数 ---
 
 func pipeDirect(local net.Conn, ws *websocket.Conn) { 
 	defer ws.Close(); defer local.Close()
