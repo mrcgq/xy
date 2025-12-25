@@ -201,21 +201,44 @@ func dialCleanWebSocket(serverAddr, serverIP, token string) (*websocket.Conn, er
 }
 
 // [v12.1] 配置生成器：支持 Strategy 参数
+// [v12.2 Fix] 修复多行输入导致解析失败的问题
 func GenerateConfigJSON(serverAddr, serverIP, secretKey, socks5Addr, fallbackAddr, listenAddr, strategy string) string {
 	token := secretKey
 	if fallbackAddr != "" { token += "|" + fallbackAddr }
 
+	// 1. 预处理：将所有换行符替换为分号，并将中文分号替换为英文分号
+	normalizedAddr := strings.ReplaceAll(serverAddr, "\r\n", ";") // Windows 换行
+	normalizedAddr = strings.ReplaceAll(normalizedAddr, "\n", ";")   // Linux 换行
+	normalizedAddr = strings.ReplaceAll(normalizedAddr, "；", ";")    // 中文分号兼容
+
 	var serverJSON string
-	if strings.Contains(serverAddr, ";") {
+	// 2. 检测是否包含分号（现在换行符也变成了分号）
+	if strings.Contains(normalizedAddr, ";") {
 		// 节点池模式
-		pool := strings.Split(serverAddr, ";")
-		for i := range pool { pool[i] = strings.TrimSpace(pool[i]) }
-		poolJSON, _ := json.Marshal(pool)
-		// 注入 Strategy 字段
-		serverJSON = fmt.Sprintf(`"server": "%s", "server_pool": %s, "strategy": "%s"`, pool[0], string(poolJSON), strategy)
+		rawPool := strings.Split(normalizedAddr, ";")
+		var validPool []string
+		
+		// 3. 清洗数据：去除空行和空格
+		for _, node := range rawPool {
+			trimmed := strings.TrimSpace(node)
+			if trimmed != "" {
+				validPool = append(validPool, trimmed)
+			}
+		}
+
+		// 兜底：如果清洗后只剩一个（或者空），回退到单节点逻辑
+		if len(validPool) == 0 {
+			serverJSON = fmt.Sprintf(`"server": ""`) // 空配置
+		} else if len(validPool) == 1 {
+			serverJSON = fmt.Sprintf(`"server": "%s"`, validPool[0])
+		} else {
+			poolJSON, _ := json.Marshal(validPool)
+			// 注入 Strategy 字段
+			serverJSON = fmt.Sprintf(`"server": "%s", "server_pool": %s, "strategy": "%s"`, validPool[0], string(poolJSON), strategy)
+		}
 	} else {
 		// 单节点模式
-		serverJSON = fmt.Sprintf(`"server": "%s"`, serverAddr)
+		serverJSON = fmt.Sprintf(`"server": "%s"`, strings.TrimSpace(serverAddr))
 	}
 
 	config := fmt.Sprintf(`{
