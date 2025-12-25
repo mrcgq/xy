@@ -1,7 +1,7 @@
-// core/core-binary.go (v10.5 - Nano Ultimate Fixed)
-// [修复] 引入 sync.Pool 复用内存，降低 GC 压力
-// [修复] 优化 pipeDirect 管道资源释放逻辑
-// [特性] 完美适配 v10.5 服务端：0-RTT, URL Token, Early Data
+// core/core-binary.go (v12.1 - Hydra Strategy Edition)
+// [基座] v12.0 Hydra (节点池)
+// [新增] 策略调度引擎 (Random / Round-Robin / Sticky Hash)
+// [状态] 物理性能无损，逻辑维度升级
 
 //go:build binary
 // +build binary
@@ -11,6 +11,7 @@ package core
 import (
 	"bufio"
 	"bytes"
+	"crypto/md5" // [v12.1] Hash 策略需要
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
@@ -18,22 +19,35 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
-	"sync" // [新增] 引入 sync 包用于内存池
+	"sync"
+	"sync/atomic" // [v12.1] RR 策略需要
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-// --- 结构定义 (与 GUI 生成的 config.json 结构匹配) ---
+// 全局计数器 (用于轮询策略)
+var globalRRIndex uint64
+
+// --- 结构定义 ---
+type ProxySettings struct { 
+	Server     string   `json:"server"`
+	ServerPool []string `json:"server_pool"`
+	Strategy   string   `json:"strategy"` // [v12.1] 策略字段: random, rr, hash
+	ServerIP   string   `json:"server_ip"` 
+	Token      string   `json:"token"` 
+	ForwarderSettings *ProxyForwarderSettings `json:"proxy_settings,omitempty"` 
+}
+
 type Config struct { Inbounds []Inbound `json:"inbounds"`; Outbounds []Outbound `json:"outbounds"`; Routing Routing `json:"routing"` }
 type Inbound struct { Tag string `json:"tag"`; Listen string `json:"listen"`; Protocol string `json:"protocol"` }
 type Outbound struct { Tag string `json:"tag"`; Protocol string `json:"protocol"`; Settings json.RawMessage `json:"settings,omitempty"` }
 type ProxyForwarderSettings struct { Socks5Address string `json:"socks5_address"` }
-type ProxySettings struct { Server string `json:"server"`; ServerIP string `json:"server_ip"`; Token string `json:"token"`; ForwarderSettings *ProxyForwarderSettings `json:"proxy_settings,omitempty"` }
 type Routing struct { Rules []Rule `json:"rules"`; DefaultOutbound string `json:"defaultOutbound,omitempty"` }
 type Rule struct { InboundTag []string `json:"inboundTag,omitempty"`; Domain []string `json:"domain,omitempty"`; GeoIP string `json:"geoip,omitempty"`; Port []int `json:"port,omitempty"`; OutboundTag string `json:"outboundTag"` }
 
@@ -42,37 +56,33 @@ var (
 	proxySettingsMap = make(map[string]ProxySettings)
 )
 
-// [优化] 定义全局内存池，复用 32KB 缓冲区，减少 GC 压力
 var bufPool = sync.Pool{
-	New: func() interface{} {
-		// 32KB 是 Cloudflare 管道传输的最佳切片大小
-		return make([]byte, 32*1024)
-	},
+	New: func() interface{} { return make([]byte, 32*1024) },
 }
 
 // ======================== 核心入口 ========================
 
 func StartInstance(configContent []byte) (net.Listener, error) {
-	// 重置 Map 防止残留
+	rand.Seed(time.Now().UnixNano())
 	proxySettingsMap = make(map[string]ProxySettings)
 	
-	if err := json.Unmarshal(configContent, &globalConfig); err != nil { 
-		return nil, err 
-	}
-	
+	if err := json.Unmarshal(configContent, &globalConfig); err != nil { return nil, err }
 	parseOutbounds()
 	
-	if len(globalConfig.Inbounds) == 0 { 
-		return nil, errors.New("no inbounds") 
-	}
-	
+	if len(globalConfig.Inbounds) == 0 { return nil, errors.New("no inbounds") }
 	inbound := globalConfig.Inbounds[0]
 	listener, err := net.Listen("tcp", inbound.Listen)
-	if err != nil { 
-		return nil, err 
-	}
+	if err != nil { return nil, err }
 	
-	log.Printf("[Core] Xlink Nano Engine (v10.5 Ultimate) Listening on %s", inbound.Listen)
+	mode := "Single Node"
+	if len(globalConfig.Outbounds) > 0 {
+		var s ProxySettings
+		json.Unmarshal(globalConfig.Outbounds[0].Settings, &s)
+		if len(s.ServerPool) > 1 {
+			mode = fmt.Sprintf("Hydra Pool (%d nodes, Strategy: %s)", len(s.ServerPool), s.Strategy)
+		}
+	}
+	log.Printf("[Core] Xlink Hydra Engine (v12.1) Listening on %s [%s]", inbound.Listen, mode)
 	
 	go func() {
 		for {
@@ -98,86 +108,72 @@ func parseOutbounds() {
 // ======================== 连接处理 ========================
 
 func handleGeneralConnection(conn net.Conn, inboundTag string) {
-	// 注意：这里不要过早 defer conn.Close()，因为所有权会转移给 pipeDirect
-	// 但为了防止 panic 导致的泄露，保留 defer 是安全的，Close 可以多次调用
 	defer conn.Close()
-	
-	// 预读取 1 字节，判断是 SOCKS5 握手还是 HTTP 请求
 	buf := make([]byte, 1)
 	if _, err := io.ReadFull(conn, buf); err != nil { return }
-	
 	var target string
 	var err error
 	var firstFrame []byte
-	var mode int // 1=SOCKS5, 2=HTTP Connect, 3=HTTP Direct
-
+	var mode int 
 	switch buf[0] {
-	case 0x05:
-		target, err = handleSOCKS5(conn, inboundTag)
-		mode = 1
-	default:
-		target, firstFrame, mode, err = handleHTTP(conn, buf, inboundTag)
+	case 0x05: target, err = handleSOCKS5(conn, inboundTag); mode = 1
+	default: target, firstFrame, mode, err = handleHTTP(conn, buf, inboundTag)
 	}
-	
-	if err != nil { 
-		return 
-	}
+	if err != nil { return }
 
-	// 建立到 Cloudflare Workers 的 WebSocket 隧道
 	wsConn, err := connectNanoTunnel(target, "proxy", firstFrame)
-	if err != nil { 
-		return 
-	}
-	
-	// 注意：wsConn 的关闭由 pipeDirect 接管
+	if err != nil { return }
 
-	// 握手成功，响应本地客户端
-	if mode == 1 { 
-		conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) 
-	}
-	if mode == 2 { 
-		conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) 
-	}
-	
-	// 进入纯管道传输模式 (借力打力：只转发，不处理)
+	if mode == 1 { conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) }
+	if mode == 2 { conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
 	pipeDirect(conn, wsConn)
 }
 
+// [v12.1 核心] 智能调度器
 func connectNanoTunnel(target, outboundTag string, payload []byte) (*websocket.Conn, error) {
 	settings, ok := proxySettingsMap[outboundTag]
 	if !ok { return nil, errors.New("settings not found") }
 
-	// 1. 提取 Token 和 Fallback
 	parts := strings.SplitN(settings.Token, "|", 2)
 	secretKey := parts[0]
 	fallback := ""
-	if len(parts) > 1 { 
-		fallback = parts[1] 
-	}
-
-	// 2. 提取 SOCKS5 (作为协议头数据发送给服务端，不是本地连接用)
+	if len(parts) > 1 { fallback = parts[1] }
 	socks5 := ""
-	if settings.ForwarderSettings != nil { 
-		socks5 = settings.ForwarderSettings.Socks5Address 
-	}
+	if settings.ForwarderSettings != nil { socks5 = settings.ForwarderSettings.Socks5Address }
 
-	// 3. 建立 WebSocket 连接 (使用 URL Token 鉴权)
-	wsConn, err := dialCleanWebSocket(settings, secretKey)
+	// ---------------------- 战术调度逻辑 ----------------------
+	targetServer := settings.Server // 默认单节点
+	if len(settings.ServerPool) > 0 {
+		poolLen := uint64(len(settings.ServerPool))
+		strategy := settings.Strategy
+
+		switch strategy {
+		case "rr": // 🚀 加特林模式 (Round Robin)
+			idx := atomic.AddUint64(&globalRRIndex, 1)
+			targetServer = settings.ServerPool[idx%poolLen]
+
+		case "hash": // 🎯 狙击模式 (Sticky Hash)
+			// 计算目标域名的 MD5，确保同一网站始终命中同一节点
+			h := md5.Sum([]byte(target))
+			hashVal := binary.BigEndian.Uint64(h[:8])
+			targetServer = settings.ServerPool[hashVal%poolLen]
+
+		default: // ⚔️ 混沌模式 (Random) - 默认
+			targetServer = settings.ServerPool[rand.Intn(int(poolLen))]
+		}
+	}
+	// ---------------------------------------------------------
+
+	wsConn, err := dialCleanWebSocket(targetServer, settings.ServerIP, secretKey)
 	if err != nil { return nil, err }
 
-	// 4. 发送 v10.2/v10.5 协议头 (包含 Target, S5, Fallback, Payload)
 	err = sendNanoHeaderV2(wsConn, target, payload, socks5, fallback)
-	if err != nil {
-		wsConn.Close()
-		return nil, err
-	}
+	if err != nil { wsConn.Close(); return nil, err }
 	return wsConn, nil
 }
 
-func dialCleanWebSocket(settings ProxySettings, token string) (*websocket.Conn, error) {
-	host, port, path, _ := parseServerAddr(settings.Server)
-	
-	// 关键：将 Token 拼接到 URL 参数中 (0-RTT 鉴权)
+func dialCleanWebSocket(serverAddr, serverIP, token string) (*websocket.Conn, error) {
+	host, port, path, _ := parseServerAddr(serverAddr)
 	wsURL := fmt.Sprintf("wss://%s:%s%s?token=%s", host, port, path, url.QueryEscape(token))
 	
 	requestHeader := http.Header{}
@@ -189,11 +185,10 @@ func dialCleanWebSocket(settings ProxySettings, token string) (*websocket.Conn, 
 		HandshakeTimeout: 5 * time.Second,
 	}
 	
-	// 处理 ServerIP 指定 (Hosts 强制解析)
-	if settings.ServerIP != "" {
+	if serverIP != "" {
 		dialer.NetDial = func(network, addr string) (net.Conn, error) { 
 			_, p, _ := net.SplitHostPort(addr)
-			return net.DialTimeout(network, net.JoinHostPort(settings.ServerIP, p), 5*time.Second) 
+			return net.DialTimeout(network, net.JoinHostPort(serverIP, p), 5*time.Second) 
 		}
 	}
 
@@ -205,81 +200,73 @@ func dialCleanWebSocket(settings ProxySettings, token string) (*websocket.Conn, 
 	return conn, nil
 }
 
-// [v10.5] Nano 协议发送：支持 S5 和 Fallback
-func sendNanoHeaderV2(wsConn *websocket.Conn, target string, payload []byte, s5 string, fb string) error {
-	host, portStr, _ := net.SplitHostPort(target)
-	var port uint16
-	fmt.Sscanf(portStr, "%d", &port)
+// [v12.1] 配置生成器：支持 Strategy 参数
+func GenerateConfigJSON(serverAddr, serverIP, secretKey, socks5Addr, fallbackAddr, listenAddr, strategy string) string {
+	token := secretKey
+	if fallbackAddr != "" { token += "|" + fallbackAddr }
 
-	hostBytes := []byte(host)
-	s5Bytes := []byte(s5)
-	fbBytes := []byte(fb)
-
-	// 长度检查
-	if len(hostBytes) > 255 || len(s5Bytes) > 255 || len(fbBytes) > 255 {
-		return errors.New("address length exceeds 255 bytes")
+	var serverJSON string
+	if strings.Contains(serverAddr, ";") {
+		// 节点池模式
+		pool := strings.Split(serverAddr, ";")
+		for i := range pool { pool[i] = strings.TrimSpace(pool[i]) }
+		poolJSON, _ := json.Marshal(pool)
+		// 注入 Strategy 字段
+		serverJSON = fmt.Sprintf(`"server": "%s", "server_pool": %s, "strategy": "%s"`, pool[0], string(poolJSON), strategy)
+	} else {
+		// 单节点模式
+		serverJSON = fmt.Sprintf(`"server": "%s"`, serverAddr)
 	}
 
-	buf := new(bytes.Buffer)
-	
-	// 1. Target [Len][Host][Port]
-	buf.WriteByte(byte(len(hostBytes)))
-	buf.Write(hostBytes)
-	portBytes := make([]byte, 2); binary.BigEndian.PutUint16(portBytes, port); buf.Write(portBytes)
-	
-	// 2. SOCKS5 [Len][String]
-	buf.WriteByte(byte(len(s5Bytes)))
-	if len(s5Bytes) > 0 { buf.Write(s5Bytes) }
+	config := fmt.Sprintf(`{
+		"inbounds": [{"tag": "socks-in", "listen": "%s", "protocol": "socks"}],
+		"outbounds": [{
+			"tag": "proxy",
+			"protocol": "ech-proxy",
+			"settings": {
+				%s,
+				"server_ip": "%s",
+				"token": "%s"`, listenAddr, serverJSON, serverIP, token)
 
-	// 3. Fallback [Len][String]
-	buf.WriteByte(byte(len(fbBytes)))
-	if len(fbBytes) > 0 { buf.Write(fbBytes) }
-
-	// 4. Payload (Early Data)
-	if len(payload) > 0 { buf.Write(payload) }
-
-	// 一次性发送 (Zero RTT)
-	return wsConn.WriteMessage(websocket.BinaryMessage, buf.Bytes())
+	if socks5Addr != "" {
+		config += fmt.Sprintf(`, "proxy_settings": {"socks5_address": "%s"}`, socks5Addr)
+	}
+	config += `}}], "routing": {"rules": [{"outboundTag": "proxy", "port": [0, 65535]}]}}`
+	return config
 }
 
-// --- 辅助函数 ---
-
-// [优化] 引入 sync.Pool 的高性能管道函数
+// --- 辅助函数 (保持不变) ---
 func pipeDirect(local net.Conn, ws *websocket.Conn) { 
-	// 确保双向关闭
-	defer ws.Close()
-	defer local.Close()
-
-	// 远程 (WS) -> 本地 (TCP)
-	// 使用 io.Copy 实现零拷贝 (Go底层会利用 sendfile/splice)
+	defer ws.Close(); defer local.Close()
 	go func() { 
 		for { 
 			mt, r, err := ws.NextReader()
 			if err != nil { break }
-			if mt == websocket.BinaryMessage { 
-				if _, err := io.Copy(local, r); err != nil { break }
-			}
+			if mt == websocket.BinaryMessage { if _, err := io.Copy(local, r); err != nil { break } }
 		} 
-		// 远程断开 -> 关闭本地
 		local.Close() 
 	}() 
-
-	// 本地 (TCP) -> 远程 (WS)
-	// 使用内存池优化
-	bufPtr := bufPool.Get().([]byte) // 从池中借出
-	defer bufPool.Put(bufPtr)        // 函数结束归还
-
+	bufPtr := bufPool.Get().([]byte); defer bufPool.Put(bufPtr)
 	for { 
 		n, err := local.Read(bufPtr)
-		if n > 0 { 
-			// 写入 WebSocket
-			if err := ws.WriteMessage(websocket.BinaryMessage, bufPtr[:n]); err != nil { break }
-		} 
+		if n > 0 { if err := ws.WriteMessage(websocket.BinaryMessage, bufPtr[:n]); err != nil { break } } 
 		if err != nil { break }
 	} 
-	// 本地断开 -> 循环结束 -> defer 触发 ws.Close()
 }
-
+func sendNanoHeaderV2(wsConn *websocket.Conn, target string, payload []byte, s5 string, fb string) error {
+	host, portStr, _ := net.SplitHostPort(target)
+	var port uint16
+	fmt.Sscanf(portStr, "%d", &port)
+	hostBytes := []byte(host); s5Bytes := []byte(s5); fbBytes := []byte(fb)
+	if len(hostBytes) > 255 || len(s5Bytes) > 255 || len(fbBytes) > 255 { return errors.New("address length exceeds 255 bytes") }
+	buf := new(bytes.Buffer)
+	buf.WriteByte(byte(len(hostBytes))); buf.Write(hostBytes)
+	portBytes := make([]byte, 2); binary.BigEndian.PutUint16(portBytes, port); buf.Write(portBytes)
+	buf.WriteByte(byte(len(s5Bytes))); if len(s5Bytes) > 0 { buf.Write(s5Bytes) }
+	buf.WriteByte(byte(len(fbBytes))); if len(fbBytes) > 0 { buf.Write(fbBytes) }
+	if len(payload) > 0 { buf.Write(payload) }
+	return wsConn.WriteMessage(websocket.BinaryMessage, buf.Bytes())
+}
 func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) { 
 	handshakeBuf := make([]byte, 2); io.ReadFull(conn, handshakeBuf)
 	conn.Write([]byte{0x05, 0x00})
@@ -294,36 +281,21 @@ func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) {
 	port := binary.BigEndian.Uint16(portBytes)
 	return net.JoinHostPort(host, fmt.Sprintf("%d", port)), nil 
 }
-
 func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) (string, []byte, int, error) { 
-	// 注意：这里 bufio 可能会预读数据。
-	// 对于 HTTPS CONNECT，Header 后通常无数据，安全。
-	// 对于 HTTP Proxy，如果有 Body，可能会被 bufio 吞掉部分。
-	// 但鉴于这主要是为了 Xray/Browser 代理，CONNECT 是主流，此处保持标准库实现以维持代码简洁。
 	reader := bufio.NewReader(io.MultiReader(bytes.NewReader(initialData), conn))
 	req, err := http.ReadRequest(reader)
 	if err != nil { return "", nil, 0, err }
 	target := req.Host
-	if !strings.Contains(target, ":") { 
-		if req.Method == "CONNECT" { target += ":443" } else { target += ":80" } 
-	}
+	if !strings.Contains(target, ":") { if req.Method == "CONNECT" { target += ":443" } else { target += ":80" } }
 	if req.Method == "CONNECT" { return target, nil, 2, nil }
 	var buf bytes.Buffer
 	req.WriteProxy(&buf)
 	return target, buf.Bytes(), 3, nil 
 }
-
 func parseServerAddr(addr string) (host, port, path string, err error) { 
 	path = "/"
-	if idx := strings.Index(addr, "/"); idx != -1 { 
-		path = addr[idx:]
-		addr = addr[:idx] 
-	}
+	if idx := strings.Index(addr, "/"); idx != -1 { path = addr[idx:]; addr = addr[:idx] }
 	host, port, err = net.SplitHostPort(addr)
-	if err != nil { 
-		host = addr
-		port = "443"
-		err = nil 
-	}
+	if err != nil { host = addr; port = "443"; err = nil }
 	return 
 }
