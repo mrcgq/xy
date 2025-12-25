@@ -1,7 +1,6 @@
-// core/core-binary.go (v12.1 - Hydra Strategy Edition)
-// [基座] v12.0 Hydra (节点池)
-// [新增] 策略调度引擎 (Random / Round-Robin / Sticky Hash)
-// [状态] 物理性能无损，逻辑维度升级
+// core/core-binary.go (v12.6 - Hydra Verbose Edition)
+// [基座] v12.2 Hydra (节点池 + 策略 + 换行修复)
+// [新增] 详细日志输出 (Verbose Logging) - 配合客户端显示流量详情
 
 //go:build binary
 // +build binary
@@ -11,7 +10,7 @@ package core
 import (
 	"bufio"
 	"bytes"
-	"crypto/md5" // [v12.1] Hash 策略需要
+	"crypto/md5"
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
@@ -25,20 +24,18 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-	"sync/atomic" // [v12.1] RR 策略需要
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-// 全局计数器 (用于轮询策略)
 var globalRRIndex uint64
 
-// --- 结构定义 ---
 type ProxySettings struct { 
 	Server     string   `json:"server"`
 	ServerPool []string `json:"server_pool"`
-	Strategy   string   `json:"strategy"` // [v12.1] 策略字段: random, rr, hash
+	Strategy   string   `json:"strategy"`
 	ServerIP   string   `json:"server_ip"` 
 	Token      string   `json:"token"` 
 	ForwarderSettings *ProxyForwarderSettings `json:"proxy_settings,omitempty"` 
@@ -56,19 +53,13 @@ var (
 	proxySettingsMap = make(map[string]ProxySettings)
 )
 
-var bufPool = sync.Pool{
-	New: func() interface{} { return make([]byte, 32*1024) },
-}
-
-// ======================== 核心入口 ========================
+var bufPool = sync.Pool{ New: func() interface{} { return make([]byte, 32*1024) } }
 
 func StartInstance(configContent []byte) (net.Listener, error) {
 	rand.Seed(time.Now().UnixNano())
 	proxySettingsMap = make(map[string]ProxySettings)
-	
 	if err := json.Unmarshal(configContent, &globalConfig); err != nil { return nil, err }
 	parseOutbounds()
-	
 	if len(globalConfig.Inbounds) == 0 { return nil, errors.New("no inbounds") }
 	inbound := globalConfig.Inbounds[0]
 	listener, err := net.Listen("tcp", inbound.Listen)
@@ -82,7 +73,7 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 			mode = fmt.Sprintf("Hydra Pool (%d nodes, Strategy: %s)", len(s.ServerPool), s.Strategy)
 		}
 	}
-	log.Printf("[Core] Xlink Hydra Engine (v12.1) Listening on %s [%s]", inbound.Listen, mode)
+	log.Printf("[Core] Xlink Hydra Engine (v12.6) Listening on %s [%s]", inbound.Listen, mode)
 	
 	go func() {
 		for {
@@ -105,8 +96,6 @@ func parseOutbounds() {
 	}
 }
 
-// ======================== 连接处理 ========================
-
 func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	defer conn.Close()
 	buf := make([]byte, 1)
@@ -122,15 +111,18 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	if err != nil { return }
 
 	wsConn, err := connectNanoTunnel(target, "proxy", firstFrame)
-	if err != nil { return }
+	if err != nil { 
+		// [Log] 连接失败日志
+		log.Printf("[Core] Error connecting to %s: %v", target, err)
+		return 
+	}
 
 	if mode == 1 { conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) }
 	if mode == 2 { conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
 	pipeDirect(conn, wsConn)
 }
 
-// [v12.1 核心] 智能调度器
-func connectNanoTunnel(target, outboundTag string, payload []byte) (*websocket.Conn, error) {
+func connectNanoTunnel(target string, outboundTag string, payload []byte) (*websocket.Conn, error) {
 	settings, ok := proxySettingsMap[outboundTag]
 	if !ok { return nil, errors.New("settings not found") }
 
@@ -141,28 +133,25 @@ func connectNanoTunnel(target, outboundTag string, payload []byte) (*websocket.C
 	socks5 := ""
 	if settings.ForwarderSettings != nil { socks5 = settings.ForwarderSettings.Socks5Address }
 
-	// ---------------------- 战术调度逻辑 ----------------------
-	targetServer := settings.Server // 默认单节点
+	targetServer := settings.Server
 	if len(settings.ServerPool) > 0 {
 		poolLen := uint64(len(settings.ServerPool))
 		strategy := settings.Strategy
-
 		switch strategy {
-		case "rr": // 🚀 加特林模式 (Round Robin)
+		case "rr":
 			idx := atomic.AddUint64(&globalRRIndex, 1)
 			targetServer = settings.ServerPool[idx%poolLen]
-
-		case "hash": // 🎯 狙击模式 (Sticky Hash)
-			// 计算目标域名的 MD5，确保同一网站始终命中同一节点
+		case "hash":
 			h := md5.Sum([]byte(target))
 			hashVal := binary.BigEndian.Uint64(h[:8])
 			targetServer = settings.ServerPool[hashVal%poolLen]
-
-		default: // ⚔️ 混沌模式 (Random) - 默认
+		default:
 			targetServer = settings.ServerPool[rand.Intn(int(poolLen))]
 		}
 	}
-	// ---------------------------------------------------------
+
+	// [Log] 关键日志：流量去向 + 命中节点
+	log.Printf("[Core] Traffic -> %s | Node: %s | Algo: %s", target, targetServer, settings.Strategy)
 
 	wsConn, err := dialCleanWebSocket(targetServer, settings.ServerIP, secretKey)
 	if err != nil { return nil, err }
@@ -200,44 +189,31 @@ func dialCleanWebSocket(serverAddr, serverIP, token string) (*websocket.Conn, er
 	return conn, nil
 }
 
-// [v12.1] 配置生成器：支持 Strategy 参数
-// [v12.2 Fix] 修复多行输入导致解析失败的问题
 func GenerateConfigJSON(serverAddr, serverIP, secretKey, socks5Addr, fallbackAddr, listenAddr, strategy string) string {
 	token := secretKey
 	if fallbackAddr != "" { token += "|" + fallbackAddr }
 
-	// 1. 预处理：将所有换行符替换为分号，并将中文分号替换为英文分号
-	normalizedAddr := strings.ReplaceAll(serverAddr, "\r\n", ";") // Windows 换行
-	normalizedAddr = strings.ReplaceAll(normalizedAddr, "\n", ";")   // Linux 换行
-	normalizedAddr = strings.ReplaceAll(normalizedAddr, "；", ";")    // 中文分号兼容
+	normalizedAddr := serverAddr
+	replacements := []string{"\r\n", "\n", "，", ",", "；"}
+	for _, r := range replacements { normalizedAddr = strings.ReplaceAll(normalizedAddr, r, ";") }
 
 	var serverJSON string
-	// 2. 检测是否包含分号（现在换行符也变成了分号）
 	if strings.Contains(normalizedAddr, ";") {
-		// 节点池模式
 		rawPool := strings.Split(normalizedAddr, ";")
 		var validPool []string
-		
-		// 3. 清洗数据：去除空行和空格
 		for _, node := range rawPool {
 			trimmed := strings.TrimSpace(node)
-			if trimmed != "" {
-				validPool = append(validPool, trimmed)
-			}
+			if trimmed != "" { validPool = append(validPool, trimmed) }
 		}
-
-		// 兜底：如果清洗后只剩一个（或者空），回退到单节点逻辑
 		if len(validPool) == 0 {
-			serverJSON = fmt.Sprintf(`"server": ""`) // 空配置
+			serverJSON = fmt.Sprintf(`"server": ""`)
 		} else if len(validPool) == 1 {
 			serverJSON = fmt.Sprintf(`"server": "%s"`, validPool[0])
 		} else {
 			poolJSON, _ := json.Marshal(validPool)
-			// 注入 Strategy 字段
 			serverJSON = fmt.Sprintf(`"server": "%s", "server_pool": %s, "strategy": "%s"`, validPool[0], string(poolJSON), strategy)
 		}
 	} else {
-		// 单节点模式
 		serverJSON = fmt.Sprintf(`"server": "%s"`, strings.TrimSpace(serverAddr))
 	}
 
@@ -258,7 +234,6 @@ func GenerateConfigJSON(serverAddr, serverIP, secretKey, socks5Addr, fallbackAdd
 	return config
 }
 
-// --- 辅助函数 (保持不变) ---
 func pipeDirect(local net.Conn, ws *websocket.Conn) { 
 	defer ws.Close(); defer local.Close()
 	go func() { 
