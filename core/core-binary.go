@@ -1,6 +1,7 @@
-// core/core-binary.go (v13.6 - Ares Final Edition)
-// [最终修复] 规则引擎现在可以识别并复用节点池中的别名及其优选IP/端口
-// [状态] 逻辑闭环，功能完整，是为最终形态
+// core/core-binary.go (v14.2 - Zeus Perfect Edition)
+// [升级] 权重生效：实现 Weighted Hash 算法，支持 |weight 精确流量配比
+// [升级] 端口解耦：分离 SNI 端口与 TCP 连接端口，实现极致伪装
+// [状态] 逻辑完美闭环，无省略完整版
 
 //go:build binary
 // +build binary
@@ -22,6 +23,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,10 +34,17 @@ import (
 
 var globalRRIndex uint64
 
+// [v14] 真实后端结构
+type Backend struct {
+	IP     string
+	Port   string
+	Weight int
+}
+
+// [v14] Node 结构
 type Node struct {
-	Domain string 
-	IP     string 
-	Port   string 
+	Domain   string    
+	Backends []Backend 
 }
 
 type ProxySettings struct { 
@@ -62,25 +71,47 @@ var (
 
 var bufPool = sync.Pool{ New: func() interface{} { return make([]byte, 32*1024) } }
 
+// 解析节点字符串 (支持权重 |n)
 func parseNode(nodeStr string) Node {
 	var n Node
 	parts := strings.SplitN(nodeStr, "#", 2)
 	n.Domain = strings.TrimSpace(parts[0])
-	
-	if len(parts) == 2 {
-		addrPart := strings.TrimSpace(parts[1])
-		host, port, err := net.SplitHostPort(addrPart)
-		if err == nil {
-			n.IP = host
-			n.Port = port
-		} else {
-			n.IP = addrPart
+
+	if len(parts) != 2 || parts[1] == "" {
+		return n 
+	}
+
+	backendPart := strings.TrimSpace(parts[1])
+	entries := strings.Split(backendPart, ",") 
+
+	for _, e := range entries {
+		e = strings.TrimSpace(e)
+		if e == "" { continue }
+
+		weight := 1 
+		addr := e
+		
+		if strings.Contains(e, "|") {
+			p := strings.SplitN(e, "|", 2)
+			addr = p[0]
+			w, err := strconv.Atoi(p[1])
+			if err == nil && w > 0 {
+				weight = w
+			}
 		}
+
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			host = addr
+			port = "" 
+		}
+
+		n.Backends = append(n.Backends, Backend{IP: host, Port: port, Weight: weight})
 	}
 	return n
 }
 
-// [v13.6 核心修复] 规则解析器现在会优先匹配节点池别名
+// 规则解析器
 func parseRules(pool []Node) {
 	if len(globalConfig.Outbounds) == 0 { return }
 	var s ProxySettings
@@ -102,8 +133,7 @@ func parseRules(pool []Node) {
 			
 			var foundNode Node
 			aliasFound := false
-
-			// 1. 优先在节点池中查找别名
+			// 优先匹配节点池中的别名
 			for _, pNode := range pool {
 				if pNode.Domain == nodeStr {
 					foundNode = pNode
@@ -111,8 +141,7 @@ func parseRules(pool []Node) {
 					break
 				}
 			}
-
-			// 2. 如果不是别名，则按 Ares 格式解析
+			// 未找到别名，则按 Ares 格式解析
 			if !aliasFound {
 				foundNode = parseNode(nodeStr)
 			}
@@ -124,13 +153,19 @@ func parseRules(pool []Node) {
 	}
 }
 
+// Outbound 解析器
 func parseOutbounds() {
 	for i, outbound := range globalConfig.Outbounds {
 		if outbound.Protocol == "ech-proxy" {
 			var settings ProxySettings
 			if err := json.Unmarshal(outbound.Settings, &settings); err == nil {
+				// 暴力清洗分隔符
 				rawPool := strings.ReplaceAll(settings.Server, "\r\n", ";")
 				rawPool = strings.ReplaceAll(rawPool, "\n", ";")
+				rawPool = strings.ReplaceAll(rawPool, "，", ";")
+				rawPool = strings.ReplaceAll(rawPool, ",", ";")
+				rawPool = strings.ReplaceAll(rawPool, "；", ";")
+
 				nodeStrs := strings.Split(rawPool, ";")
 				
 				for _, nodeStr := range nodeStrs {
@@ -141,6 +176,7 @@ func parseOutbounds() {
 				}
 				proxySettingsMap[outbound.Tag] = settings
 				
+				// 回写配置
 				b, _ := json.Marshal(settings)
 				globalConfig.Outbounds[i].Settings = b
 			}
@@ -168,15 +204,15 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 	mode := "Single Node"
 	if s, ok := proxySettingsMap["proxy"]; ok {
 		if len(s.NodePool) > 1 {
-			mode = fmt.Sprintf("Ares Pool (%d nodes, Strategy: %s)", len(s.NodePool), s.Strategy)
+			mode = fmt.Sprintf("Zeus Pool (%d nodes, Strategy: %s)", len(s.NodePool), s.Strategy)
 		} else if len(s.NodePool) == 1 {
-			mode = fmt.Sprintf("Ares Single (%s)", s.NodePool[0].Domain)
+			mode = fmt.Sprintf("Zeus Single (%s)", s.NodePool[0].Domain)
 		}
 		if len(routingMap) > 0 {
 			mode += fmt.Sprintf(" + %d Rules", len(routingMap))
 		}
 	}
-	log.Printf("[Core] Xlink Ares Engine (v13.6 Final) Listening on %s [%s]", inbound.Listen, mode)
+	log.Printf("[Core] Xlink Zeus Engine (v14.1 Perfect) Listening on %s [%s]", inbound.Listen, mode)
 	
 	go func() {
 		for {
@@ -187,7 +223,6 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 	}()
 	return listener, nil
 }
-
 
 func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	defer conn.Close()
@@ -227,16 +262,16 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 	var targetNode Node
 	logMsg := ""
 
-	// 1. 规则匹配
+	// 1. [外层调度] 规则匹配
 	for _, rule := range routingMap {
 		if strings.Contains(target, rule.Keyword) {
 			targetNode = rule.Node
-			logMsg = fmt.Sprintf("[Core] Rule Hit -> %s | Node: %s (Rule: %s)", target, targetNode.Domain, rule.Keyword)
+			logMsg = fmt.Sprintf("[Core] Rule Hit -> %s | SNI: %s (Rule: %s)", target, targetNode.Domain, rule.Keyword)
 			break
 		}
 	}
 
-	// 2. 负载均衡
+	// 2. [外层调度] 负载均衡
 	if targetNode.Domain == "" {
 		if len(settings.NodePool) > 0 {
 			poolLen := uint64(len(settings.NodePool))
@@ -252,7 +287,7 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 			default:
 				targetNode = settings.NodePool[rand.Intn(int(poolLen))]
 			}
-			logMsg = fmt.Sprintf("[Core] LB -> %s | Node: %s | Algo: %s", target, targetNode.Domain, strategy)
+			logMsg = fmt.Sprintf("[Core] LB -> %s | SNI: %s | Algo: %s", target, targetNode.Domain, strategy)
 		} else {
 			return nil, errors.New("no nodes configured in pool")
 		}
@@ -260,7 +295,19 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 	
 	log.Print(logMsg)
 
-	wsConn, err := dialAresWebSocket(targetNode, secretKey, settings.ServerIP)
+	// 3. [内层调度] 选择真实后端 (支持权重)
+	backend := selectBackend(targetNode.Backends, target)
+	if backend.IP == "" {
+		backend.IP = settings.ServerIP // 兜底使用全局 IP
+	}
+
+	if backend.IP != "" {
+		// Log 显示真实出口 (IP:Port)
+		log.Printf("[Core] Tunnel -> %s (SNI) >>> %s:%s (Real)", targetNode.Domain, backend.IP, backend.Port)
+	}
+
+	// 4. 发起连接 (解耦 SNI 和 TCP 端口)
+	wsConn, err := dialZeusWebSocket(targetNode.Domain, backend, secretKey)
 	if err != nil { return nil, err }
 
 	err = sendNanoHeaderV2(wsConn, target, payload, socks5, fallback)
@@ -268,53 +315,83 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 	return wsConn, nil
 }
 
-func dialAresWebSocket(node Node, token string, globalIP string) (*websocket.Conn, error) {
-	host, port, err := net.SplitHostPort(node.Domain)
-	if err != nil {
-		host = node.Domain
-		port = "443" 
-	}
-	if node.Port != "" {
-		port = node.Port 
+// [v14.1 核心修复] 加权哈希选择器
+func selectBackend(backends []Backend, key string) Backend {
+	if len(backends) == 0 { return Backend{} }
+	if len(backends) == 1 { return backends[0] }
+
+	// 1. 计算总权重
+	totalWeight := 0
+	for _, b := range backends {
+		totalWeight += b.Weight
 	}
 
-	wsURL := fmt.Sprintf("wss://%s:%s/?token=%s", host, port, url.QueryEscape(token))
+	// 2. 计算目标哈希值，映射到 [0, totalWeight) 区间
+	h := md5.Sum([]byte(key))
+	hashVal := binary.BigEndian.Uint64(h[:8])
+	
+	// 防止 mod 0 panic (防御性编程)
+	if totalWeight == 0 {
+		targetVal := int(hashVal % uint64(len(backends)))
+		return backends[targetVal]
+	}
+	
+	targetVal := int(hashVal % uint64(totalWeight))
+
+	// 3. 权重区间查找
+	currentWeight := 0
+	for _, b := range backends {
+		currentWeight += b.Weight
+		if targetVal < currentWeight {
+			return b
+		}
+	}
+	return backends[0] // Fallback
+}
+
+// [v14.1 核心修复] 端口解耦拨号器
+func dialZeusWebSocket(sni string, backend Backend, token string) (*websocket.Conn, error) {
+	// 1. 解析 SNI 域名中的端口 (用于伪装和 WS 握手)
+	sniHost, sniPort, err := net.SplitHostPort(sni)
+	if err != nil {
+		sniHost = sni
+		sniPort = "443"
+	}
+
+	// 2. 确定真实的 TCP 连接端口
+	dialPort := sniPort // 默认与 SNI 端口一致
+	if backend.Port != "" {
+		dialPort = backend.Port // 如果后端指定了端口，强制使用后端端口
+	}
+
+	// 3. 构造 WebSocket URL (始终使用 SNI 信息，保证 Host 头正确)
+	wsURL := fmt.Sprintf("wss://%s:%s/?token=%s", sniHost, sniPort, url.QueryEscape(token))
 	
 	requestHeader := http.Header{}
-	requestHeader.Add("Host", host)
+	requestHeader.Add("Host", sniHost)
 	requestHeader.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 	
 	dialer := websocket.Dialer{ 
-		TLSClientConfig: &tls.Config{ InsecureSkipVerify: true, ServerName: host }, 
+		TLSClientConfig: &tls.Config{ InsecureSkipVerify: true, ServerName: sniHost }, 
 		HandshakeTimeout: 5 * time.Second,
 	}
 	
-	targetIP := node.IP
-	if targetIP == "" {
-		targetIP = globalIP 
-	}
-	
-	if targetIP != "" {
+	// 4. 强制 TCP 连接到真实后端 IP 和 端口
+	if backend.IP != "" {
 		dialer.NetDial = func(network, addr string) (net.Conn, error) { 
-			return net.DialTimeout(network, net.JoinHostPort(targetIP, port), 5*time.Second) 
+			// 忽略 addr 中的域名解析，直接连 IP:DialPort
+			return net.DialTimeout(network, net.JoinHostPort(backend.IP, dialPort), 5*time.Second) 
 		}
 	}
 
-	conn, resp, err := dialer.Dial(wsURL, requestHeader)
-	if err != nil { 
-		if resp != nil { return nil, fmt.Errorf("HTTP %d", resp.StatusCode) }
-		return nil, err 
-	}
-	return conn, nil
+	return dialer.Dial(wsURL, requestHeader)
 }
 
 func GenerateConfigJSON(serverAddr, serverIP, secretKey, socks5Addr, fallbackAddr, listenAddr, strategy, rules string) string {
 	token := secretKey
 	if fallbackAddr != "" { token += "|" + fallbackAddr }
-	
 	serverJSON, _ := json.Marshal(serverAddr)
 	rulesJSON, _ := json.Marshal(rules)
-
 	config := fmt.Sprintf(`{
 		"inbounds": [{"tag": "socks-in", "listen": "%s", "protocol": "socks"}],
 		"outbounds": [{
@@ -326,10 +403,7 @@ func GenerateConfigJSON(serverAddr, serverIP, secretKey, socks5Addr, fallbackAdd
 				"token": "%s",
 				"strategy": "%s",
 				"rules": %s`, listenAddr, string(serverJSON), serverIP, token, strategy, string(rulesJSON))
-
-	if socks5Addr != "" {
-		config += fmt.Sprintf(`, "proxy_settings": {"socks5_address": "%s"}`, socks5Addr)
-	}
+	if socks5Addr != "" { config += fmt.Sprintf(`, "proxy_settings": {"socks5_address": "%s"}`, socks5Addr) }
 	config += `}}], "routing": {}}` 
 	return config
 }
