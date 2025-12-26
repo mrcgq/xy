@@ -1,6 +1,6 @@
-// core/core-binary.go (v13.1 - Odyssey Fix Edition)
-// [修复] 规则解析器：兼容 '|' (C客户端传参符)、';' (分号)、换行符
-// [修复] 域名清洗：自动去除规则末尾多余的标点符号
+// core/core-binary.go (v13.6 - Ares Final Edition)
+// [最终修复] 规则引擎现在可以识别并复用节点池中的别名及其优选IP/端口
+// [状态] 逻辑闭环，功能完整，是为最终形态
 
 //go:build binary
 // +build binary
@@ -27,42 +27,126 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.comcom/gorilla/websocket"
 )
 
 var globalRRIndex uint64
 
-// --- 结构定义 ---
+type Node struct {
+	Domain string 
+	IP     string 
+	Port   string 
+}
+
 type ProxySettings struct { 
-	Server     string   `json:"server"`
-	ServerPool []string `json:"server_pool"`
-	Strategy   string   `json:"strategy"`
-	Rules      string   `json:"rules"` 
-	ServerIP   string   `json:"server_ip"` 
-	Token      string   `json:"token"` 
-	ForwarderSettings *ProxyForwarderSettings `json:"proxy_settings,omitempty"` 
+	Server     string `json:"server"`      
+	ServerIP   string `json:"server_ip"`   
+	Token      string `json:"token"`
+	Strategy   string `json:"strategy"`
+	Rules      string `json:"rules"`
+	ForwarderSettings *ProxyForwarderSettings `json:"proxy_settings,omitempty"`
+	NodePool   []Node `json:"-"` 
 }
 
-type Rule struct {
-	Keyword string 
-	Node    string 
-}
-
-type Config struct { Inbounds []Inbound `json:"inbounds"`; Outbounds []Outbound `json:"outbounds"`; Routing Routing `json:"routing"` }
+type Rule struct { Keyword string; Node Node }
+type Config struct { Inbounds []Inbound `json:"inbounds"`; Outbounds []Outbound `json:"outbounds"` }
 type Inbound struct { Tag string `json:"tag"`; Listen string `json:"listen"`; Protocol string `json:"protocol"` }
 type Outbound struct { Tag string `json:"tag"`; Protocol string `json:"protocol"`; Settings json.RawMessage `json:"settings,omitempty"` }
 type ProxyForwarderSettings struct { Socks5Address string `json:"socks5_address"` }
-type Routing struct { Rules []Rule `json:"rules"`; DefaultOutbound string `json:"defaultOutbound,omitempty"` }
 
 var ( 
 	globalConfig Config
 	proxySettingsMap = make(map[string]ProxySettings)
-	routingMap       []Rule 
+	routingMap       []Rule
 )
 
 var bufPool = sync.Pool{ New: func() interface{} { return make([]byte, 32*1024) } }
 
-// ======================== 核心入口 ========================
+func parseNode(nodeStr string) Node {
+	var n Node
+	parts := strings.SplitN(nodeStr, "#", 2)
+	n.Domain = strings.TrimSpace(parts[0])
+	
+	if len(parts) == 2 {
+		addrPart := strings.TrimSpace(parts[1])
+		host, port, err := net.SplitHostPort(addrPart)
+		if err == nil {
+			n.IP = host
+			n.Port = port
+		} else {
+			n.IP = addrPart
+		}
+	}
+	return n
+}
+
+// [v13.6 核心修复] 规则解析器现在会优先匹配节点池别名
+func parseRules(pool []Node) {
+	if len(globalConfig.Outbounds) == 0 { return }
+	var s ProxySettings
+	if err := json.Unmarshal(globalConfig.Outbounds[0].Settings, &s); err != nil { return }
+	if s.Rules == "" { return }
+
+	rawRules := strings.ReplaceAll(s.Rules, "|", "\n")
+	lines := strings.Split(rawRules, "\n")
+	
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") { continue }
+		
+		line = strings.ReplaceAll(line, "，", ",")
+		parts := strings.SplitN(line, ",", 2)
+		if len(parts) == 2 {
+			keyword := strings.TrimSpace(parts[0])
+			nodeStr := strings.TrimSpace(parts[1])
+			
+			var foundNode Node
+			aliasFound := false
+
+			// 1. 优先在节点池中查找别名
+			for _, pNode := range pool {
+				if pNode.Domain == nodeStr {
+					foundNode = pNode
+					aliasFound = true
+					break
+				}
+			}
+
+			// 2. 如果不是别名，则按 Ares 格式解析
+			if !aliasFound {
+				foundNode = parseNode(nodeStr)
+			}
+			
+			if keyword != "" && foundNode.Domain != "" {
+				routingMap = append(routingMap, Rule{Keyword: keyword, Node: foundNode})
+			}
+		}
+	}
+}
+
+func parseOutbounds() {
+	for i, outbound := range globalConfig.Outbounds {
+		if outbound.Protocol == "ech-proxy" {
+			var settings ProxySettings
+			if err := json.Unmarshal(outbound.Settings, &settings); err == nil {
+				rawPool := strings.ReplaceAll(settings.Server, "\r\n", ";")
+				rawPool = strings.ReplaceAll(rawPool, "\n", ";")
+				nodeStrs := strings.Split(rawPool, ";")
+				
+				for _, nodeStr := range nodeStrs {
+					trimmed := strings.TrimSpace(nodeStr)
+					if trimmed != "" {
+						settings.NodePool = append(settings.NodePool, parseNode(trimmed))
+					}
+				}
+				proxySettingsMap[outbound.Tag] = settings
+				
+				b, _ := json.Marshal(settings)
+				globalConfig.Outbounds[i].Settings = b
+			}
+		}
+	}
+}
 
 func StartInstance(configContent []byte) (net.Listener, error) {
 	rand.Seed(time.Now().UnixNano())
@@ -71,26 +155,28 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 	
 	if err := json.Unmarshal(configContent, &globalConfig); err != nil { return nil, err }
 	
-	parseRules() // [修复] 调用增强版解析器
 	parseOutbounds()
-
+	if s, ok := proxySettingsMap["proxy"]; ok {
+		parseRules(s.NodePool) 
+	}
+	
 	if len(globalConfig.Inbounds) == 0 { return nil, errors.New("no inbounds") }
 	inbound := globalConfig.Inbounds[0]
 	listener, err := net.Listen("tcp", inbound.Listen)
 	if err != nil { return nil, err }
 	
 	mode := "Single Node"
-	if len(globalConfig.Outbounds) > 0 {
-		var s ProxySettings
-		json.Unmarshal(globalConfig.Outbounds[0].Settings, &s)
-		if len(s.ServerPool) > 1 {
-			mode = fmt.Sprintf("Hydra Pool (%d nodes, Strategy: %s)", len(s.ServerPool), s.Strategy)
+	if s, ok := proxySettingsMap["proxy"]; ok {
+		if len(s.NodePool) > 1 {
+			mode = fmt.Sprintf("Ares Pool (%d nodes, Strategy: %s)", len(s.NodePool), s.Strategy)
+		} else if len(s.NodePool) == 1 {
+			mode = fmt.Sprintf("Ares Single (%s)", s.NodePool[0].Domain)
 		}
 		if len(routingMap) > 0 {
 			mode += fmt.Sprintf(" + %d Rules", len(routingMap))
 		}
 	}
-	log.Printf("[Core] Xlink Odyssey Engine (v13.1 Fix) Listening on %s [%s]", inbound.Listen, mode)
+	log.Printf("[Core] Xlink Ares Engine (v13.6 Final) Listening on %s [%s]", inbound.Listen, mode)
 	
 	go func() {
 		for {
@@ -102,54 +188,6 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 	return listener, nil
 }
 
-// [核心修复] 增强版规则解析器
-func parseRules() {
-	if len(globalConfig.Outbounds) == 0 { return }
-	var s ProxySettings
-	if err := json.Unmarshal(globalConfig.Outbounds[0].Settings, &s); err != nil { return }
-	if s.Rules == "" { return }
-
-	// 1. 统一分隔符：将 C 客户端传来的管道符 '|' 和各种分号都转为换行符
-	rawRules := strings.ReplaceAll(s.Rules, "|", "\n")
-	rawRules = strings.ReplaceAll(rawRules, ";", "\n")
-	rawRules = strings.ReplaceAll(rawRules, "；", "\n")
-	rawRules = strings.ReplaceAll(rawRules, "\r", "") 
-
-	lines := strings.Split(rawRules, "\n")
-	
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") { continue }
-		
-		// 2. 兼容各种逗号分割
-		line = strings.ReplaceAll(line, "，", ",")
-		parts := strings.SplitN(line, ",", 2)
-		if len(parts) == 2 {
-			keyword := strings.TrimSpace(parts[0])
-			node := strings.TrimSpace(parts[1])
-			
-			// 3. [关键] 清洗节点地址，去除末尾可能残留的标点符号
-			node = strings.TrimRight(node, ";,.")
-			
-			if keyword != "" && node != "" {
-				routingMap = append(routingMap, Rule{Keyword: keyword, Node: node})
-				// 调试日志：确认规则已加载
-				// log.Printf("[Debug] Loaded Rule: %s -> %s", keyword, node)
-			}
-		}
-	}
-}
-
-func parseOutbounds() {
-	for _, outbound := range globalConfig.Outbounds {
-		if outbound.Protocol == "ech-proxy" {
-			var settings ProxySettings
-			if err := json.Unmarshal(outbound.Settings, &settings); err == nil {
-				proxySettingsMap[outbound.Tag] = settings
-			}
-		}
-	}
-}
 
 func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	defer conn.Close()
@@ -170,7 +208,6 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 		log.Printf("[Core] Error connecting to %s: %v", target, err)
 		return 
 	}
-
 	if mode == 1 { conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) }
 	if mode == 2 { conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
 	pipeDirect(conn, wsConn)
@@ -187,44 +224,43 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 	socks5 := ""
 	if settings.ForwarderSettings != nil { socks5 = settings.ForwarderSettings.Socks5Address }
 
-	targetServer := ""
+	var targetNode Node
 	logMsg := ""
 
 	// 1. 规则匹配
 	for _, rule := range routingMap {
 		if strings.Contains(target, rule.Keyword) {
-			targetServer = rule.Node
-			logMsg = fmt.Sprintf("[Core] Rule Hit -> %s | Node: %s (Rule: %s)", target, targetServer, rule.Keyword)
+			targetNode = rule.Node
+			logMsg = fmt.Sprintf("[Core] Rule Hit -> %s | Node: %s (Rule: %s)", target, targetNode.Domain, rule.Keyword)
 			break
 		}
 	}
 
-	// 2. 负载均衡兜底
-	if targetServer == "" {
-		if len(settings.ServerPool) > 0 {
-			poolLen := uint64(len(settings.ServerPool))
+	// 2. 负载均衡
+	if targetNode.Domain == "" {
+		if len(settings.NodePool) > 0 {
+			poolLen := uint64(len(settings.NodePool))
 			strategy := settings.Strategy
 			switch strategy {
 			case "rr":
 				idx := atomic.AddUint64(&globalRRIndex, 1)
-				targetServer = settings.ServerPool[idx%poolLen]
+				targetNode = settings.NodePool[idx%poolLen]
 			case "hash":
 				h := md5.Sum([]byte(target))
 				hashVal := binary.BigEndian.Uint64(h[:8])
-				targetServer = settings.ServerPool[hashVal%poolLen]
+				targetNode = settings.NodePool[hashVal%poolLen]
 			default:
-				targetServer = settings.ServerPool[rand.Intn(int(poolLen))]
+				targetNode = settings.NodePool[rand.Intn(int(poolLen))]
 			}
-			logMsg = fmt.Sprintf("[Core] LB -> %s | Node: %s | Algo: %s", target, targetServer, strategy)
+			logMsg = fmt.Sprintf("[Core] LB -> %s | Node: %s | Algo: %s", target, targetNode.Domain, strategy)
 		} else {
-			targetServer = settings.Server
-			logMsg = fmt.Sprintf("[Core] Direct -> %s | Node: %s", target, targetServer)
+			return nil, errors.New("no nodes configured in pool")
 		}
 	}
 	
 	log.Print(logMsg)
 
-	wsConn, err := dialCleanWebSocket(targetServer, settings.ServerIP, secretKey)
+	wsConn, err := dialAresWebSocket(targetNode, secretKey, settings.ServerIP)
 	if err != nil { return nil, err }
 
 	err = sendNanoHeaderV2(wsConn, target, payload, socks5, fallback)
@@ -232,9 +268,17 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 	return wsConn, nil
 }
 
-func dialCleanWebSocket(serverAddr, serverIP, token string) (*websocket.Conn, error) {
-	host, port, path, _ := parseServerAddr(serverAddr)
-	wsURL := fmt.Sprintf("wss://%s:%s%s?token=%s", host, port, path, url.QueryEscape(token))
+func dialAresWebSocket(node Node, token string, globalIP string) (*websocket.Conn, error) {
+	host, port, err := net.SplitHostPort(node.Domain)
+	if err != nil {
+		host = node.Domain
+		port = "443" 
+	}
+	if node.Port != "" {
+		port = node.Port 
+	}
+
+	wsURL := fmt.Sprintf("wss://%s:%s/?token=%s", host, port, url.QueryEscape(token))
 	
 	requestHeader := http.Header{}
 	requestHeader.Add("Host", host)
@@ -245,10 +289,14 @@ func dialCleanWebSocket(serverAddr, serverIP, token string) (*websocket.Conn, er
 		HandshakeTimeout: 5 * time.Second,
 	}
 	
-	if serverIP != "" {
+	targetIP := node.IP
+	if targetIP == "" {
+		targetIP = globalIP 
+	}
+	
+	if targetIP != "" {
 		dialer.NetDial = func(network, addr string) (net.Conn, error) { 
-			_, p, _ := net.SplitHostPort(addr)
-			return net.DialTimeout(network, net.JoinHostPort(serverIP, p), 5*time.Second) 
+			return net.DialTimeout(network, net.JoinHostPort(targetIP, port), 5*time.Second) 
 		}
 	}
 
@@ -263,32 +311,8 @@ func dialCleanWebSocket(serverAddr, serverIP, token string) (*websocket.Conn, er
 func GenerateConfigJSON(serverAddr, serverIP, secretKey, socks5Addr, fallbackAddr, listenAddr, strategy, rules string) string {
 	token := secretKey
 	if fallbackAddr != "" { token += "|" + fallbackAddr }
-
-	normalizedAddr := serverAddr
-	replacements := []string{"\r\n", "\n", "，", ",", "；"}
-	for _, r := range replacements { normalizedAddr = strings.ReplaceAll(normalizedAddr, r, ";") }
-
-	var serverJSON string
-	if strings.Contains(normalizedAddr, ";") {
-		rawPool := strings.Split(normalizedAddr, ";")
-		var validPool []string
-		for _, node := range rawPool {
-			trimmed := strings.TrimSpace(node)
-			if trimmed != "" { validPool = append(validPool, trimmed) }
-		}
-		if len(validPool) == 0 {
-			serverJSON = fmt.Sprintf(`"server": ""`)
-		} else if len(validPool) == 1 {
-			serverJSON = fmt.Sprintf(`"server": "%s"`, validPool[0])
-		} else {
-			poolJSON, _ := json.Marshal(validPool)
-			serverJSON = fmt.Sprintf(`"server": "%s", "server_pool": %s, "strategy": "%s"`, validPool[0], string(poolJSON), strategy)
-		}
-	} else {
-		serverJSON = fmt.Sprintf(`"server": "%s"`, strings.TrimSpace(serverAddr))
-	}
-
-	// 规则字符串直接透传，由 StartInstance 里的 parseRules 进行清洗
+	
+	serverJSON, _ := json.Marshal(serverAddr)
 	rulesJSON, _ := json.Marshal(rules)
 
 	config := fmt.Sprintf(`{
@@ -297,19 +321,19 @@ func GenerateConfigJSON(serverAddr, serverIP, secretKey, socks5Addr, fallbackAdd
 			"tag": "proxy",
 			"protocol": "ech-proxy",
 			"settings": {
-				%s,
+				"server": %s,
 				"server_ip": "%s",
 				"token": "%s",
-				"rules": %s`, listenAddr, serverJSON, serverIP, token, string(rulesJSON))
+				"strategy": "%s",
+				"rules": %s`, listenAddr, string(serverJSON), serverIP, token, strategy, string(rulesJSON))
 
 	if socks5Addr != "" {
 		config += fmt.Sprintf(`, "proxy_settings": {"socks5_address": "%s"}`, socks5Addr)
 	}
-	config += `}}], "routing": {"rules": [{"outboundTag": "proxy", "port": [0, 65535]}]}}`
+	config += `}}], "routing": {}}` 
 	return config
 }
 
-// --- 辅助函数 ---
 func pipeDirect(local net.Conn, ws *websocket.Conn) { 
 	defer ws.Close(); defer local.Close()
 	go func() { 
@@ -327,6 +351,7 @@ func pipeDirect(local net.Conn, ws *websocket.Conn) {
 		if err != nil { break }
 	} 
 }
+
 func sendNanoHeaderV2(wsConn *websocket.Conn, target string, payload []byte, s5 string, fb string) error {
 	host, portStr, _ := net.SplitHostPort(target)
 	var port uint16
@@ -341,6 +366,7 @@ func sendNanoHeaderV2(wsConn *websocket.Conn, target string, payload []byte, s5 
 	if len(payload) > 0 { buf.Write(payload) }
 	return wsConn.WriteMessage(websocket.BinaryMessage, buf.Bytes())
 }
+
 func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) { 
 	handshakeBuf := make([]byte, 2); io.ReadFull(conn, handshakeBuf)
 	conn.Write([]byte{0x05, 0x00})
@@ -355,6 +381,7 @@ func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) {
 	port := binary.BigEndian.Uint16(portBytes)
 	return net.JoinHostPort(host, fmt.Sprintf("%d", port)), nil 
 }
+
 func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) (string, []byte, int, error) { 
 	reader := bufio.NewReader(io.MultiReader(bytes.NewReader(initialData), conn))
 	req, err := http.ReadRequest(reader)
@@ -366,6 +393,7 @@ func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) (string, [
 	req.WriteProxy(&buf)
 	return target, buf.Bytes(), 3, nil 
 }
+
 func parseServerAddr(addr string) (host, port, path string, err error) { 
 	path = "/"
 	if idx := strings.Index(addr, "/"); idx != -1 { path = addr[idx:]; addr = addr[:idx] }
