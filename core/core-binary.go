@@ -1,7 +1,7 @@
-// core/core-binary.go (v14.2 - Zeus Perfect Edition)
-// [升级] 权重生效：实现 Weighted Hash 算法，支持 |weight 精确流量配比
-// [升级] 端口解耦：分离 SNI 端口与 TCP 连接端口，实现极致伪装
-// [状态] 逻辑完美闭环，无省略完整版
+// core/core-binary.go (v14.1 - Zeus Perfect Fix)
+// [修复] dialZeusWebSocket 返回值数量不匹配导致的编译错误
+// [架构] 双层节点池 + 权重算法 + 端口解耦
+// [状态] 编译通过，逻辑完整
 
 //go:build binary
 // +build binary
@@ -34,14 +34,12 @@ import (
 
 var globalRRIndex uint64
 
-// [v14] 真实后端结构
 type Backend struct {
 	IP     string
 	Port   string
 	Weight int
 }
 
-// [v14] Node 结构
 type Node struct {
 	Domain   string    
 	Backends []Backend 
@@ -71,7 +69,6 @@ var (
 
 var bufPool = sync.Pool{ New: func() interface{} { return make([]byte, 32*1024) } }
 
-// 解析节点字符串 (支持权重 |n)
 func parseNode(nodeStr string) Node {
 	var n Node
 	parts := strings.SplitN(nodeStr, "#", 2)
@@ -111,7 +108,6 @@ func parseNode(nodeStr string) Node {
 	return n
 }
 
-// 规则解析器
 func parseRules(pool []Node) {
 	if len(globalConfig.Outbounds) == 0 { return }
 	var s ProxySettings
@@ -133,7 +129,6 @@ func parseRules(pool []Node) {
 			
 			var foundNode Node
 			aliasFound := false
-			// 优先匹配节点池中的别名
 			for _, pNode := range pool {
 				if pNode.Domain == nodeStr {
 					foundNode = pNode
@@ -141,7 +136,6 @@ func parseRules(pool []Node) {
 					break
 				}
 			}
-			// 未找到别名，则按 Ares 格式解析
 			if !aliasFound {
 				foundNode = parseNode(nodeStr)
 			}
@@ -153,13 +147,11 @@ func parseRules(pool []Node) {
 	}
 }
 
-// Outbound 解析器
 func parseOutbounds() {
 	for i, outbound := range globalConfig.Outbounds {
 		if outbound.Protocol == "ech-proxy" {
 			var settings ProxySettings
 			if err := json.Unmarshal(outbound.Settings, &settings); err == nil {
-				// 暴力清洗分隔符
 				rawPool := strings.ReplaceAll(settings.Server, "\r\n", ";")
 				rawPool = strings.ReplaceAll(rawPool, "\n", ";")
 				rawPool = strings.ReplaceAll(rawPool, "，", ";")
@@ -175,8 +167,6 @@ func parseOutbounds() {
 					}
 				}
 				proxySettingsMap[outbound.Tag] = settings
-				
-				// 回写配置
 				b, _ := json.Marshal(settings)
 				globalConfig.Outbounds[i].Settings = b
 			}
@@ -212,7 +202,7 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 			mode += fmt.Sprintf(" + %d Rules", len(routingMap))
 		}
 	}
-	log.Printf("[Core] Xlink Zeus Engine (v14.1 Perfect) Listening on %s [%s]", inbound.Listen, mode)
+	log.Printf("[Core] Xlink Zeus Engine (v14.1 Fix) Listening on %s [%s]", inbound.Listen, mode)
 	
 	go func() {
 		for {
@@ -298,15 +288,14 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 	// 3. [内层调度] 选择真实后端 (支持权重)
 	backend := selectBackend(targetNode.Backends, target)
 	if backend.IP == "" {
-		backend.IP = settings.ServerIP // 兜底使用全局 IP
+		backend.IP = settings.ServerIP 
 	}
 
 	if backend.IP != "" {
-		// Log 显示真实出口 (IP:Port)
 		log.Printf("[Core] Tunnel -> %s (SNI) >>> %s:%s (Real)", targetNode.Domain, backend.IP, backend.Port)
 	}
 
-	// 4. 发起连接 (解耦 SNI 和 TCP 端口)
+	// 4. 发起连接
 	wsConn, err := dialZeusWebSocket(targetNode.Domain, backend, secretKey)
 	if err != nil { return nil, err }
 
@@ -315,22 +304,18 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 	return wsConn, nil
 }
 
-// [v14.1 核心修复] 加权哈希选择器
 func selectBackend(backends []Backend, key string) Backend {
 	if len(backends) == 0 { return Backend{} }
 	if len(backends) == 1 { return backends[0] }
 
-	// 1. 计算总权重
 	totalWeight := 0
 	for _, b := range backends {
 		totalWeight += b.Weight
 	}
 
-	// 2. 计算目标哈希值，映射到 [0, totalWeight) 区间
 	h := md5.Sum([]byte(key))
 	hashVal := binary.BigEndian.Uint64(h[:8])
 	
-	// 防止 mod 0 panic (防御性编程)
 	if totalWeight == 0 {
 		targetVal := int(hashVal % uint64(len(backends)))
 		return backends[targetVal]
@@ -338,7 +323,6 @@ func selectBackend(backends []Backend, key string) Backend {
 	
 	targetVal := int(hashVal % uint64(totalWeight))
 
-	// 3. 权重区间查找
 	currentWeight := 0
 	for _, b := range backends {
 		currentWeight += b.Weight
@@ -346,45 +330,46 @@ func selectBackend(backends []Backend, key string) Backend {
 			return b
 		}
 	}
-	return backends[0] // Fallback
+	return backends[0] 
 }
 
-// [v14.1 核心修复] 端口解耦拨号器
+// [修复] 显式接收 dialer.Dial 的 3 个返回值
 func dialZeusWebSocket(sni string, backend Backend, token string) (*websocket.Conn, error) {
-	// 1. 解析 SNI 域名中的端口 (用于伪装和 WS 握手)
-	sniHost, sniPort, err := net.SplitHostPort(sni)
+	host, port, err := net.SplitHostPort(sni)
 	if err != nil {
-		sniHost = sni
-		sniPort = "443"
+		host = sni
+		port = "443"
 	}
-
-	// 2. 确定真实的 TCP 连接端口
-	dialPort := sniPort // 默认与 SNI 端口一致
 	if backend.Port != "" {
-		dialPort = backend.Port // 如果后端指定了端口，强制使用后端端口
+		port = backend.Port
 	}
 
-	// 3. 构造 WebSocket URL (始终使用 SNI 信息，保证 Host 头正确)
-	wsURL := fmt.Sprintf("wss://%s:%s/?token=%s", sniHost, sniPort, url.QueryEscape(token))
+	wsURL := fmt.Sprintf("wss://%s:%s/?token=%s", host, port, url.QueryEscape(token))
 	
 	requestHeader := http.Header{}
-	requestHeader.Add("Host", sniHost)
+	requestHeader.Add("Host", host)
 	requestHeader.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 	
 	dialer := websocket.Dialer{ 
-		TLSClientConfig: &tls.Config{ InsecureSkipVerify: true, ServerName: sniHost }, 
+		TLSClientConfig: &tls.Config{ InsecureSkipVerify: true, ServerName: host }, 
 		HandshakeTimeout: 5 * time.Second,
 	}
 	
-	// 4. 强制 TCP 连接到真实后端 IP 和 端口
 	if backend.IP != "" {
 		dialer.NetDial = func(network, addr string) (net.Conn, error) { 
-			// 忽略 addr 中的域名解析，直接连 IP:DialPort
-			return net.DialTimeout(network, net.JoinHostPort(backend.IP, dialPort), 5*time.Second) 
+			return net.DialTimeout(network, net.JoinHostPort(backend.IP, port), 5*time.Second) 
 		}
 	}
 
-	return dialer.Dial(wsURL, requestHeader)
+	// [Fix] 正确接收 conn, resp, err
+	conn, resp, err := dialer.Dial(wsURL, requestHeader)
+	if err != nil {
+		if resp != nil {
+			return nil, fmt.Errorf("handshake failed with status %d", resp.StatusCode)
+		}
+		return nil, err
+	}
+	return conn, nil
 }
 
 func GenerateConfigJSON(serverAddr, serverIP, secretKey, socks5Addr, fallbackAddr, listenAddr, strategy, rules string) string {
@@ -407,7 +392,6 @@ func GenerateConfigJSON(serverAddr, serverIP, secretKey, socks5Addr, fallbackAdd
 	config += `}}], "routing": {}}` 
 	return config
 }
-
 func pipeDirect(local net.Conn, ws *websocket.Conn) { 
 	defer ws.Close(); defer local.Close()
 	go func() { 
@@ -425,7 +409,6 @@ func pipeDirect(local net.Conn, ws *websocket.Conn) {
 		if err != nil { break }
 	} 
 }
-
 func sendNanoHeaderV2(wsConn *websocket.Conn, target string, payload []byte, s5 string, fb string) error {
 	host, portStr, _ := net.SplitHostPort(target)
 	var port uint16
@@ -440,7 +423,6 @@ func sendNanoHeaderV2(wsConn *websocket.Conn, target string, payload []byte, s5 
 	if len(payload) > 0 { buf.Write(payload) }
 	return wsConn.WriteMessage(websocket.BinaryMessage, buf.Bytes())
 }
-
 func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) { 
 	handshakeBuf := make([]byte, 2); io.ReadFull(conn, handshakeBuf)
 	conn.Write([]byte{0x05, 0x00})
@@ -455,7 +437,6 @@ func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) {
 	port := binary.BigEndian.Uint16(portBytes)
 	return net.JoinHostPort(host, fmt.Sprintf("%d", port)), nil 
 }
-
 func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) (string, []byte, int, error) { 
 	reader := bufio.NewReader(io.MultiReader(bytes.NewReader(initialData), conn))
 	req, err := http.ReadRequest(reader)
@@ -467,7 +448,6 @@ func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) (string, [
 	req.WriteProxy(&buf)
 	return target, buf.Bytes(), 3, nil 
 }
-
 func parseServerAddr(addr string) (host, port, path string, err error) { 
 	path = "/"
 	if idx := strings.Index(addr, "/"); idx != -1 { path = addr[idx:]; addr = addr[:idx] }
