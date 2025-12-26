@@ -27,7 +27,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.comcom/gorilla/websocket"
+	"github.com/gorilla/websocket"
 )
 
 var globalRRIndex uint64
