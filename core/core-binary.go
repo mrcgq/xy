@@ -1,6 +1,7 @@
-// core/core-binary.go (v18.0 - Genesis Edition)
-// [v18] 新增 RunSpeedTest, pingNode 函数，实现内置并发测速
-// [架构] 代理模式与测速模式共享底层拨号逻辑，保证结果一致性
+// core/core-binary.go (v18.1 - Genesis Stable)
+// [修复] 修复 pingNode 调用参数过多的错误
+// [修复] 修复 connectNanoTunnel 未使用 secretKey 的错误
+// [架构] 完美集成 v18 测速 + v14.1 核心
 
 //go:build binary
 // +build binary
@@ -64,33 +65,39 @@ var bufPool = sync.Pool{ New: func() interface{} { return make([]byte, 32*1024) 
 
 // ======================== [v18] 测速模式核心 ========================
 
-// TestResult 用于保存单个节点的测速结果
 type TestResult struct {
 	Node   Node
 	Delay  time.Duration
 	Error  error
 }
 
-// pingNode 对单个节点进行 TCP+TLS 握手测速
+// pingNode [修复版]
 func pingNode(node Node, token string, globalIP string, results chan<- TestResult) {
 	startTime := time.Now()
 	
-	// 使用核心拨号逻辑，但不发送任何数据
-	conn, err := dialZeusWebSocket(node.Domain, selectBackend(node.Backends, ""), token, globalIP)
+	// 1. 预处理后端：从池中选一个，并应用全局 IP 兜底
+	backend := selectBackend(node.Backends, "")
+	if backend.IP == "" {
+		backend.IP = globalIP
+	}
+
+	// 2. 发起连接 (修复：只传 3 个参数)
+	conn, err := dialZeusWebSocket(node.Domain, backend, token)
 	
 	if err != nil {
 		results <- TestResult{Node: node, Error: err}
 		return
 	}
-	conn.Close() // 测速成功后立即关闭连接
+	conn.Close() 
 	
 	delay := time.Since(startTime)
 	results <- TestResult{Node: node, Delay: delay}
 }
 
-// RunSpeedTest 是测速模式的入口
+// RunSpeedTest
 func RunSpeedTest(serverAddr, token, globalIP string) {
 	// 1. 解析节点池
+	// 清洗换行符，兼容 C 客户端传来的格式
 	rawPool := strings.ReplaceAll(serverAddr, "\r\n", ";")
 	rawPool = strings.ReplaceAll(rawPool, "\n", ";")
 	nodeStrs := strings.Split(rawPool, ";")
@@ -116,7 +123,11 @@ func RunSpeedTest(serverAddr, token, globalIP string) {
 		wg.Add(1)
 		go func(n Node) {
 			defer wg.Done()
-			pingNode(n, token, globalIP, results)
+			// 注意：Token 需要处理，如果在测速模式下 token 包含 |fallback，需要切割
+			// 但通常测速只测连通性，用原始 token 握手即可
+			parts := strings.SplitN(token, "|", 2)
+			realKey := parts[0]
+			pingNode(n, realKey, globalIP, results)
 		}(node)
 	}
 
@@ -140,14 +151,14 @@ func RunSpeedTest(serverAddr, token, globalIP string) {
 	})
 	
 	// 4. 打印报告
-	fmt.Println("\n--- Xlink Genesis Ping Test Report ---")
-	fmt.Println("\n✅ Successful Nodes (sorted by delay):")
+	fmt.Println("\nPing Test Report") // 这里的关键词会被 C 客户端捕获翻译
+	fmt.Println("\nSuccessful Nodes")
 	for i, res := range successful {
 		fmt.Printf("%d. %-40s | Delay: %v\n", i+1, formatNode(res.Node), res.Delay.Round(time.Millisecond))
 	}
 
 	if len(failed) > 0 {
-		fmt.Println("\n❌ Failed Nodes:")
+		fmt.Println("\nFailed Nodes")
 		for _, res := range failed {
 			fmt.Printf("- %-40s | Error: %v\n", formatNode(res.Node), res.Error)
 		}
@@ -155,7 +166,6 @@ func RunSpeedTest(serverAddr, token, globalIP string) {
 	fmt.Println("\n------------------------------------")
 }
 
-// formatNode 将 Node 结构格式化为字符串
 func formatNode(n Node) string {
     res := n.Domain
     if len(n.Backends) > 0 {
@@ -173,7 +183,7 @@ func formatNode(n Node) string {
 }
 
 
-// ======================== 代理模式核心 (v16 逻辑) ========================
+// ======================== 代理模式核心 (v16/v14 逻辑) ========================
 
 func parseNode(nodeStr string) Node {
 	var n Node
@@ -275,7 +285,7 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 		}
 		if len(routingMap) > 0 { mode += fmt.Sprintf(" + %d Rules", len(routingMap)) }
 	}
-	log.Printf("[Core] Xlink Zeus Engine (v14.1+) Listening on %s [%s]", inbound.Listen, mode)
+	log.Printf("[Core] Xlink Zeus Engine (v18.1 Final) Listening on %s [%s]", inbound.Listen, mode)
 	go func() {
 		for {
 			conn, err := listener.Accept()
@@ -301,7 +311,7 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	if err != nil { return }
 	wsConn, err := connectNanoTunnel(target, "proxy", firstFrame)
 	if err != nil { 
-		// log.Printf("[Core] Error connecting to %s: %v", target, err) // connectNanoTunnel has its own log
+		// log.Printf("[Core] Error connecting to %s: %v", target, err)
 		return 
 	}
 	if mode == 1 { conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) }
@@ -309,9 +319,17 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	pipeDirect(conn, wsConn)
 }
 
+// [核心] 调度与连接 (修复了 secretKey 未使用的问题)
 func connectNanoTunnel(target string, outboundTag string, payload []byte) (*websocket.Conn, error) {
 	settings, ok := proxySettingsMap[outboundTag]
 	if !ok { return nil, errors.New("settings not found") }
+
+	// [Fix] 解析 Token，提取纯密钥
+	parts := strings.SplitN(settings.Token, "|", 2)
+	secretKey := parts[0]
+	
+	fallback := ""; if len(parts) > 1 { fallback = parts[1] }
+	socks5 := ""; if settings.ForwarderSettings != nil { socks5 = settings.ForwarderSettings.Socks5Address }
 
 	// --- 内部重试函数 ---
 	tryConnectOnce := func() (*websocket.Conn, error) {
@@ -360,15 +378,11 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 		if backend.IP == "" { backend.IP = settings.ServerIP }
 		if backend.IP != "" { log.Printf("[Core] Tunnel -> %s (SNI) >>> %s:%s (Real)", targetNode.Domain, backend.IP, backend.Port) }
 		
-		// 4. 拨号
-		wsConn, err := dialZeusWebSocket(targetNode.Domain, backend, settings.Token)
+		// 4. 拨号 [Fix: 使用 secretKey]
+		wsConn, err := dialZeusWebSocket(targetNode.Domain, backend, secretKey)
 		if err != nil { return nil, err }
 		
 		// 5. 发送协议头
-		parts := strings.SplitN(settings.Token, "|", 2)
-		secretKey := parts[0]
-		fallback := ""; if len(parts) > 1 { fallback = parts[1] }
-		socks5 := ""; if settings.ForwarderSettings != nil { socks5 = settings.ForwarderSettings.Socks5Address }
 		err = sendNanoHeaderV2(wsConn, target, payload, socks5, fallback)
 		if err != nil { wsConn.Close(); return nil, err }
 		return wsConn, nil
@@ -377,10 +391,9 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 	// --- 执行连接与故障转移 ---
 	conn, err := tryConnectOnce()
 	
-	// [v15] 被动故障转移
 	if err != nil && len(settings.NodePool) > 1 {
 		log.Printf("[Core] Connect failed: %v. Activating Passive Failover...", err)
-		return tryConnectOnce() // 简单重试一次
+		return tryConnectOnce() 
 	}
 
 	return conn, err
@@ -418,9 +431,13 @@ func dialZeusWebSocket(sni string, backend Backend, token string) (*websocket.Co
 			return net.DialTimeout(network, net.JoinHostPort(backend.IP, dialPort), 5*time.Second) 
 		}
 	}
+	
+	// [Fix] 显式接收 3 个返回值
 	conn, resp, err := dialer.Dial(wsURL, requestHeader)
 	if err != nil {
-		if resp != nil { return nil, fmt.Errorf("handshake failed with status %d", resp.StatusCode) }
+		if resp != nil {
+			return nil, fmt.Errorf("handshake failed with status %d", resp.StatusCode)
+		}
 		return nil, err
 	}
 	return conn, nil
