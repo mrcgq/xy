@@ -1,7 +1,8 @@
-// core/core-binary.go (v18.1 - Genesis Stable)
-// [修复] 修复 pingNode 调用参数过多的错误
-// [修复] 修复 connectNanoTunnel 未使用 secretKey 的错误
-// [架构] 完美集成 v18 测速 + v14.1 核心
+// core/core-binary.go (v19.0 - Observer Edition)
+// [新增] 握手延迟记录 (Latency Tracking)
+// [新增] 流量统计与连接时长记录 (Traffic Auditing)
+// [架构] 集成 v18 测速 + v16 策略 + v15 容灾 + v14 双层池
+// [状态] 完整无省略版
 
 //go:build binary
 // +build binary
@@ -36,16 +37,29 @@ import (
 var globalRRIndex uint64
 
 // --- 结构定义 ---
-type Backend struct { IP string; Port string; Weight int }
-type Node struct { Domain string; Backends []Backend }
-type Rule struct { Keyword string; Node Node; Strategy string } 
+type Backend struct {
+	IP     string
+	Port   string
+	Weight int
+}
+
+type Node struct {
+	Domain   string    
+	Backends []Backend 
+}
+
+type Rule struct { 
+	Keyword  string
+	Node     Node
+	Strategy string 
+}
 
 type ProxySettings struct { 
-	Server     string `json:"server"`      
-	ServerIP   string `json:"server_ip"`   
-	Token      string `json:"token"`
-	Strategy   string `json:"strategy"`
-	Rules      string `json:"rules"`
+	Server     string   `json:"server"`      
+	ServerIP   string   `json:"server_ip"`   
+	Token      string   `json:"token"`
+	Strategy   string   `json:"strategy"`
+	Rules      string   `json:"rules"`
 	ForwarderSettings *ProxyForwarderSettings `json:"proxy_settings,omitempty"`
 	NodePool   []Node `json:"-"` 
 }
@@ -63,7 +77,118 @@ var (
 
 var bufPool = sync.Pool{ New: func() interface{} { return make([]byte, 32*1024) } }
 
-// ======================== [v18] 测速模式核心 ========================
+// ======================== 节点与规则解析 ========================
+
+func parseNode(nodeStr string) Node {
+	var n Node
+	parts := strings.SplitN(nodeStr, "#", 2)
+	n.Domain = strings.TrimSpace(parts[0])
+
+	if len(parts) != 2 || parts[1] == "" {
+		return n 
+	}
+
+	backendPart := strings.TrimSpace(parts[1])
+	entries := strings.Split(backendPart, ",") 
+
+	for _, e := range entries {
+		e = strings.TrimSpace(e)
+		if e == "" { continue }
+
+		weight := 1 
+		addr := e
+		
+		if strings.Contains(e, "|") {
+			p := strings.SplitN(e, "|", 2)
+			addr = p[0]
+			if w, err := strconv.Atoi(p[1]); err == nil && w > 0 {
+				weight = w
+			}
+		}
+
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			host = addr
+			port = "" 
+		}
+
+		n.Backends = append(n.Backends, Backend{IP: host, Port: port, Weight: weight})
+	}
+	return n
+}
+
+func parseRules(pool []Node) {
+	if len(globalConfig.Outbounds) == 0 { return }
+	var s ProxySettings
+	if err := json.Unmarshal(globalConfig.Outbounds[0].Settings, &s); err != nil { return }
+	if s.Rules == "" { return }
+
+	rawRules := strings.ReplaceAll(s.Rules, "|", "\n")
+	lines := strings.Split(rawRules, "\n")
+	
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") { continue }
+		
+		line = strings.ReplaceAll(line, "，", ",")
+		parts := strings.Split(line, ",")
+		
+		if len(parts) >= 2 {
+			keyword := strings.TrimSpace(parts[0])
+			nodeStr := strings.TrimSpace(parts[1])
+			strategy := ""
+			if len(parts) >= 3 {
+				strategy = strings.TrimSpace(parts[2])
+			}
+			
+			var foundNode Node
+			aliasFound := false
+			for _, pNode := range pool {
+				if pNode.Domain == nodeStr {
+					foundNode = pNode
+					aliasFound = true
+					break
+				}
+			}
+			if !aliasFound {
+				foundNode = parseNode(nodeStr)
+			}
+			
+			if keyword != "" && foundNode.Domain != "" {
+				routingMap = append(routingMap, Rule{Keyword: keyword, Node: foundNode, Strategy: strategy})
+			}
+		}
+	}
+}
+
+func parseOutbounds() {
+	for i, outbound := range globalConfig.Outbounds {
+		if outbound.Protocol == "ech-proxy" {
+			var settings ProxySettings
+			if err := json.Unmarshal(outbound.Settings, &settings); err == nil {
+				rawPool := strings.ReplaceAll(settings.Server, "\r\n", ";")
+				rawPool = strings.ReplaceAll(rawPool, "\n", ";")
+				rawPool = strings.ReplaceAll(rawPool, "，", ";")
+				rawPool = strings.ReplaceAll(rawPool, ",", ";")
+				rawPool = strings.ReplaceAll(rawPool, "；", ";")
+
+				nodeStrs := strings.Split(rawPool, ";")
+				
+				for _, nodeStr := range nodeStrs {
+					trimmed := strings.TrimSpace(nodeStr)
+					if trimmed != "" {
+						settings.NodePool = append(settings.NodePool, parseNode(trimmed))
+					}
+				}
+				proxySettingsMap[outbound.Tag] = settings
+				b, _ := json.Marshal(settings)
+				globalConfig.Outbounds[i].Settings = b
+			}
+		}
+	}
+}
+
+// ======================== 测速模块 (v18 Integrated) ========================
 
 type TestResult struct {
 	Node   Node
@@ -71,19 +196,15 @@ type TestResult struct {
 	Error  error
 }
 
-// pingNode [修复版]
 func pingNode(node Node, token string, globalIP string, results chan<- TestResult) {
 	startTime := time.Now()
 	
-	// 1. 预处理后端：从池中选一个，并应用全局 IP 兜底
 	backend := selectBackend(node.Backends, "")
 	if backend.IP == "" {
 		backend.IP = globalIP
 	}
 
-	// 2. 发起连接 (修复：只传 3 个参数)
 	conn, err := dialZeusWebSocket(node.Domain, backend, token)
-	
 	if err != nil {
 		results <- TestResult{Node: node, Error: err}
 		return
@@ -94,10 +215,7 @@ func pingNode(node Node, token string, globalIP string, results chan<- TestResul
 	results <- TestResult{Node: node, Delay: delay}
 }
 
-// RunSpeedTest
 func RunSpeedTest(serverAddr, token, globalIP string) {
-	// 1. 解析节点池
-	// 清洗换行符，兼容 C 客户端传来的格式
 	rawPool := strings.ReplaceAll(serverAddr, "\r\n", ";")
 	rawPool = strings.ReplaceAll(rawPool, "\n", ";")
 	nodeStrs := strings.Split(rawPool, ";")
@@ -115,7 +233,6 @@ func RunSpeedTest(serverAddr, token, globalIP string) {
 		return
 	}
 
-	// 2. 并发测速
 	var wg sync.WaitGroup
 	results := make(chan TestResult, len(nodes))
 	
@@ -123,18 +240,14 @@ func RunSpeedTest(serverAddr, token, globalIP string) {
 		wg.Add(1)
 		go func(n Node) {
 			defer wg.Done()
-			// 注意：Token 需要处理，如果在测速模式下 token 包含 |fallback，需要切割
-			// 但通常测速只测连通性，用原始 token 握手即可
 			parts := strings.SplitN(token, "|", 2)
-			realKey := parts[0]
-			pingNode(n, realKey, globalIP, results)
+			pingNode(n, parts[0], globalIP, results)
 		}(node)
 	}
 
 	wg.Wait()
 	close(results)
 
-	// 3. 收集并排序结果
 	var successful []TestResult
 	var failed []TestResult
 
@@ -150,8 +263,7 @@ func RunSpeedTest(serverAddr, token, globalIP string) {
 		return successful[i].Delay < successful[j].Delay
 	})
 	
-	// 4. 打印报告
-	fmt.Println("\nPing Test Report") // 这里的关键词会被 C 客户端捕获翻译
+	fmt.Println("\nPing Test Report")
 	fmt.Println("\nSuccessful Nodes")
 	for i, res := range successful {
 		fmt.Printf("%d. %-40s | Delay: %v\n", i+1, formatNode(res.Node), res.Delay.Round(time.Millisecond))
@@ -182,100 +294,25 @@ func formatNode(n Node) string {
     return res
 }
 
-
-// ======================== 代理模式核心 (v16/v14 逻辑) ========================
-
-func parseNode(nodeStr string) Node {
-	var n Node
-	parts := strings.SplitN(nodeStr, "#", 2)
-	n.Domain = strings.TrimSpace(parts[0])
-	if len(parts) != 2 || parts[1] == "" { return n }
-	backendPart := strings.TrimSpace(parts[1])
-	entries := strings.Split(backendPart, ",")
-	for _, e := range entries {
-		e = strings.TrimSpace(e)
-		if e == "" { continue }
-		weight := 1
-		addr := e
-		if strings.Contains(e, "|") {
-			p := strings.SplitN(e, "|", 2)
-			addr = p[0]
-			if w, err := strconv.Atoi(p[1]); err == nil && w > 0 { weight = w }
-		}
-		host, port, err := net.SplitHostPort(addr)
-		if err != nil { host = addr; port = "" }
-		n.Backends = append(n.Backends, Backend{IP: host, Port: port, Weight: weight})
-	}
-	return n
-}
-
-func parseRules(pool []Node) {
-	if len(globalConfig.Outbounds) == 0 { return }
-	var s ProxySettings
-	if err := json.Unmarshal(globalConfig.Outbounds[0].Settings, &s); err != nil { return }
-	if s.Rules == "" { return }
-	rawRules := strings.ReplaceAll(s.Rules, "|", "\n")
-	lines := strings.Split(rawRules, "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") { continue }
-		line = strings.ReplaceAll(line, "，", ",")
-		parts := strings.Split(line, ",")
-		if len(parts) >= 2 {
-			keyword := strings.TrimSpace(parts[0])
-			nodeStr := strings.TrimSpace(parts[1])
-			strategy := ""
-			if len(parts) >= 3 { strategy = strings.TrimSpace(parts[2]) }
-			var foundNode Node
-			aliasFound := false
-			for _, pNode := range pool {
-				if pNode.Domain == nodeStr {
-					foundNode = pNode
-					aliasFound = true
-					break
-				}
-			}
-			if !aliasFound { foundNode = parseNode(nodeStr) }
-			if keyword != "" && foundNode.Domain != "" {
-				routingMap = append(routingMap, Rule{Keyword: keyword, Node: foundNode, Strategy: strategy})
-			}
-		}
-	}
-}
-
-func parseOutbounds() {
-	for i, outbound := range globalConfig.Outbounds {
-		if outbound.Protocol == "ech-proxy" {
-			var settings ProxySettings
-			if err := json.Unmarshal(outbound.Settings, &settings); err == nil {
-				rawPool := strings.ReplaceAll(settings.Server, "\r\n", ";")
-				rawPool = strings.ReplaceAll(rawPool, "\n", ";")
-				nodeStrs := strings.Split(rawPool, ";")
-				for _, nodeStr := range nodeStrs {
-					trimmed := strings.TrimSpace(nodeStr)
-					if trimmed != "" {
-						settings.NodePool = append(settings.NodePool, parseNode(trimmed))
-					}
-				}
-				proxySettingsMap[outbound.Tag] = settings
-				b, _ := json.Marshal(settings)
-				globalConfig.Outbounds[i].Settings = b
-			}
-		}
-	}
-}
+// ======================== 主运行逻辑 ========================
 
 func StartInstance(configContent []byte) (net.Listener, error) {
 	rand.Seed(time.Now().UnixNano())
 	proxySettingsMap = make(map[string]ProxySettings)
 	routingMap = nil 
+	
 	if err := json.Unmarshal(configContent, &globalConfig); err != nil { return nil, err }
+	
 	parseOutbounds()
-	if s, ok := proxySettingsMap["proxy"]; ok { parseRules(s.NodePool) }
+	if s, ok := proxySettingsMap["proxy"]; ok {
+		parseRules(s.NodePool) 
+	}
+	
 	if len(globalConfig.Inbounds) == 0 { return nil, errors.New("no inbounds") }
 	inbound := globalConfig.Inbounds[0]
 	listener, err := net.Listen("tcp", inbound.Listen)
 	if err != nil { return nil, err }
+	
 	mode := "Single Node"
 	if s, ok := proxySettingsMap["proxy"]; ok {
 		if len(s.NodePool) > 1 {
@@ -283,9 +320,12 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 		} else if len(s.NodePool) == 1 {
 			mode = fmt.Sprintf("Zeus Single (%s)", s.NodePool[0].Domain)
 		}
-		if len(routingMap) > 0 { mode += fmt.Sprintf(" + %d Rules", len(routingMap)) }
+		if len(routingMap) > 0 {
+			mode += fmt.Sprintf(" + %d Rules", len(routingMap))
+		}
 	}
-	log.Printf("[Core] Xlink Zeus Engine (v18.1 Final) Listening on %s [%s]", inbound.Listen, mode)
+	log.Printf("[Core] Xlink Observer Engine (v19.0) Listening on %s [%s]", inbound.Listen, mode)
+	
 	go func() {
 		for {
 			conn, err := listener.Accept()
@@ -303,31 +343,34 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	var target string
 	var err error
 	var firstFrame []byte
-	var mode int
+	var mode int 
 	switch buf[0] {
 	case 0x05: target, err = handleSOCKS5(conn, inboundTag); mode = 1
 	default: target, firstFrame, mode, err = handleHTTP(conn, buf, inboundTag)
 	}
 	if err != nil { return }
+
+	// 传入 target 以便 pipeDirect 打印日志
 	wsConn, err := connectNanoTunnel(target, "proxy", firstFrame)
+	
 	if err != nil { 
-		// log.Printf("[Core] Error connecting to %s: %v", target, err)
+		// 连接失败日志已在内部打印，此处略过
 		return 
 	}
+
 	if mode == 1 { conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) }
 	if mode == 2 { conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
-	pipeDirect(conn, wsConn)
+	
+	// [v19] 调用带统计的管道
+	pipeDirect(conn, wsConn, target)
 }
 
-// [核心] 调度与连接 (修复了 secretKey 未使用的问题)
 func connectNanoTunnel(target string, outboundTag string, payload []byte) (*websocket.Conn, error) {
 	settings, ok := proxySettingsMap[outboundTag]
 	if !ok { return nil, errors.New("settings not found") }
 
-	// [Fix] 解析 Token，提取纯密钥
 	parts := strings.SplitN(settings.Token, "|", 2)
 	secretKey := parts[0]
-	
 	fallback := ""; if len(parts) > 1 { fallback = parts[1] }
 	socks5 := ""; if settings.ForwarderSettings != nil { socks5 = settings.ForwarderSettings.Socks5Address }
 
@@ -376,23 +419,32 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 		// 3. 内层调度
 		backend := selectBackend(targetNode.Backends, target)
 		if backend.IP == "" { backend.IP = settings.ServerIP }
-		if backend.IP != "" { log.Printf("[Core] Tunnel -> %s (SNI) >>> %s:%s (Real)", targetNode.Domain, backend.IP, backend.Port) }
-		
-		// 4. 拨号 [Fix: 使用 secretKey]
+
+		// [v19] 计时开始
+		start := time.Now()
+
+		// 4. 拨号
 		wsConn, err := dialZeusWebSocket(targetNode.Domain, backend, secretKey)
-		if err != nil { return nil, err }
 		
-		// 5. 发送协议头
+		// [v19] 计算延迟
+		latency := time.Since(start).Milliseconds()
+
+		if err != nil { return nil, err }
+
+		if backend.IP != "" {
+			// [v19] 日志包含 Latency
+			log.Printf("[Core] Tunnel -> %s (SNI) >>> %s:%s (Real) | Latency: %dms", targetNode.Domain, backend.IP, backend.Port, latency)
+		}
+
 		err = sendNanoHeaderV2(wsConn, target, payload, socks5, fallback)
 		if err != nil { wsConn.Close(); return nil, err }
 		return wsConn, nil
 	}
 	
-	// --- 执行连接与故障转移 ---
+	// [v15] 被动故障转移
 	conn, err := tryConnectOnce()
-	
 	if err != nil && len(settings.NodePool) > 1 {
-		log.Printf("[Core] Connect failed: %v. Activating Passive Failover...", err)
+		log.Printf("[Core] Connect failed: %v. Retry...", err)
 		return tryConnectOnce() 
 	}
 
@@ -402,37 +454,60 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 func selectBackend(backends []Backend, key string) Backend {
 	if len(backends) == 0 { return Backend{} }
 	if len(backends) == 1 { return backends[0] }
+
 	totalWeight := 0
-	for _, b := range backends { totalWeight += b.Weight }
-	if totalWeight == 0 { return backends[rand.Intn(len(backends))] }
+	for _, b := range backends {
+		totalWeight += b.Weight
+	}
+
 	h := md5.Sum([]byte(key))
 	hashVal := binary.BigEndian.Uint64(h[:8])
+	
+	if totalWeight == 0 {
+		targetVal := int(hashVal % uint64(len(backends)))
+		return backends[targetVal]
+	}
+	
 	targetVal := int(hashVal % uint64(totalWeight))
+
 	currentWeight := 0
 	for _, b := range backends {
 		currentWeight += b.Weight
-		if targetVal < currentWeight { return b }
+		if targetVal < currentWeight {
+			return b
+		}
 	}
 	return backends[0] 
 }
 
 func dialZeusWebSocket(sni string, backend Backend, token string) (*websocket.Conn, error) {
 	sniHost, sniPort, err := net.SplitHostPort(sni)
-	if err != nil { sniHost = sni; sniPort = "443" }
+	if err != nil {
+		sniHost = sni
+		sniPort = "443"
+	}
 	dialPort := sniPort
-	if backend.Port != "" { dialPort = backend.Port }
+	if backend.Port != "" {
+		dialPort = backend.Port
+	}
+
 	wsURL := fmt.Sprintf("wss://%s:%s/?token=%s", sniHost, sniPort, url.QueryEscape(token))
+	
 	requestHeader := http.Header{}
 	requestHeader.Add("Host", sniHost)
 	requestHeader.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	dialer := websocket.Dialer{ TLSClientConfig: &tls.Config{ InsecureSkipVerify: true, ServerName: sniHost }, HandshakeTimeout: 5 * time.Second }
+	
+	dialer := websocket.Dialer{ 
+		TLSClientConfig: &tls.Config{ InsecureSkipVerify: true, ServerName: sniHost }, 
+		HandshakeTimeout: 5 * time.Second,
+	}
+	
 	if backend.IP != "" {
 		dialer.NetDial = func(network, addr string) (net.Conn, error) { 
 			return net.DialTimeout(network, net.JoinHostPort(backend.IP, dialPort), 5*time.Second) 
 		}
 	}
-	
-	// [Fix] 显式接收 3 个返回值
+
 	conn, resp, err := dialer.Dial(wsURL, requestHeader)
 	if err != nil {
 		if resp != nil {
@@ -453,31 +528,85 @@ func GenerateConfigJSON(serverAddr, serverIP, secretKey, socks5Addr, fallbackAdd
 		"outbounds": [{
 			"tag": "proxy",
 			"protocol": "ech-proxy",
-			"settings": { "server": %s, "server_ip": "%s", "token": "%s", "strategy": "%s", "rules": %s`,
-			listenAddr, string(serverJSON), serverIP, token, strategy, string(rulesJSON))
-	if socks5Addr != "" { config += fmt.Sprintf(`, "proxy_settings": {"socks5_address": "%s"}`, socks5Addr) }
+			"settings": {
+				"server": %s,
+				"server_ip": "%s",
+				"token": "%s",
+				"strategy": "%s",
+				"rules": %s`, listenAddr, string(serverJSON), serverIP, token, strategy, string(rulesJSON))
+
+	if socks5Addr != "" {
+		config += fmt.Sprintf(`, "proxy_settings": {"socks5_address": "%s"}`, socks5Addr)
+	}
 	config += `}}], "routing": {}}` 
 	return config
 }
 
-func pipeDirect(local net.Conn, ws *websocket.Conn) { 
-	defer ws.Close(); defer local.Close()
-	go func() { 
-		for { 
+// [v19] 升级版管道：支持流量统计
+func pipeDirect(local net.Conn, ws *websocket.Conn, target string) { 
+	defer ws.Close()
+	defer local.Close()
+
+	var upBytes, downBytes int64
+	startTime := time.Now()
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Downlink: WS -> TCP
+	go func() {
+		defer wg.Done()
+		buf := bufPool.Get().([]byte)
+		defer bufPool.Put(buf)
+		
+		for {
 			mt, r, err := ws.NextReader()
 			if err != nil { break }
-			if mt == websocket.BinaryMessage { if _, err := io.Copy(local, r); err != nil { break } }
-		} 
+			if mt == websocket.BinaryMessage {
+				n, err := io.CopyBuffer(local, r, buf)
+				if err == nil { atomic.AddInt64(&downBytes, n) }
+				if err != nil { break }
+			}
+		}
 		local.Close() 
 	}() 
-	bufPtr := bufPool.Get().([]byte); defer bufPool.Put(bufPtr)
-	for { 
-		n, err := local.Read(bufPtr)
-		if n > 0 { if err := ws.WriteMessage(websocket.BinaryMessage, bufPtr[:n]); err != nil { break } } 
-		if err != nil { break }
-	} 
+
+	// Uplink: TCP -> WS
+	go func() {
+		defer wg.Done()
+		buf := bufPool.Get().([]byte)
+		defer bufPool.Put(buf)
+
+		for {
+			n, err := local.Read(buf)
+			if n > 0 {
+				atomic.AddInt64(&upBytes, int64(n))
+				err := ws.WriteMessage(websocket.BinaryMessage, buf[:n])
+				if err != nil { break }
+			}
+			if err != nil { break }
+		}
+	}()
+
+	wg.Wait()
+	duration := time.Since(startTime)
+	
+	// [v19] 打印统计日志
+	log.Printf("[Stats] %s | Up: %s | Down: %s | Time: %v", 
+		target, formatBytes(upBytes), formatBytes(downBytes), duration.Round(time.Second))
 }
 
+func formatBytes(b int64) string {
+	const unit = 1024
+	if b < unit { return fmt.Sprintf("%d B", b) }
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+// ... (sendNanoHeaderV2, handleSOCKS5, handleHTTP, parseServerAddr 保持 v14.1 不变)
 func sendNanoHeaderV2(wsConn *websocket.Conn, target string, payload []byte, s5 string, fb string) error {
 	host, portStr, _ := net.SplitHostPort(target)
 	var port uint16
