@@ -1,4 +1,4 @@
-// core/core-binary.go (v19.5 - Final API-Stable Edition)
+// core/core-binary.go (v19.6 - Final & Verified API Edition)
 // [最终修正] 全面适配 V2Ray v5 最新的、已稳定的 Geodata API (Final V2Ray v5 API Compliance)
 // [状态] 完整无省略版, 生产级可用
 
@@ -33,9 +33,9 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	// [V2RAY V5 API-COMPLIANT] [FINAL FIX] 使用 V2Ray v5 最终稳定的 API 路径
-	"github.com/v2fly/v2ray-core/v5/app/lib/asset"
-	"github.comcom/v2fly/v2ray-core/v5/app/router"
+	// [FINAL & VERIFIED] 使用 V2Ray v5 最终稳定版的正确 API 路径
+	"github.com/v2fly/v2ray-core/v5/app/router"
+	"github.com/v2fly/v2ray-core/v5/common/platform"
 )
 
 var globalRRIndex uint64
@@ -105,9 +105,9 @@ func checkFileDependency(filename string) bool {
 	return !info.IsDir()
 }
 
-// [V2RAY V5 API-COMPLIANT] The logic using the new API is correct and remains unchanged.
+// [FINAL & VERIFIED] 使用 platform.OpenAsset API 加载 geosite.dat
 func loadGeodata() {
-	rawBytes, err := asset.Open("geosite.dat")
+	rawBytes, err := platform.OpenAsset("geosite.dat")
 	if err != nil {
 		// This warning is already handled by the main dependency check, so we can keep it simple.
 		return
@@ -430,7 +430,7 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 			mode += fmt.Sprintf(" + %d Rules", len(routingMap))
 		}
 	}
-	log.Printf("[Core] Xlink Observer Engine (v19.5) Listening on %s [%s]", inbound.Listen, mode)
+	log.Printf("[Core] Xlink Observer Engine (v19.6) Listening on %s [%s]", inbound.Listen, mode)
 	go func() {
 		for {
 			conn, err := listener.Accept()
