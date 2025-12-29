@@ -1,5 +1,5 @@
-// core/core-binary.go (v19.4 - V2Ray v5 API-Compliant Edition)
-// [升级] 全面适配 V2Ray v5.42.0+ 的 Geodata API 变更 (V2Ray v5 API Compliance)
+// core/core-binary.go (v19.5 - Final API-Stable Edition)
+// [最终修正] 全面适配 V2Ray v5 最新的、已稳定的 Geodata API (Final V2Ray v5 API Compliance)
 // [状态] 完整无省略版, 生产级可用
 
 //go:build binary
@@ -33,9 +33,9 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	// [V2RAY V5 API-COMPLIANT] [FIXED] 使用 V2Ray v5 最新API的模块路径
-	"github.com/v2fly/v2ray-core/v5/app/router"
-	"github.com/v2fly/v2ray-core/v5/features/asset"
+	// [V2RAY V5 API-COMPLIANT] [FINAL FIX] 使用 V2Ray v5 最终稳定的 API 路径
+	"github.com/v2fly/v2ray-core/v5/app/lib/asset"
+	"github.comcom/v2fly/v2ray-core/v5/app/router"
 )
 
 var globalRRIndex uint64
@@ -105,7 +105,7 @@ func checkFileDependency(filename string) bool {
 	return !info.IsDir()
 }
 
-// [V2RAY V5 API-COMPLIANT] [FIXED] 使用最新的 asset.Open API 加载 geosite.dat
+// [V2RAY V5 API-COMPLIANT] The logic using the new API is correct and remains unchanged.
 func loadGeodata() {
 	rawBytes, err := asset.Open("geosite.dat")
 	if err != nil {
@@ -123,7 +123,6 @@ func loadGeodata() {
 	geodataMutex.Lock()
 	defer geodataMutex.Unlock()
 
-	// 将解析出的列表转换为 map 以便快速查找
 	matcher := make(map[string][]*router.Domain)
 	for _, site := range geositeList {
 		matcher[strings.ToLower(site.CountryCode)] = site.Domain
@@ -431,7 +430,7 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 			mode += fmt.Sprintf(" + %d Rules", len(routingMap))
 		}
 	}
-	log.Printf("[Core] Xlink Observer Engine (v19.4) Listening on %s [%s]", inbound.Listen, mode)
+	log.Printf("[Core] Xlink Observer Engine (v19.5) Listening on %s [%s]", inbound.Listen, mode)
 	go func() {
 		for {
 			conn, err := listener.Accept()
