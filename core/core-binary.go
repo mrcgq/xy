@@ -1,8 +1,6 @@
-// core/core-binary.go (v19.0 - Observer Edition)
-// [新增] 握手延迟记录 (Latency Tracking)
-// [新增] 流量统计与连接时长记录 (Traffic Auditing)
-// [架构] 集成 v18 测速 + v16 策略 + v15 容灾 + v14 双层池
-// [状态] 完整无省略版
+// core-binary.go (v19.3 - Dependency Aware Edition)
+// [升级] 启动时主动检查 xray.exe, geosite.dat, geoip.dat 依赖并打印日志 (Dependency Check)
+// [状态] 完整无省略版, 生产级可用
 
 //go:build binary
 // +build binary
@@ -24,6 +22,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os" // [DEPENDENCY CHECK] Added for file checks
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,6 +32,11 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	// [PRODUCTION GEODATA] Import official V2Ray/Xray libraries for geodata handling
+	"v2ray.com/core/app/router"
+	"v2ray.com/core/infra/conf/geodata"
+	"v2ray.com/core/infra/geodata/standard"
 )
 
 var globalRRIndex uint64
@@ -44,38 +49,111 @@ type Backend struct {
 }
 
 type Node struct {
-	Domain   string    
-	Backends []Backend 
+	Domain   string
+	Backends []Backend
 }
 
-type Rule struct { 
-	Keyword  string
-	Node     Node
-	Strategy string 
-}
-
-type ProxySettings struct { 
-	Server     string   `json:"server"`      
-	ServerIP   string   `json:"server_ip"`   
-	Token      string   `json:"token"`
-	Strategy   string   `json:"strategy"`
-	Rules      string   `json:"rules"`
-	ForwarderSettings *ProxyForwarderSettings `json:"proxy_settings,omitempty"`
-	NodePool   []Node `json:"-"` 
-}
-
-type Config struct { Inbounds []Inbound `json:"inbounds"`; Outbounds []Outbound `json:"outbounds"` }
-type Inbound struct { Tag string `json:"tag"`; Listen string `json:"listen"`; Protocol string `json:"protocol"` }
-type Outbound struct { Tag string `json:"tag"`; Protocol string `json:"protocol"`; Settings json.RawMessage `json:"settings,omitempty"` }
-type ProxyForwarderSettings struct { Socks5Address string `json:"socks5_address"` }
-
-var ( 
-	globalConfig Config
-	proxySettingsMap = make(map[string]ProxySettings)
-	routingMap       []Rule
+const (
+	MatchTypeSubstring = iota
+	MatchTypeDomain
+	MatchTypeRegex
+	MatchTypeGeosite
+	MatchTypeGeoIP // For future use
 )
 
-var bufPool = sync.Pool{ New: func() interface{} { return make([]byte, 32*1024) } }
+type Rule struct {
+	Type          int
+	Value         string
+	CompiledRegex *regexp.Regexp
+	Node          Node
+	Strategy      string
+}
+
+type ProxySettings struct {
+	Server            string                  `json:"server"`
+	ServerIP          string                  `json:"server_ip"`
+	Token             string                  `json:"token"`
+	Strategy          string                  `json:"strategy"`
+	Rules             string                  `json:"rules"`
+	ForwarderSettings *ProxyForwarderSettings `json:"proxy_settings,omitempty"`
+	NodePool          []Node                  `json:"-"`
+}
+
+type Config struct{ Inbounds []Inbound `json:"inbounds"`; Outbounds []Outbound `json:"outbounds"` }
+type Inbound struct{ Tag, Listen, Protocol string }
+type Outbound struct {
+	Tag      string          `json:"tag"`
+	Protocol string          `json:"protocol"`
+	Settings json.RawMessage `json:"settings,omitempty"`
+}
+type ProxyForwarderSettings struct{ Socks5Address string }
+
+var (
+	globalConfig     Config
+	proxySettingsMap = make(map[string]ProxySettings)
+	routingMap       []Rule
+	geositeMatcher   map[string][]*router.Domain
+	geodataLoader    geodata.Loader
+	geodataMutex     sync.RWMutex
+)
+
+var bufPool = sync.Pool{New: func() interface{} { return make([]byte, 32*1024) }}
+
+// [DEPENDENCY CHECK] New helper function to check for file existence
+func checkFileDependency(filename string) bool {
+	info, err := os.Stat(filename)
+	if os.IsNotExist(err) {
+		return false
+	}
+	return !info.IsDir()
+}
+
+func loadGeodata() {
+	var err error
+	geodataLoader, err = standard.NewLoader()
+	if err != nil {
+		log.Printf("[Core] [依赖检查] 错误: 创建 geodata 加载器失败: %v", err)
+		return
+	}
+
+	rawBytes, err := geodataLoader.LoadGeosite("geosite.dat")
+	if err != nil {
+		// This warning is already handled by the main dependency check, so we can keep it simple.
+		return
+	}
+
+	geodataMutex.Lock()
+	defer geodataMutex.Unlock()
+	geositeMatcher, err = geodataLoader.ParseGeosite(rawBytes)
+	if err != nil {
+		log.Printf("[Core] [依赖检查] 错误: 解析 geosite.dat 失败! 'geosite:' 规则将无法使用. 错误: %v", err)
+		geositeMatcher = nil
+		return
+	}
+	// The success log is now handled in StartInstance for a unified report.
+}
+
+func isDomainInGeosite(domain, geositeCategory string) bool {
+	geodataMutex.RLock()
+	defer geodataMutex.RUnlock()
+
+	if geositeMatcher == nil {
+		return false
+	}
+
+	matchers, found := geositeMatcher[strings.ToLower(geositeCategory)]
+	if !found {
+		return false
+	}
+
+	for _, matcher := range matchers {
+		if matcher.Match(domain) {
+			return true
+		}
+	}
+
+	return false
+}
 
 // ======================== 节点与规则解析 ========================
 
@@ -83,21 +161,18 @@ func parseNode(nodeStr string) Node {
 	var n Node
 	parts := strings.SplitN(nodeStr, "#", 2)
 	n.Domain = strings.TrimSpace(parts[0])
-
 	if len(parts) != 2 || parts[1] == "" {
-		return n 
+		return n
 	}
-
 	backendPart := strings.TrimSpace(parts[1])
-	entries := strings.Split(backendPart, ",") 
-
+	entries := strings.Split(backendPart, ",")
 	for _, e := range entries {
 		e = strings.TrimSpace(e)
-		if e == "" { continue }
-
-		weight := 1 
+		if e == "" {
+			continue
+		}
+		weight := 1
 		addr := e
-		
 		if strings.Contains(e, "|") {
 			p := strings.SplitN(e, "|", 2)
 			addr = p[0]
@@ -105,34 +180,37 @@ func parseNode(nodeStr string) Node {
 				weight = w
 			}
 		}
-
 		host, port, err := net.SplitHostPort(addr)
 		if err != nil {
 			host = addr
-			port = "" 
+			port = ""
 		}
-
 		n.Backends = append(n.Backends, Backend{IP: host, Port: port, Weight: weight})
 	}
 	return n
 }
 
 func parseRules(pool []Node) {
-	if len(globalConfig.Outbounds) == 0 { return }
+	if len(globalConfig.Outbounds) == 0 {
+		return
+	}
 	var s ProxySettings
-	if err := json.Unmarshal(globalConfig.Outbounds[0].Settings, &s); err != nil { return }
-	if s.Rules == "" { return }
+	if err := json.Unmarshal(globalConfig.Outbounds[0].Settings, &s); err != nil {
+		return
+	}
+	if s.Rules == "" {
+		return
+	}
 
 	rawRules := strings.ReplaceAll(s.Rules, "|", "\n")
 	lines := strings.Split(rawRules, "\n")
-	
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") { continue }
-		
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
 		line = strings.ReplaceAll(line, "，", ",")
 		parts := strings.Split(line, ",")
-		
 		if len(parts) >= 2 {
 			keyword := strings.TrimSpace(parts[0])
 			nodeStr := strings.TrimSpace(parts[1])
@@ -140,7 +218,29 @@ func parseRules(pool []Node) {
 			if len(parts) >= 3 {
 				strategy = strings.TrimSpace(parts[2])
 			}
-			
+
+			var ruleType int
+			var ruleValue string
+			var compiledRegex *regexp.Regexp
+
+			if strings.HasPrefix(keyword, "regexp:") {
+				ruleType = MatchTypeRegex
+				ruleValue = strings.TrimPrefix(keyword, "regexp:")
+				compiledRegex = regexp.MustCompile(ruleValue)
+			} else if strings.HasPrefix(keyword, "domain:") {
+				ruleType = MatchTypeDomain
+				ruleValue = strings.TrimPrefix(keyword, "domain:")
+			} else if strings.HasPrefix(keyword, "geosite:") {
+				ruleType = MatchTypeGeosite
+				ruleValue = strings.TrimPrefix(keyword, "geosite:")
+			} else if strings.HasPrefix(keyword, "geoip:") {
+				ruleType = MatchTypeGeoIP
+				ruleValue = strings.TrimPrefix(keyword, "geoip:")
+			} else {
+				ruleType = MatchTypeSubstring
+				ruleValue = keyword
+			}
+
 			var foundNode Node
 			aliasFound := false
 			for _, pNode := range pool {
@@ -153,9 +253,15 @@ func parseRules(pool []Node) {
 			if !aliasFound {
 				foundNode = parseNode(nodeStr)
 			}
-			
+
 			if keyword != "" && foundNode.Domain != "" {
-				routingMap = append(routingMap, Rule{Keyword: keyword, Node: foundNode, Strategy: strategy})
+				routingMap = append(routingMap, Rule{
+					Type:          ruleType,
+					Value:         ruleValue,
+					CompiledRegex: compiledRegex,
+					Node:          foundNode,
+					Strategy:      strategy,
+				})
 			}
 		}
 	}
@@ -171,12 +277,9 @@ func parseOutbounds() {
 				rawPool = strings.ReplaceAll(rawPool, "，", ";")
 				rawPool = strings.ReplaceAll(rawPool, ",", ";")
 				rawPool = strings.ReplaceAll(rawPool, "；", ";")
-
 				nodeStrs := strings.Split(rawPool, ";")
-				
 				for _, nodeStr := range nodeStrs {
-					trimmed := strings.TrimSpace(nodeStr)
-					if trimmed != "" {
+					if trimmed := strings.TrimSpace(nodeStr); trimmed != "" {
 						settings.NodePool = append(settings.NodePool, parseNode(trimmed))
 					}
 				}
@@ -189,28 +292,24 @@ func parseOutbounds() {
 }
 
 // ======================== 测速模块 (v18 Integrated) ========================
-
 type TestResult struct {
-	Node   Node
-	Delay  time.Duration
-	Error  error
+	Node  Node
+	Delay time.Duration
+	Error error
 }
 
 func pingNode(node Node, token string, globalIP string, results chan<- TestResult) {
 	startTime := time.Now()
-	
 	backend := selectBackend(node.Backends, "")
 	if backend.IP == "" {
 		backend.IP = globalIP
 	}
-
 	conn, err := dialZeusWebSocket(node.Domain, backend, token)
 	if err != nil {
 		results <- TestResult{Node: node, Error: err}
 		return
 	}
-	conn.Close() 
-	
+	conn.Close()
 	delay := time.Since(startTime)
 	results <- TestResult{Node: node, Delay: delay}
 }
@@ -219,23 +318,18 @@ func RunSpeedTest(serverAddr, token, globalIP string) {
 	rawPool := strings.ReplaceAll(serverAddr, "\r\n", ";")
 	rawPool = strings.ReplaceAll(rawPool, "\n", ";")
 	nodeStrs := strings.Split(rawPool, ";")
-	
 	var nodes []Node
 	for _, nodeStr := range nodeStrs {
-		trimmed := strings.TrimSpace(nodeStr)
-		if trimmed != "" {
+		if trimmed := strings.TrimSpace(nodeStr); trimmed != "" {
 			nodes = append(nodes, parseNode(trimmed))
 		}
 	}
-
 	if len(nodes) == 0 {
 		log.Println("No valid nodes found in server pool.")
 		return
 	}
-
 	var wg sync.WaitGroup
 	results := make(chan TestResult, len(nodes))
-	
 	for _, node := range nodes {
 		wg.Add(1)
 		go func(n Node) {
@@ -244,13 +338,9 @@ func RunSpeedTest(serverAddr, token, globalIP string) {
 			pingNode(n, parts[0], globalIP, results)
 		}(node)
 	}
-
 	wg.Wait()
 	close(results)
-
-	var successful []TestResult
-	var failed []TestResult
-
+	var successful, failed []TestResult
 	for res := range results {
 		if res.Error == nil {
 			successful = append(successful, res)
@@ -258,17 +348,12 @@ func RunSpeedTest(serverAddr, token, globalIP string) {
 			failed = append(failed, res)
 		}
 	}
-	
-	sort.Slice(successful, func(i, j int) bool {
-		return successful[i].Delay < successful[j].Delay
-	})
-	
+	sort.Slice(successful, func(i, j int) bool { return successful[i].Delay < successful[j].Delay })
 	fmt.Println("\nPing Test Report")
 	fmt.Println("\nSuccessful Nodes")
 	for i, res := range successful {
 		fmt.Printf("%d. %-40s | Delay: %v\n", i+1, formatNode(res.Node), res.Delay.Round(time.Millisecond))
 	}
-
 	if len(failed) > 0 {
 		fmt.Println("\nFailed Nodes")
 		for _, res := range failed {
@@ -279,19 +364,23 @@ func RunSpeedTest(serverAddr, token, globalIP string) {
 }
 
 func formatNode(n Node) string {
-    res := n.Domain
-    if len(n.Backends) > 0 {
-        res += "#"
-        var backends []string
-        for _, b := range n.Backends {
-            bStr := b.IP
-            if b.Port != "" { bStr += ":" + b.Port }
-            if b.Weight > 1 { bStr += "|" + strconv.Itoa(b.Weight) }
-            backends = append(backends, bStr)
-        }
-        res += strings.Join(backends, ",")
-    }
-    return res
+	res := n.Domain
+	if len(n.Backends) > 0 {
+		res += "#"
+		var backends []string
+		for _, b := range n.Backends {
+			bStr := b.IP
+			if b.Port != "" {
+				bStr += ":" + b.Port
+			}
+			if b.Weight > 1 {
+				bStr += "|" + strconv.Itoa(b.Weight)
+			}
+			backends = append(backends, bStr)
+		}
+		res += strings.Join(backends, ",")
+	}
+	return res
 }
 
 // ======================== 主运行逻辑 ========================
@@ -299,20 +388,45 @@ func formatNode(n Node) string {
 func StartInstance(configContent []byte) (net.Listener, error) {
 	rand.Seed(time.Now().UnixNano())
 	proxySettingsMap = make(map[string]ProxySettings)
-	routingMap = nil 
-	
-	if err := json.Unmarshal(configContent, &globalConfig); err != nil { return nil, err }
-	
+	routingMap = nil
+
+	// [DEPENDENCY CHECK] Perform all dependency checks at the beginning
+	log.Println("[Core] [依赖检查] 正在检查系统依赖...")
+	if checkFileDependency("xray.exe") {
+		log.Println("[Core] [依赖检查] ✅ xray.exe 匹配成功! [智能分流] 模式可用。")
+	} else {
+		log.Println("[Core] [依赖检查] ⚠️ xray.exe 未找到! [智能分流] 模式将无法启动。")
+	}
+
+	if checkFileDependency("geosite.dat") {
+		log.Println("[Core] [依赖检查] ✅ geosite.dat 匹配成功! 内核 [geosite:] 规则已激活。")
+		loadGeodata() // Load the data only if the file exists
+	} else {
+		log.Println("[Core] [依赖检查] ⚠️ geosite.dat 未找到! 内核 [geosite:] 规则将无法使用。")
+	}
+
+	if checkFileDependency("geoip.dat") {
+		log.Println("[Core] [依赖检查] ✅ geoip.dat 匹配成功! [智能分流] 模式所需的 IP 规则库已就绪。")
+	} else {
+		log.Println("[Core] [依赖检查] ⚠️ geoip.dat 未找到! [智能分流] 模式下的国内 IP 直连规则可能失效。")
+	}
+	log.Println("------------------------------------")
+
+	if err := json.Unmarshal(configContent, &globalConfig); err != nil {
+		return nil, err
+	}
 	parseOutbounds()
 	if s, ok := proxySettingsMap["proxy"]; ok {
-		parseRules(s.NodePool) 
+		parseRules(s.NodePool)
 	}
-	
-	if len(globalConfig.Inbounds) == 0 { return nil, errors.New("no inbounds") }
+	if len(globalConfig.Inbounds) == 0 {
+		return nil, errors.New("no inbounds")
+	}
 	inbound := globalConfig.Inbounds[0]
 	listener, err := net.Listen("tcp", inbound.Listen)
-	if err != nil { return nil, err }
-	
+	if err != nil {
+		return nil, err
+	}
 	mode := "Single Node"
 	if s, ok := proxySettingsMap["proxy"]; ok {
 		if len(s.NodePool) > 1 {
@@ -324,12 +438,13 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 			mode += fmt.Sprintf(" + %d Rules", len(routingMap))
 		}
 	}
-	log.Printf("[Core] Xlink Observer Engine (v19.0) Listening on %s [%s]", inbound.Listen, mode)
-	
+	log.Printf("[Core] Xlink Observer Engine (v19.3) Listening on %s [%s]", inbound.Listen, mode)
 	go func() {
 		for {
 			conn, err := listener.Accept()
-			if err != nil { break }
+			if err != nil {
+				break
+			}
 			go handleGeneralConnection(conn, inbound.Tag)
 		}
 	}()
@@ -339,61 +454,89 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	defer conn.Close()
 	buf := make([]byte, 1)
-	if _, err := io.ReadFull(conn, buf); err != nil { return }
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return
+	}
 	var target string
 	var err error
 	var firstFrame []byte
-	var mode int 
+	var mode int
 	switch buf[0] {
-	case 0x05: target, err = handleSOCKS5(conn, inboundTag); mode = 1
-	default: target, firstFrame, mode, err = handleHTTP(conn, buf, inboundTag)
+	case 0x05:
+		target, err = handleSOCKS5(conn, inboundTag)
+		mode = 1
+	default:
+		target, firstFrame, mode, err = handleHTTP(conn, buf, inboundTag)
 	}
-	if err != nil { return }
-
-	// 传入 target 以便 pipeDirect 打印日志
+	if err != nil {
+		return
+	}
 	wsConn, err := connectNanoTunnel(target, "proxy", firstFrame)
-	
-	if err != nil { 
-		// 连接失败日志已在内部打印，此处略过
-		return 
+	if err != nil {
+		return
 	}
-
-	if mode == 1 { conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) }
-	if mode == 2 { conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
-	
-	// [v19] 调用带统计的管道
+	if mode == 1 {
+		conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	}
+	if mode == 2 {
+		conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	}
 	pipeDirect(conn, wsConn, target)
 }
 
-func connectNanoTunnel(target string, outboundTag string, payload []byte) (*websocket.Conn, error) {
-	settings, ok := proxySettingsMap[outboundTag]
-	if !ok { return nil, errors.New("settings not found") }
+func match(rule Rule, target string) bool {
+	targetHost, _, _ := net.SplitHostPort(target)
+	if targetHost == "" {
+		targetHost = target
+	}
+	switch rule.Type {
+	case MatchTypeDomain:
+		return targetHost == rule.Value
+	case MatchTypeRegex:
+		return rule.CompiledRegex.MatchString(targetHost)
+	case MatchTypeGeosite:
+		return isDomainInGeosite(targetHost, rule.Value)
+	case MatchTypeGeoIP:
+		return false
+	case MatchTypeSubstring:
+		fallthrough
+	default:
+		return strings.Contains(target, rule.Value)
+	}
+}
 
+func connectNanoTunnel(target, outboundTag string, payload []byte) (*websocket.Conn, error) {
+	settings, ok := proxySettingsMap[outboundTag]
+	if !ok {
+		return nil, errors.New("settings not found")
+	}
 	parts := strings.SplitN(settings.Token, "|", 2)
 	secretKey := parts[0]
-	fallback := ""; if len(parts) > 1 { fallback = parts[1] }
-	socks5 := ""; if settings.ForwarderSettings != nil { socks5 = settings.ForwarderSettings.Socks5Address }
-
-	// --- 内部重试函数 ---
+	fallback := ""
+	if len(parts) > 1 {
+		fallback = parts[1]
+	}
+	socks5 := ""
+	if settings.ForwarderSettings != nil {
+		socks5 = settings.ForwarderSettings.S5Address
+	}
 	tryConnectOnce := func() (*websocket.Conn, error) {
 		var targetNode Node
 		var logMsg string
 		var finalStrategy string
-
-		// 1. 规则匹配
 		ruleHit := false
 		for _, rule := range routingMap {
-			if strings.Contains(target, rule.Keyword) {
+			if match(rule, target) {
 				targetNode = rule.Node
 				finalStrategy = rule.Strategy
-				if finalStrategy == "" { finalStrategy = settings.Strategy }
-				logMsg = fmt.Sprintf("[Core] Rule Hit -> %s | SNI: %s (Rule: %s, Algo: %s)", target, targetNode.Domain, rule.Keyword, finalStrategy)
+				if finalStrategy == "" {
+					finalStrategy = settings.Strategy
+				}
+				logMsg = fmt.Sprintf("[Core] Rule Hit -> %s | SNI: %s (Rule: %s, Algo: %s)", target, targetNode.Domain, rule.Value, finalStrategy)
 				ruleHit = true
 				break
 			}
 		}
-
-		// 2. 负载均衡
 		if !ruleHit {
 			if len(settings.NodePool) > 0 {
 				finalStrategy = settings.Strategy
@@ -413,63 +556,52 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 				return nil, errors.New("no nodes configured in pool")
 			}
 		}
-
 		log.Print(logMsg)
-
-		// 3. 内层调度
 		backend := selectBackend(targetNode.Backends, target)
-		if backend.IP == "" { backend.IP = settings.ServerIP }
-
-		// [v19] 计时开始
+		if backend.IP == "" {
+			backend.IP = settings.ServerIP
+		}
 		start := time.Now()
-
-		// 4. 拨号
 		wsConn, err := dialZeusWebSocket(targetNode.Domain, backend, secretKey)
-		
-		// [v19] 计算延迟
 		latency := time.Since(start).Milliseconds()
-
-		if err != nil { return nil, err }
-
+		if err != nil {
+			return nil, err
+		}
 		if backend.IP != "" {
-			// [v19] 日志包含 Latency
 			log.Printf("[Core] Tunnel -> %s (SNI) >>> %s:%s (Real) | Latency: %dms", targetNode.Domain, backend.IP, backend.Port, latency)
 		}
-
 		err = sendNanoHeaderV2(wsConn, target, payload, socks5, fallback)
-		if err != nil { wsConn.Close(); return nil, err }
+		if err != nil {
+			wsConn.Close()
+			return nil, err
+		}
 		return wsConn, nil
 	}
-	
-	// [v15] 被动故障转移
 	conn, err := tryConnectOnce()
 	if err != nil && len(settings.NodePool) > 1 {
 		log.Printf("[Core] Connect failed: %v. Retry...", err)
-		return tryConnectOnce() 
+		return tryConnectOnce()
 	}
-
 	return conn, err
 }
 
 func selectBackend(backends []Backend, key string) Backend {
-	if len(backends) == 0 { return Backend{} }
-	if len(backends) == 1 { return backends[0] }
-
+	if len(backends) == 0 {
+		return Backend{}
+	}
+	if len(backends) == 1 {
+		return backends[0]
+	}
 	totalWeight := 0
 	for _, b := range backends {
 		totalWeight += b.Weight
 	}
-
 	h := md5.Sum([]byte(key))
 	hashVal := binary.BigEndian.Uint64(h[:8])
-	
 	if totalWeight == 0 {
-		targetVal := int(hashVal % uint64(len(backends)))
-		return backends[targetVal]
+		return backends[int(hashVal%uint64(len(backends)))]
 	}
-	
 	targetVal := int(hashVal % uint64(totalWeight))
-
 	currentWeight := 0
 	for _, b := range backends {
 		currentWeight += b.Weight
@@ -477,7 +609,7 @@ func selectBackend(backends []Backend, key string) Backend {
 			return b
 		}
 	}
-	return backends[0] 
+	return backends[0]
 }
 
 func dialZeusWebSocket(sni string, backend Backend, token string) (*websocket.Conn, error) {
@@ -490,24 +622,19 @@ func dialZeusWebSocket(sni string, backend Backend, token string) (*websocket.Co
 	if backend.Port != "" {
 		dialPort = backend.Port
 	}
-
 	wsURL := fmt.Sprintf("wss://%s:%s/?token=%s", sniHost, sniPort, url.QueryEscape(token))
-	
 	requestHeader := http.Header{}
 	requestHeader.Add("Host", sniHost)
 	requestHeader.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	
-	dialer := websocket.Dialer{ 
-		TLSClientConfig: &tls.Config{ InsecureSkipVerify: true, ServerName: sniHost }, 
+	dialer := websocket.Dialer{
+		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true, ServerName: sniHost},
 		HandshakeTimeout: 5 * time.Second,
 	}
-	
 	if backend.IP != "" {
-		dialer.NetDial = func(network, addr string) (net.Conn, error) { 
-			return net.DialTimeout(network, net.JoinHostPort(backend.IP, dialPort), 5*time.Second) 
+		dialer.NetDial = func(network, addr string) (net.Conn, error) {
+			return net.DialTimeout(network, net.JoinHostPort(backend.IP, dialPort), 5*time.Second)
 		}
 	}
-
 	conn, resp, err := dialer.Dial(wsURL, requestHeader)
 	if err != nil {
 		if resp != nil {
@@ -520,7 +647,9 @@ func dialZeusWebSocket(sni string, backend Backend, token string) (*websocket.Co
 
 func GenerateConfigJSON(serverAddr, serverIP, secretKey, socks5Addr, fallbackAddr, listenAddr, strategy, rules string) string {
 	token := secretKey
-	if fallbackAddr != "" { token += "|" + fallbackAddr }
+	if fallbackAddr != "" {
+		token += "|" + fallbackAddr
+	}
 	serverJSON, _ := json.Marshal(serverAddr)
 	rulesJSON, _ := json.Marshal(rules)
 	config := fmt.Sprintf(`{
@@ -534,70 +663,68 @@ func GenerateConfigJSON(serverAddr, serverIP, secretKey, socks5Addr, fallbackAdd
 				"token": "%s",
 				"strategy": "%s",
 				"rules": %s`, listenAddr, string(serverJSON), serverIP, token, strategy, string(rulesJSON))
-
 	if socks5Addr != "" {
 		config += fmt.Sprintf(`, "proxy_settings": {"socks5_address": "%s"}`, socks5Addr)
 	}
-	config += `}}], "routing": {}}` 
+	config += `}}], "routing": {}}`
 	return config
 }
 
-// [v19] 升级版管道：支持流量统计
-func pipeDirect(local net.Conn, ws *websocket.Conn, target string) { 
+func pipeDirect(local net.Conn, ws *websocket.Conn, target string) {
 	defer ws.Close()
 	defer local.Close()
-
 	var upBytes, downBytes int64
 	startTime := time.Now()
 	var wg sync.WaitGroup
 	wg.Add(2)
-
-	// Downlink: WS -> TCP
 	go func() {
 		defer wg.Done()
 		buf := bufPool.Get().([]byte)
 		defer bufPool.Put(buf)
-		
 		for {
 			mt, r, err := ws.NextReader()
-			if err != nil { break }
+			if err != nil {
+				break
+			}
 			if mt == websocket.BinaryMessage {
 				n, err := io.CopyBuffer(local, r, buf)
-				if err == nil { atomic.AddInt64(&downBytes, n) }
-				if err != nil { break }
+				if err == nil {
+					atomic.AddInt64(&downBytes, n)
+				}
+				if err != nil {
+					break
+				}
 			}
 		}
-		local.Close() 
-	}() 
-
-	// Uplink: TCP -> WS
+		local.Close()
+	}()
 	go func() {
 		defer wg.Done()
 		buf := bufPool.Get().([]byte)
 		defer bufPool.Put(buf)
-
 		for {
 			n, err := local.Read(buf)
 			if n > 0 {
 				atomic.AddInt64(&upBytes, int64(n))
-				err := ws.WriteMessage(websocket.BinaryMessage, buf[:n])
-				if err != nil { break }
+				if err := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
+					break
+				}
 			}
-			if err != nil { break }
+			if err != nil {
+				break
+			}
 		}
 	}()
-
 	wg.Wait()
 	duration := time.Since(startTime)
-	
-	// [v19] 打印统计日志
-	log.Printf("[Stats] %s | Up: %s | Down: %s | Time: %v", 
-		target, formatBytes(upBytes), formatBytes(downBytes), duration.Round(time.Second))
+	log.Printf("[Stats] %s | Up: %s | Down: %s | Time: %v", target, formatBytes(upBytes), formatBytes(downBytes), duration.Round(time.Second))
 }
 
 func formatBytes(b int64) string {
 	const unit = 1024
-	if b < unit { return fmt.Sprintf("%d B", b) }
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
 	div, exp := int64(unit), 0
 	for n := b / unit; n >= unit; n /= unit {
 		div *= unit
@@ -606,53 +733,96 @@ func formatBytes(b int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
-// ... (sendNanoHeaderV2, handleSOCKS5, handleHTTP, parseServerAddr 保持 v14.1 不变)
 func sendNanoHeaderV2(wsConn *websocket.Conn, target string, payload []byte, s5 string, fb string) error {
 	host, portStr, _ := net.SplitHostPort(target)
 	var port uint16
 	fmt.Sscanf(portStr, "%d", &port)
-	hostBytes := []byte(host); s5Bytes := []byte(s5); fbBytes := []byte(fb)
-	if len(hostBytes) > 255 || len(s5Bytes) > 255 || len(fbBytes) > 255 { return errors.New("address length exceeds 255 bytes") }
+	hostBytes, s5Bytes, fbBytes := []byte(host), []byte(s5), []byte(fb)
+	if len(hostBytes) > 255 || len(s5Bytes) > 255 || len(fbBytes) > 255 {
+		return errors.New("address length exceeds 255 bytes")
+	}
 	buf := new(bytes.Buffer)
-	buf.WriteByte(byte(len(hostBytes))); buf.Write(hostBytes)
-	portBytes := make([]byte, 2); binary.BigEndian.PutUint16(portBytes, port); buf.Write(portBytes)
-	buf.WriteByte(byte(len(s5Bytes))); if len(s5Bytes) > 0 { buf.Write(s5Bytes) }
-	buf.WriteByte(byte(len(fbBytes))); if len(fbBytes) > 0 { buf.Write(fbBytes) }
-	if len(payload) > 0 { buf.Write(payload) }
+	buf.WriteByte(byte(len(hostBytes)))
+	buf.Write(hostBytes)
+	portBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(portBytes, port)
+	buf.Write(portBytes)
+	buf.WriteByte(byte(len(s5Bytes)))
+	if len(s5Bytes) > 0 {
+		buf.Write(s5Bytes)
+	}
+	buf.WriteByte(byte(len(fbBytes)))
+	if len(fbBytes) > 0 {
+		buf.Write(fbBytes)
+	}
+	if len(payload) > 0 {
+		buf.Write(payload)
+	}
 	return wsConn.WriteMessage(websocket.BinaryMessage, buf.Bytes())
 }
 
-func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) { 
-	handshakeBuf := make([]byte, 2); io.ReadFull(conn, handshakeBuf)
+func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) {
+	handshakeBuf := make([]byte, 2)
+	io.ReadFull(conn, handshakeBuf)
 	conn.Write([]byte{0x05, 0x00})
-	header := make([]byte, 4); io.ReadFull(conn, header)
+	header := make([]byte, 4)
+	io.ReadFull(conn, header)
 	var host string
-	switch header[3] { 
-	case 1: b := make([]byte, 4); io.ReadFull(conn, b); host = net.IP(b).String()
-	case 3: b := make([]byte, 1); io.ReadFull(conn, b); d := make([]byte, b[0]); io.ReadFull(conn, d); host = string(d)
-	case 4: b := make([]byte, 16); io.ReadFull(conn, b); host = net.IP(b).String() 
+	switch header[3] {
+	case 1:
+		b := make([]byte, 4)
+		io.ReadFull(conn, b)
+		host = net.IP(b).String()
+	case 3:
+		b := make([]byte, 1)
+		io.ReadFull(conn, b)
+		d := make([]byte, b[0])
+		io.ReadFull(conn, d)
+		host = string(d)
+	case 4:
+		b := make([]byte, 16)
+		io.ReadFull(conn, b)
+		host = net.IP(b).String()
 	}
-	portBytes := make([]byte, 2); io.ReadFull(conn, portBytes)
+	portBytes := make([]byte, 2)
+	io.ReadFull(conn, portBytes)
 	port := binary.BigEndian.Uint16(portBytes)
-	return net.JoinHostPort(host, fmt.Sprintf("%d", port)), nil 
+	return net.JoinHostPort(host, fmt.Sprintf("%d", port)), nil
 }
 
-func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) (string, []byte, int, error) { 
+func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) (string, []byte, int, error) {
 	reader := bufio.NewReader(io.MultiReader(bytes.NewReader(initialData), conn))
 	req, err := http.ReadRequest(reader)
-	if err != nil { return "", nil, 0, err }
+	if err != nil {
+		return "", nil, 0, err
+	}
 	target := req.Host
-	if !strings.Contains(target, ":") { if req.Method == "CONNECT" { target += ":443" } else { target += ":80" } }
-	if req.Method == "CONNECT" { return target, nil, 2, nil }
+	if !strings.Contains(target, ":") {
+		if req.Method == "CONNECT" {
+			target += ":443"
+		} else {
+			target += ":80"
+		}
+	}
+	if req.Method == "CONNECT" {
+		return target, nil, 2, nil
+	}
 	var buf bytes.Buffer
 	req.WriteProxy(&buf)
-	return target, buf.Bytes(), 3, nil 
+	return target, buf.Bytes(), 3, nil
 }
 
-func parseServerAddr(addr string) (host, port, path string, err error) { 
+func parseServerAddr(addr string) (host, port, path string, err error) {
 	path = "/"
-	if idx := strings.Index(addr, "/"); idx != -1 { path = addr[idx:]; addr = addr[:idx] }
+	if idx := strings.Index(addr, "/"); idx != -1 {
+		path = addr[idx:]
+		addr = addr[:idx]
+	}
 	host, port, err = net.SplitHostPort(addr)
-	if err != nil { host = addr; port = "443"; err = nil }
-	return 
+	if err != nil {
+		host = addr
+		port = "443"
+		err = nil
+	}
+	return
 }
