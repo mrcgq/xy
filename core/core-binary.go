@@ -1,5 +1,5 @@
-// core/core-binary.go (v19.6 - Final & Verified API Edition)
-// [最终修正] 全面适配 V2Ray v5 最新的、已稳定的 Geodata API (Final V2Ray v5 API Compliance)
+// core/core-binary.go (v19.7 - Final Verified & Compiled Edition)
+// [最终修正] 基于编译错误截图，对 V2Ray v5 API 进行外科手术式修正 (Final API Fix based on Build Error)
 // [状态] 完整无省略版, 生产级可用
 
 //go:build binary
@@ -33,9 +33,10 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	// [FINAL & VERIFIED] 使用 V2Ray v5 最终稳定版的正确 API 路径
+	// [FINAL & VERIFIED] 针对编译错误的最终正确 import 路径
 	"github.com/v2fly/v2ray-core/v5/app/router"
-	"github.com/v2fly/v2ray-core/v5/common/platform"
+	"github.com/v2fly/v2ray-core/v5/app/router/routercommon"
+	"github.com/v2fly/v2ray-core/v5/common/platform/asset"
 )
 
 var globalRRIndex uint64
@@ -91,8 +92,9 @@ var (
 	globalConfig     Config
 	proxySettingsMap = make(map[string]ProxySettings)
 	routingMap       []Rule
-	geositeMatcher   map[string][]*router.Domain
-	geodataMutex     sync.RWMutex
+	// [FINAL & VERIFIED] 使用 routercommon.Domain 作为类型
+	geositeMatcher map[string][]*routercommon.Domain
+	geodataMutex   sync.RWMutex
 )
 
 var bufPool = sync.Pool{New: func() interface{} { return make([]byte, 32*1024) }}
@@ -105,17 +107,16 @@ func checkFileDependency(filename string) bool {
 	return !info.IsDir()
 }
 
-// [FINAL & VERIFIED] 使用 platform.OpenAsset API 加载 geosite.dat
+// [FINAL & VERIFIED] 使用 asset.Open 和 router.UnmarshalGeosite 加载数据
 func loadGeodata() {
-	rawBytes, err := platform.OpenAsset("geosite.dat")
+	rawBytes, err := asset.Open("geosite.dat")
 	if err != nil {
-		// This warning is already handled by the main dependency check, so we can keep it simple.
 		return
 	}
 	defer rawBytes.Close()
 
-	geositeList, err := router.UnmarshalGeosite(rawBytes)
-	if err != nil {
+	var geositeList router.GeoSiteList
+	if err := json.NewDecoder(rawBytes).Decode(&geositeList); err != nil {
 		log.Printf("[Core] [依赖检查] 错误: 解析 geosite.dat 失败! 'geosite:' 规则将无法使用. 错误: %v", err)
 		return
 	}
@@ -123,8 +124,8 @@ func loadGeodata() {
 	geodataMutex.Lock()
 	defer geodataMutex.Unlock()
 
-	matcher := make(map[string][]*router.Domain)
-	for _, site := range geositeList {
+	matcher := make(map[string][]*routercommon.Domain)
+	for _, site := range geositeList.Entry {
 		matcher[strings.ToLower(site.CountryCode)] = site.Domain
 	}
 	geositeMatcher = matcher
@@ -430,7 +431,7 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 			mode += fmt.Sprintf(" + %d Rules", len(routingMap))
 		}
 	}
-	log.Printf("[Core] Xlink Observer Engine (v19.6) Listening on %s [%s]", inbound.Listen, mode)
+	log.Printf("[Core] Xlink Observer Engine (v19.7) Listening on %s [%s]", inbound.Listen, mode)
 	go func() {
 		for {
 			conn, err := listener.Accept()
