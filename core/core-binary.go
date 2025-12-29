@@ -1,5 +1,5 @@
-// core/core-binary.go (v19.7 - Final Verified & Compiled Edition)
-// [最终修正] 基于编译错误截图，对 V2Ray v5 API 进行外科手术式修正 (Final API Fix based on Build Error)
+// core/core-binary.go (v19.8 - Protobuf Native Edition)
+// [架构重构] 移除所有 V2Ray 不稳定的内部加载器依赖，改用原生 Protobuf 解析 (Zero Internal Dependency)
 // [状态] 完整无省略版, 生产级可用
 
 //go:build binary
@@ -33,10 +33,9 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	// [FINAL & VERIFIED] 针对编译错误的最终正确 import 路径
-	"github.com/v2fly/v2ray-core/v5/app/router"
+	// [FINAL & STABLE] 只依赖核心数据结构定义，不依赖任何不稳定的内部实现
 	"github.com/v2fly/v2ray-core/v5/app/router/routercommon"
-	"github.com/v2fly/v2ray-core/v5/common/platform/asset"
+	"google.golang.org/protobuf/proto"
 )
 
 var globalRRIndex uint64
@@ -92,7 +91,7 @@ var (
 	globalConfig     Config
 	proxySettingsMap = make(map[string]ProxySettings)
 	routingMap       []Rule
-	// [FINAL & VERIFIED] 使用 routercommon.Domain 作为类型
+	// [STABLE] 使用 routercommon.Domain
 	geositeMatcher map[string][]*routercommon.Domain
 	geodataMutex   sync.RWMutex
 )
@@ -107,28 +106,53 @@ func checkFileDependency(filename string) bool {
 	return !info.IsDir()
 }
 
-// [FINAL & VERIFIED] 使用 asset.Open 和 router.UnmarshalGeosite 加载数据
+// [STABLE] 原生加载逻辑：os.ReadFile + proto.Unmarshal
+// 不再依赖 v2ray 内部随时会变的 asset/platform 包
 func loadGeodata() {
-	rawBytes, err := asset.Open("geosite.dat")
+	// 1. 直接读取文件
+	rawBytes, err := os.ReadFile("geosite.dat")
 	if err != nil {
+		// 文件不存在，由外部检查逻辑处理提示，这里直接返回
 		return
 	}
-	defer rawBytes.Close()
 
-	var geositeList router.GeoSiteList
-	if err := json.NewDecoder(rawBytes).Decode(&geositeList); err != nil {
-		log.Printf("[Core] [依赖检查] 错误: 解析 geosite.dat 失败! 'geosite:' 规则将无法使用. 错误: %v", err)
+	// 2. 解析 Protobuf 数据
+	var geositeList routercommon.GeoSiteList
+	if err := proto.Unmarshal(rawBytes, &geositeList); err != nil {
+		log.Printf("[Core] [依赖检查] 错误: 解析 geosite.dat 失败! 文件可能损坏或版本不兼容. 错误: %v", err)
 		return
 	}
 
 	geodataMutex.Lock()
 	defer geodataMutex.Unlock()
 
+	// 3. 构建索引 Map
 	matcher := make(map[string][]*routercommon.Domain)
 	for _, site := range geositeList.Entry {
 		matcher[strings.ToLower(site.CountryCode)] = site.Domain
 	}
 	geositeMatcher = matcher
+}
+
+// [STABLE] 手写匹配逻辑，完全掌控，不依赖外部
+func matchDomainRule(domain string, rule *routercommon.Domain) bool {
+	switch rule.Type {
+	case routercommon.Domain_Plain:
+		return strings.Contains(domain, rule.Value)
+	case routercommon.Domain_Regex:
+		// 注意：实际生产中应预编译 Regex，这里为了简化依赖直接匹配
+		// 如果追求极致性能，可以在加载时预编译
+		matched, _ := regexp.MatchString(rule.Value, domain)
+		return matched
+	case routercommon.Domain_Domain:
+		// 域名匹配：是该域名本身，或者是其子域名
+		return domain == rule.Value || strings.HasSuffix(domain, "."+rule.Value)
+	case routercommon.Domain_Full:
+		// 完全匹配
+		return domain == rule.Value
+	default:
+		return false
+	}
 }
 
 func isDomainInGeosite(domain, geositeCategory string) bool {
@@ -137,12 +161,15 @@ func isDomainInGeosite(domain, geositeCategory string) bool {
 	if geositeMatcher == nil {
 		return false
 	}
+	
 	matchers, found := geositeMatcher[strings.ToLower(geositeCategory)]
 	if !found {
 		return false
 	}
+
+	// 遍历该分类下的所有规则进行匹配
 	for _, matcher := range matchers {
-		if matcher.Match(domain) {
+		if matchDomainRule(domain, matcher) {
 			return true
 		}
 	}
@@ -431,7 +458,7 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 			mode += fmt.Sprintf(" + %d Rules", len(routingMap))
 		}
 	}
-	log.Printf("[Core] Xlink Observer Engine (v19.7) Listening on %s [%s]", inbound.Listen, mode)
+	log.Printf("[Core] Xlink Observer Engine (v19.8) Listening on %s [%s]", inbound.Listen, mode)
 	go func() {
 		for {
 			conn, err := listener.Accept()
