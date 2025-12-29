@@ -33,10 +33,10 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	// [PRODUCTION GEODATA] Import official V2Ray/Xray libraries for geodata handling
-	"v2ray.com/core/app/router"
-	"v2ray.com/core/infra/conf/geodata"
-	"v2ray.com/core/infra/geodata/standard"
+	// [PRODUCTION GEODATA] [FIXED] 使用 v5 的官方模块路径
+	"github.com/v2fly/v2ray-core/v5/app/router"
+	"github.com/v2fly/v2ray-core/v5/infra/conf/geodata"
+	"github.com/v2fly/v2ray-core/v5/infra/geodata/standard"
 )
 
 var globalRRIndex uint64
