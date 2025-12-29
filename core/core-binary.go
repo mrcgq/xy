@@ -1,5 +1,5 @@
-// core-binary.go (v19.3 - Dependency Aware Edition)
-// [升级] 启动时主动检查 xray.exe, geosite.dat, geoip.dat 依赖并打印日志 (Dependency Check)
+// core/core-binary.go (v19.4 - V2Ray v5 API-Compliant Edition)
+// [升级] 全面适配 V2Ray v5.42.0+ 的 Geodata API 变更 (V2Ray v5 API Compliance)
 // [状态] 完整无省略版, 生产级可用
 
 //go:build binary
@@ -22,7 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os" // [DEPENDENCY CHECK] Added for file checks
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -33,10 +33,9 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	// [PRODUCTION GEODATA] [FIXED] 使用 v5 的官方模块路径
+	// [V2RAY V5 API-COMPLIANT] [FIXED] 使用 V2Ray v5 最新API的模块路径
 	"github.com/v2fly/v2ray-core/v5/app/router"
-	"github.com/v2fly/v2ray-core/v5/infra/conf/geodata"
-	"github.com/v2fly/v2ray-core/v5/infra/geodata/standard"
+	"github.com/v2fly/v2ray-core/v5/features/asset"
 )
 
 var globalRRIndex uint64
@@ -58,7 +57,7 @@ const (
 	MatchTypeDomain
 	MatchTypeRegex
 	MatchTypeGeosite
-	MatchTypeGeoIP // For future use
+	MatchTypeGeoIP
 )
 
 type Rule struct {
@@ -93,13 +92,11 @@ var (
 	proxySettingsMap = make(map[string]ProxySettings)
 	routingMap       []Rule
 	geositeMatcher   map[string][]*router.Domain
-	geodataLoader    geodata.Loader
 	geodataMutex     sync.RWMutex
 )
 
 var bufPool = sync.Pool{New: func() interface{} { return make([]byte, 32*1024) }}
 
-// [DEPENDENCY CHECK] New helper function to check for file existence
 func checkFileDependency(filename string) bool {
 	info, err := os.Stat(filename)
 	if os.IsNotExist(err) {
@@ -108,50 +105,47 @@ func checkFileDependency(filename string) bool {
 	return !info.IsDir()
 }
 
+// [V2RAY V5 API-COMPLIANT] [FIXED] 使用最新的 asset.Open API 加载 geosite.dat
 func loadGeodata() {
-	var err error
-	geodataLoader, err = standard.NewLoader()
-	if err != nil {
-		log.Printf("[Core] [依赖检查] 错误: 创建 geodata 加载器失败: %v", err)
-		return
-	}
-
-	rawBytes, err := geodataLoader.LoadGeosite("geosite.dat")
+	rawBytes, err := asset.Open("geosite.dat")
 	if err != nil {
 		// This warning is already handled by the main dependency check, so we can keep it simple.
+		return
+	}
+	defer rawBytes.Close()
+
+	geositeList, err := router.UnmarshalGeosite(rawBytes)
+	if err != nil {
+		log.Printf("[Core] [依赖检查] 错误: 解析 geosite.dat 失败! 'geosite:' 规则将无法使用. 错误: %v", err)
 		return
 	}
 
 	geodataMutex.Lock()
 	defer geodataMutex.Unlock()
-	geositeMatcher, err = geodataLoader.ParseGeosite(rawBytes)
-	if err != nil {
-		log.Printf("[Core] [依赖检查] 错误: 解析 geosite.dat 失败! 'geosite:' 规则将无法使用. 错误: %v", err)
-		geositeMatcher = nil
-		return
+
+	// 将解析出的列表转换为 map 以便快速查找
+	matcher := make(map[string][]*router.Domain)
+	for _, site := range geositeList {
+		matcher[strings.ToLower(site.CountryCode)] = site.Domain
 	}
-	// The success log is now handled in StartInstance for a unified report.
+	geositeMatcher = matcher
 }
 
 func isDomainInGeosite(domain, geositeCategory string) bool {
 	geodataMutex.RLock()
 	defer geodataMutex.RUnlock()
-
 	if geositeMatcher == nil {
 		return false
 	}
-
 	matchers, found := geositeMatcher[strings.ToLower(geositeCategory)]
 	if !found {
 		return false
 	}
-
 	for _, matcher := range matchers {
 		if matcher.Match(domain) {
 			return true
 		}
 	}
-
 	return false
 }
 
@@ -390,7 +384,6 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 	proxySettingsMap = make(map[string]ProxySettings)
 	routingMap = nil
 
-	// [DEPENDENCY CHECK] Perform all dependency checks at the beginning
 	log.Println("[Core] [依赖检查] 正在检查系统依赖...")
 	if checkFileDependency("xray.exe") {
 		log.Println("[Core] [依赖检查] ✅ xray.exe 匹配成功! [智能分流] 模式可用。")
@@ -400,7 +393,7 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 
 	if checkFileDependency("geosite.dat") {
 		log.Println("[Core] [依赖检查] ✅ geosite.dat 匹配成功! 内核 [geosite:] 规则已激活。")
-		loadGeodata() // Load the data only if the file exists
+		loadGeodata()
 	} else {
 		log.Println("[Core] [依赖检查] ⚠️ geosite.dat 未找到! 内核 [geosite:] 规则将无法使用。")
 	}
@@ -438,7 +431,7 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 			mode += fmt.Sprintf(" + %d Rules", len(routingMap))
 		}
 	}
-	log.Printf("[Core] Xlink Observer Engine (v19.3) Listening on %s [%s]", inbound.Listen, mode)
+	log.Printf("[Core] Xlink Observer Engine (v19.4) Listening on %s [%s]", inbound.Listen, mode)
 	go func() {
 		for {
 			conn, err := listener.Accept()
@@ -518,7 +511,7 @@ func connectNanoTunnel(target, outboundTag string, payload []byte) (*websocket.C
 	}
 	socks5 := ""
 	if settings.ForwarderSettings != nil {
-		socks5 = settings.ForwarderSettings.S5Address
+		socks5 = settings.ForwarderSettings.Socks5Address
 	}
 	tryConnectOnce := func() (*websocket.Conn, error) {
 		var targetNode Node
