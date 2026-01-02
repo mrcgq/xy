@@ -33,7 +33,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.comcom/gorilla/websocket"
+	"github.com/gorilla/websocket"
 
 	"github.com/v2fly/v2ray-core/v5/app/router/routercommon"
 	"google.golang.org/protobuf/proto"
