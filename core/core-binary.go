@@ -6,7 +6,6 @@
 //go:build binary
 // +build binary
 
-
 package core // ★ 这才是正确的
 
 import (
@@ -397,6 +396,117 @@ func parseOutbounds() {
 		}
 	}
 }
+
+
+
+
+
+
+
+
+
+// ======================== 测速模块 ========================
+type TestResult struct {
+	Node  Node
+	Delay time.Duration
+	Error error
+}
+
+func pingNode(node Node, token string, globalIP string, results chan<- TestResult) {
+	startTime := time.Now()
+	backend := selectBackend(node.Backends, "")
+	if backend.IP == "" {
+		backend.IP = globalIP
+	}
+	conn, err := dialZeusWebSocket(node.Domain, backend, token)
+	if err != nil {
+		results <- TestResult{Node: node, Error: err}
+		return
+	}
+	conn.Close()
+	delay := time.Since(startTime)
+	results <- TestResult{Node: node, Delay: delay}
+}
+
+func RunSpeedTest(serverAddr, token, globalIP string) {
+	rawPool := strings.ReplaceAll(serverAddr, "\r\n", ";")
+	rawPool = strings.ReplaceAll(rawPool, "\n", ";")
+	nodeStrs := strings.Split(rawPool, ";")
+	var nodes []Node
+	for _, nodeStr := range nodeStrs {
+		if trimmed := strings.TrimSpace(nodeStr); trimmed != "" {
+			nodes = append(nodes, parseNode(trimmed))
+		}
+	}
+	if len(nodes) == 0 {
+		log.Println("No valid nodes found in server pool.")
+		return
+	}
+	var wg sync.WaitGroup
+	results := make(chan TestResult, len(nodes))
+	for _, node := range nodes {
+		wg.Add(1)
+		go func(n Node) {
+			defer wg.Done()
+			parts := strings.SplitN(token, "|", 2)
+			pingNode(n, parts[0], globalIP, results)
+		}(node)
+	}
+	wg.Wait()
+	close(results)
+	var successful, failed []TestResult
+	for res := range results {
+		if res.Error == nil {
+			successful = append(successful, res)
+		} else {
+			failed = append(failed, res)
+		}
+	}
+	sort.Slice(successful, func(i, j int) bool { return successful[i].Delay < successful[j].Delay })
+	fmt.Println("\nPing Test Report")
+	fmt.Println("\nSuccessful Nodes")
+	for i, res := range successful {
+		fmt.Printf("%d. %-40s | Delay: %v\n", i+1, formatNode(res.Node), res.Delay.Round(time.Millisecond))
+	}
+	if len(failed) > 0 {
+		fmt.Println("\nFailed Nodes")
+		for _, res := range failed {
+			fmt.Printf("- %-40s | Error: %v\n", formatNode(res.Node), res.Error)
+		}
+	}
+	fmt.Println("\n------------------------------------")
+}
+
+func formatNode(n Node) string {
+	res := n.Domain
+	if len(n.Backends) > 0 {
+		res += "#"
+		var backends []string
+		for _, b := range n.Backends {
+			bStr := b.IP
+			if b.Port != "" {
+				bStr += ":" + b.Port
+			}
+			if b.Weight > 1 {
+				bStr += "|" + strconv.Itoa(b.Weight)
+			}
+			backends = append(backends, bStr)
+		}
+		res += strings.Join(backends, ",")
+	}
+	return res
+}
+
+
+
+
+
+
+
+
+
+
+
 
 func StartInstance(configContent []byte) (net.Listener, error) {
 	rand.Seed(time.Now().UnixNano())
