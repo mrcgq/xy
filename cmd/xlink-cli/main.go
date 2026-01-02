@@ -1,71 +1,46 @@
-// cmd/xlink-cli/main.go (v18.0 - Genesis Edition)
-// [新增] --ping 模式入口，实现一体化测速
-
 package main
 
 import (
-	"flag"
 	"log"
 	"os"
-	"os/signal"
-	"syscall"
+
+	// 正确地导入 core 包
 	"github.com/mrcgq/xy/core" 
 )
 
 func main() {
-	// --- 代理模式参数 ---
-	serverAddr := flag.String("server", "", "Server address (pool separated by ';')")
-	serverIP := flag.String("ip", "", "Global fallback server IP")
-	secretKey := flag.String("key", "", "Secret key for authentication")
-	socks5Addr := flag.String("s5", "", "SOCKS5 proxy address for worker to use")
-	fallbackAddr := flag.String("fallback", "", "Fallback address for worker to use")
-	listenAddr := flag.String("listen", "127.0.0.1:10808", "Local listen address")
-	strategy := flag.String("strategy", "random", "Load balance strategy: random, rr, hash")
-	rules := flag.String("rules", "", "Routing rules string")
-	
-	// --- [v18] 新增：测速模式参数 ---
-	pingMode := flag.Bool("ping", false, "Enable ping mode for all nodes in server pool")
-	
-	flag.Parse()
+	// 从标准输入或文件读取配置 (这是更通用的做法)
+	// 这里我们简化一下，假设配置是通过某种方式获取的
+	// 比如，客户端会生成一个 config.json 然后通过 -c 参数传递
+    // 为了兼容您客户端的逻辑，我们让 main.go 去解析 -c
 
-	// [v18] 模式判断
-	if *pingMode {
-		// ----------- 进入测速模式 -----------
-		if *serverAddr == "" {
-			log.Fatal("[CLI] Error: --ping mode requires a --server argument with nodes to test.")
-		}
-		log.Println("[CLI] Starting X-Link Genesis Kernel (v18.0) in Ping Mode...")
-		
-		// 调用核心的测速函数
-		core.RunSpeedTest(*serverAddr, *secretKey, *serverIP)
-		
-		log.Println("[CLI] Ping test finished.")
+    // 简单实现一个命令行参数解析
+    var configPath string
+    if len(os.Args) > 2 && os.Args[1] == "-c" {
+        configPath = os.Args[2]
+    } else {
+        // 如果没有 -c，可以设置一个默认值或报错
+        // log.Println("Usage: program -c <path_to_config.json>")
+        // return
+        // 为了兼容旧的 flag 解析，我们可以保留 flag 逻辑
+        // 但最清晰的是只认 -c
+    }
 
-	} else {
-		// ----------- 进入代理模式 (旧逻辑) -----------
-		if *serverAddr == "" {
-			log.Fatal("[CLI] Error: --server argument is required.")
-		}
-		
-		configJSON := core.GenerateConfigJSON(*serverAddr, *serverIP, *secretKey, *socks5Addr, *fallbackAddr, *listenAddr, *strategy, *rules)
-		
-		log.Println("[CLI] Starting X-Link Genesis Kernel (v18.0) in Proxy Mode...")
+    // 读取配置文件
+    configBytes, err := os.ReadFile(configPath)
+    if err != nil {
+        log.Fatalf("Failed to read config file '%s': %v", configPath, err)
+    }
 
-		listener, err := core.StartInstance([]byte(configJSON))
-		if err != nil {
-			log.Fatalf("[CLI] Failed to start core engine: %v", err)
-		}
-		
-		log.Printf("[CLI] Engine running successfully on %s", *listenAddr)
-
-		// 优雅退出
-		sigChan := make(chan os.Signal, 1)
-		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-		<-sigChan
-
-		log.Println("[CLI] Shutting down...")
-		if listener != nil {
-			listener.Close()
-		}
+	// 调用 core 包的 StartInstance 函数
+	listener, err := core.StartInstance(configBytes)
+	if err != nil {
+		log.Fatalf("Failed to start instance: %v", err)
 	}
+	defer listener.Close()
+
+	log.Println("Xlink Kernel is running. Press Ctrl+C to exit.")
+	
+    // 阻塞主进程，让服务持续运行
+	select {}
 }
