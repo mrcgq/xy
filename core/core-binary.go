@@ -55,6 +55,12 @@ var disconnectDomainBlacklist = []string{
 	"stream",          // 各种视频流
 	"telesco.pe",      // Telegram CDN
 	"tdesktop.com",    // Telegram Desktop
+		// YouTube 全家桶
+	"youtube.com",     // ★★★ 新增：YouTube 主站
+	"googlevideo.com", // YouTube 视频流
+	"ytimg.com",       // YouTube 缩略图和静态资源
+    "youtu.be",        // YouTube 短链接
+	
 }
 
 // URL 后缀正则黑名单 (匹配这些后缀的，禁用主动断流)
