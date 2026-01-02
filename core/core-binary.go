@@ -50,21 +50,7 @@ const (
 
 // [v20.4 终极稳定] 扩大视频免疫范围，彻底解决 YouTube 转圈问题
 var disconnectDomainBlacklist = []string{
-	// YouTube 全家桶
-	"youtube.com",     // 主站
-	"googlevideo.com", // 视频流 CDN
-	"ytimg.com",       // 缩略图和静态资源
-    "youtu.be",        // 短链接
 
-	// 主流流媒体
-	"nflxvideo.net",   // Netflix
-	"vimeo.com",       // Vimeo
-    "live",            // 直播关键词
-    "stream",          // 视频流关键词
-
-    // App 长连接
-	"telesco.pe",      // Telegram CDN
-	"tdesktop.com",    // Telegram Desktop
 }
 
 var disconnectSuffixRegex = regexp.MustCompile(`(?i)\.(m3u8|mp4|flv|mkv|avi|mov|ts|webm)$`)
