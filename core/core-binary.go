@@ -50,35 +50,58 @@ const (
 
 // [v20.4 终极稳定] 扩大视频免疫范围，彻底解决 YouTube 转圈问题
 var disconnectDomainBlacklist = []string{
+	// YouTube 全家桶
+	"youtube.com",     // 主站
+	"googlevideo.com", // 视频流 CDN
+	"ytimg.com",       // 缩略图和静态资源
+    "youtu.be",        // 短链接
 
+	// 主流流媒体
+	"nflxvideo.net",   // Netflix
+	"vimeo.com",       // Vimeo
+    "live",            // 直播关键词
+    "stream",          // 视频流关键词
+
+    // App 长连接
+	"telesco.pe",      // Telegram CDN
+	"tdesktop.com",    // Telegram Desktop
 }
 
 var disconnectSuffixRegex = regexp.MustCompile(`(?i)\.(m3u8|mp4|flv|mkv|avi|mov|ts|webm)$`)
 
-// [v20.4 终极修正] 智能检查函数，先提取纯域名再匹配
+// [v20.5 终极稳健] 彻底修复因 IPv6 解析失败导致的黑名单失效问题
 func shouldDisableDisconnect(target string) bool {
-    // 1. [关键] 先分离出 Host (纯域名/IP)，去除端口影响
-    host, portStr, err := net.SplitHostPort(target)
-    if err != nil { // 如果分离失败 (可能没有端口)，则 target 本身就是 host
-        host = target
+    // ★★★ 核心修复：不再使用 net.SplitHostPort，改用更可靠的字符串查找 ★★★
+    
+    // 1. 先把 target 转为小写，统一处理
+    lowerTarget := strings.ToLower(target)
+    
+    // 2. 检查域名关键词黑名单
+    for _, keyword := range disconnectDomainBlacklist {
+        if strings.Contains(lowerTarget, keyword) {
+            return true
+        }
     }
-	host = strings.ToLower(host) // 全部转为小写，统一匹配
+    
+    // 3. 检查 URL 后缀 (正则)
+    if disconnectSuffixRegex.MatchString(lowerTarget) {
+        return true
+    }
 
-	// 2. 检查域名关键词黑名单
-	for _, keyword := range disconnectDomainBlacklist {
-		if strings.Contains(host, keyword) {
-			return true
-		}
-	}
-	// 3. 检查 URL 后缀 (正则)
-	if disconnectSuffixRegex.MatchString(host) {
-		return true
-	}
-	// 4. 检查端口 (保护非 Web 流量)
-	if portStr != "80" && portStr != "443" && portStr != "" {
-		return true 
-	}
-
+    // 4. 检查端口 (保护非 Web 流量)
+    // 同样使用字符串查找，避免 IPv6 解析问题
+    // 查找最后一个冒号
+    lastColon := strings.LastIndex(lowerTarget, ":")
+    if lastColon != -1 {
+        portStr := lowerTarget[lastColon+1:]
+        // 如果冒号后面不是纯数字（比如 IPv6 的一部分），则认为没有端口
+        if _, err := strconv.Atoi(portStr); err == nil {
+             if portStr != "80" && portStr != "443" {
+                return true
+            }
+        }
+    }
+    
 	return false
 }
 
