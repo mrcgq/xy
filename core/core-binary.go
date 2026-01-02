@@ -5,7 +5,7 @@
 //go:build binary
 // +build binary
 
-package main // ★ 改为 main 包以独立编译
+package core
 
 import (
 	"bufio"
