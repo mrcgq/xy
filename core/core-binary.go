@@ -131,17 +131,28 @@ func loadGeodata() {
 	geositeMatcher = matcher
 }
 
+// [API 兼容性修复] 适配 v2ray-core v5.x 的最新枚举值
 func matchDomainRule(domain string, rule *routercommon.Domain) bool {
 	switch rule.Type {
 	case routercommon.Domain_Plain:
+		// Plain 类型在新的 geosite.dat 中等同于 Substring
 		return strings.Contains(domain, rule.Value)
+	
 	case routercommon.Domain_Regex:
+		// 正则匹配
+		// 为了性能，建议在加载时预编译，但这里为了保持依赖纯净，直接匹配
 		matched, _ := regexp.MatchString(rule.Value, domain)
 		return matched
-	case routercommon.Domain_Domain:
+	
+	case routercommon.Domain_RootDomain: 
+        // ★★★ 核心修正：Domain 被更名为 RootDomain ★★★
+		// 匹配根域名及其所有子域名
 		return domain == rule.Value || strings.HasSuffix(domain, "."+rule.Value)
+	
 	case routercommon.Domain_Full:
+		// 完全匹配
 		return domain == rule.Value
+	
 	default:
 		return false
 	}
