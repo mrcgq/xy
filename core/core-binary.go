@@ -1,3 +1,5 @@
+
+
 // core/core-binary.go (v21.5 - Final Merged & Corrected)
 // [最终修复] 合并所有重复/缺失的函数，确保代码完整性
 // [状态] 完整无省略版, 生产级可用, 可直接编译
@@ -118,50 +120,51 @@ var (
 
 var bufPool = sync.Pool{New: func() interface{} { return make([]byte, 32*1024) }}
 
-// ======================== 主入口 (Main) ========================
+
+
+// ======================== 主入口 (Main) - JSON 通信专用版 ========================
 
 func main() {
+	// 1. 定义核心参数
 	configPath := flag.String("c", "", "Path to config file (JSON)")
-	listen := flag.String("listen", "", "Local listen address")
-	server := flag.String("server", "", "Server address (pool)")
-	serverIP := flag.String("ip", "", "Global fallback server IP")
-	key := flag.String("key", "", "Secret key")
-	s5 := flag.String("s5", "", "SOCKS5 proxy address")
-	fallback := flag.String("fallback", "", "Fallback address")
-	strategy := flag.String("strategy", "random", "Load balance strategy")
-	rules := flag.String("rules", "", "Routing rules")
-	keepAlive := flag.Bool("keepalive", false, "Enable global keep-alive")
+	
+	// 保留 ping 模式参数 (因为 ping 模式通常不走 JSON)
 	ping := flag.Bool("ping", false, "Ping mode")
+	server := flag.String("server", "", "Server address (pool) for ping")
+	key := flag.String("key", "", "Secret key for ping")
+	serverIP := flag.String("ip", "", "Global fallback server IP for ping")
+
 	flag.Parse()
 
+	// 2. 优先处理测速模式
 	if *ping {
+		if *server == "" || *key == "" {
+			log.Fatal("Ping mode requires -server and -key")
+		}
 		RunSpeedTest(*server, *key, *serverIP)
 		return
 	}
-    
-    var configBytes []byte; var err error
-    if *configPath != "" {
-        configBytes, err = os.ReadFile(*configPath)
-        if err != nil { log.Fatalf("Failed to read config file: %v", err) }
-    } else {
-        tokenVal := *key
-        if *fallback != "" { tokenVal = tokenVal + "|" + *fallback }
-        settings := ProxySettings{
-            Server: *server, ServerIP: *serverIP, Token: tokenVal, Strategy: *strategy,
-            Rules: *rules, GlobalKeepAlive: *keepAlive,
-        }
-        if *s5 != "" { settings.ForwarderSettings = &ProxyForwarderSettings{Socks5Address: *s5} }
-        settingsBytes, _ := json.Marshal(settings)
-        configStr := fmt.Sprintf(`{
-            "inbounds": [{"tag": "socks-in", "listen": "%s", "protocol": "socks"}],
-            "outbounds": [{"tag": "proxy", "protocol": "ech-proxy", "settings": %s}]
-        }`, *listen, string(settingsBytes))
-        configBytes = []byte(configStr)
-    }
 
+	// 3. 处理代理模式 (必须有配置文件)
+	if *configPath == "" {
+		log.Fatal("Config file path is required. Usage: -c config.json")
+	}
+
+	// 4. 读取配置文件
+	configBytes, err := os.ReadFile(*configPath)
+	if err != nil {
+		log.Fatalf("Failed to read config file: %v", err)
+	}
+
+	// 5. 启动内核
 	listener, err := StartInstance(configBytes)
-	if err != nil { log.Fatalf("Failed to start instance: %v", err) }
-	select {}
+	if err != nil {
+		log.Fatalf("Failed to start instance: %v", err)
+	}
+	
+	// 6. 阻塞主进程 (防止退出)
+	// 这一步至关重要！之前的代码可能漏了这里，导致 StartInstance 后主线程直接结束了
+	select {} 
 	_ = listener
 }
 
@@ -573,3 +576,6 @@ func sendNanoHeaderV2(wsConn *websocket.Conn, target string, payload []byte, s5 
 func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) { handshakeBuf := make([]byte, 2); io.ReadFull(conn, handshakeBuf); conn.Write([]byte{0x05, 0x00}); header := make([]byte, 4); io.ReadFull(conn, header); var host string; switch header[3] { case 1: b := make([]byte, 4); io.ReadFull(conn, b); host = net.IP(b).String(); case 3: b := make([]byte, 1); io.ReadFull(conn, b); d := make([]byte, b[0]); io.ReadFull(conn, d); host = string(d); case 4: b := make([]byte, 16); io.ReadFull(conn, b); host = net.IP(b).String() }; portBytes := make([]byte, 2); io.ReadFull(conn, portBytes); port := binary.BigEndian.Uint16(portBytes); return net.JoinHostPort(host, fmt.Sprintf("%d", port)), nil }
 func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) (string, []byte, int, error) { reader := bufio.NewReader(io.MultiReader(bytes.NewReader(initialData), conn)); req, err := http.ReadRequest(reader); if err != nil { return "", nil, 0, err }; target := req.Host; if !strings.Contains(target, ":") { if req.Method == "CONNECT" { target += ":443" } else { target += ":80" } }; if req.Method == "CONNECT" { return target, nil, 2, nil }; var buf bytes.Buffer; req.WriteProxy(&buf); return target, buf.Bytes(), 3, nil }
 func parseServerAddr(addr string) (host, port, path string, err error) { path = "/"; if idx := strings.Index(addr, "/"); idx != -1 { path, addr = addr[idx:], addr[:idx] }; host, port, err = net.SplitHostPort(addr); if err != nil { host, port, err = addr, "443", nil }; return }
+
+
+
