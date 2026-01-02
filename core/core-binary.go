@@ -236,41 +236,81 @@ func parseNode(nodeStr string) Node {
 	return n
 }
 
+// [v21.0 语法修复] 补全 if-else 链条的花括号
 func parseRules(pool []Node) {
-	if len(globalConfig.Outbounds) == 0 { return }
+	if len(globalConfig.Outbounds) == 0 {
+		return
+	}
 	var s ProxySettings
-	if err := json.Unmarshal(globalConfig.Outbounds[0].Settings, &s); err != nil { return }
-	if s.Rules == "" { return }
+	if err := json.Unmarshal(globalConfig.Outbounds[0].Settings, &s); err != nil {
+		return
+	}
+	if s.Rules == "" {
+		return
+	}
 
 	rawRules := strings.ReplaceAll(s.Rules, "\r", "")
 	lines := strings.Split(rawRules, "\n")
+
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") { continue }
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
 		parts := strings.Split(line, ",")
 		if len(parts) >= 2 {
 			keyword := strings.TrimSpace(parts[0])
 			rightSide := strings.TrimSpace(parts[1])
 			strategy := ""
-			if len(parts) >= 3 { strategy = strings.TrimSpace(parts[2]) }
+			if len(parts) >= 3 {
+				strategy = strings.TrimSpace(parts[2])
+			}
 			disconnectMode := MODE_AUTO
-			if strings.HasSuffix(rightSide, "|keep") { disconnectMode = MODE_KEEP; rightSide = strings.TrimSuffix(rightSide, "|keep") } 
-			else if strings.HasSuffix(rightSide, "|cut") { disconnectMode = MODE_CUT; rightSide = strings.TrimSuffix(rightSide, "|cut") }
+			if strings.HasSuffix(rightSide, "|keep") {
+				disconnectMode = MODE_KEEP
+				rightSide = strings.TrimSuffix(rightSide, "|keep")
+			} else if strings.HasSuffix(rightSide, "|cut") {
+				disconnectMode = MODE_CUT
+				rightSide = strings.TrimSuffix(rightSide, "|cut")
+			}
+			var ruleType int
+			var ruleValue string
+			var compiledRegex *regexp.Regexp
 			
-			var ruleType int; var ruleValue string; var compiledRegex *regexp.Regexp
-			if strings.HasPrefix(keyword, "regexp:") { ruleType, ruleValue = MatchTypeRegex, strings.TrimPrefix(keyword, "regexp:"); compiledRegex = regexp.MustCompile(ruleValue) } 
-			else if strings.HasPrefix(keyword, "domain:") { ruleType, ruleValue = MatchTypeDomain, strings.TrimPrefix(keyword, "domain:") } 
-			else if strings.HasPrefix(keyword, "geosite:") { ruleType, ruleValue = MatchTypeGeosite, strings.TrimPrefix(keyword, "geosite:") } 
-			else if strings.HasPrefix(keyword, "geoip:") { ruleType, ruleValue = MatchTypeGeoIP, strings.TrimPrefix(keyword, "geoip:") } 
-			else { ruleType, ruleValue = MatchTypeSubstring, keyword }
+			// ★★★ 核心修复：为 if-else 链条添加花括号 ★★★
+			if strings.HasPrefix(keyword, "regexp:") {
+				ruleType, ruleValue = MatchTypeRegex, strings.TrimPrefix(keyword, "regexp:")
+				compiledRegex = regexp.MustCompile(ruleValue)
+			} else if strings.HasPrefix(keyword, "domain:") {
+				ruleType, ruleValue = MatchTypeDomain, strings.TrimPrefix(keyword, "domain:")
+			} else if strings.HasPrefix(keyword, "geosite:") {
+				ruleType, ruleValue = MatchTypeGeosite, strings.TrimPrefix(keyword, "geosite:")
+			} else if strings.HasPrefix(keyword, "geoip:") {
+				ruleType, ruleValue = MatchTypeGeoIP, strings.TrimPrefix(keyword, "geoip:")
+			} else {
+				ruleType, ruleValue = MatchTypeSubstring, keyword
+			}
 
-			var foundNode Node; aliasFound := false
-			for _, pNode := range pool { if pNode.Domain == rightSide { foundNode, aliasFound = pNode, true; break } }
-			if !aliasFound { foundNode = parseNode(rightSide) }
+			var foundNode Node
+			aliasFound := false
+			for _, pNode := range pool {
+				if pNode.Domain == rightSide {
+					foundNode = pNode
+					aliasFound = true
+					break
+				}
+			}
+			if !aliasFound {
+				foundNode = parseNode(rightSide)
+			}
 			if keyword != "" {
 				routingMap = append(routingMap, Rule{
-					Type: ruleType, Value: ruleValue, CompiledRegex: compiledRegex,
-					Node: foundNode, Strategy: strategy, DisconnectMode: disconnectMode,
+					Type:           ruleType,
+					Value:          ruleValue,
+					CompiledRegex:  compiledRegex,
+					Node:           foundNode,
+					Strategy:       strategy,
+					DisconnectMode: disconnectMode,
 				})
 			}
 		}
