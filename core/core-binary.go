@@ -1,12 +1,11 @@
-// core/core-binary.go (v21.5 - Event-Driven Disconnection Edition)
-// [架构] 采用“事件驱动”主动断流模型：超时 + 阈值双重触发
-// [通信] 保持 StartInstance + JSON 配置的统一通信方式
+// core/core-binary.go (v21.5 - Final Cleaned)
+// [修复] 移除所有重复定义的函数 (StartInstance, RunSpeedTest)
 // [状态] 完整无省略版, 生产级可用, 可直接编译
 
 //go:build binary
 // +build binary
 
-package core // ★ 这才是正确的
+package main // ★ 改为 main 包以独立编译
 
 import (
 	"bufio"
@@ -144,7 +143,6 @@ var bufPool = sync.Pool{New: func() interface{} { return make([]byte, 32*1024) }
 func main() {
 	configPath := flag.String("c", "", "Path to config file (JSON)")
 	
-	// 为了兼容旧的命令行模式，保留所有旧的 flag，但不作为主要方式
 	listen := flag.String("listen", "", "Local listen address")
 	server := flag.String("server", "", "Server address (pool)")
 	serverIP := flag.String("ip", "", "Global fallback server IP")
@@ -172,7 +170,6 @@ func main() {
             log.Fatalf("Failed to read config file: %v", err)
         }
     } else {
-        // 如果没有 -c 参数，则回退到旧的命令行参数构建 JSON 的方式
         tokenVal := *key
         if *fallback != "" { tokenVal = tokenVal + "|" + *fallback }
         
@@ -397,15 +394,6 @@ func parseOutbounds() {
 	}
 }
 
-
-
-
-
-
-
-
-
-// ======================== 测速模块 ========================
 type TestResult struct {
 	Node  Node
 	Delay time.Duration
@@ -496,17 +484,6 @@ func formatNode(n Node) string {
 	}
 	return res
 }
-
-
-
-
-
-
-
-
-
-
-
 
 func StartInstance(configContent []byte) (net.Listener, error) {
 	rand.Seed(time.Now().UnixNano())
@@ -722,7 +699,6 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 	return finalConn, currentMode, finalErr
 }
 
-// [v21.5] 事件驱动型管道
 func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int) {
 	defer ws.Close()
 	defer local.Close()
@@ -863,4 +839,3 @@ func sendNanoHeaderV2(wsConn *websocket.Conn, target string, payload []byte, s5 
 func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) { handshakeBuf := make([]byte, 2); io.ReadFull(conn, handshakeBuf); conn.Write([]byte{0x05, 0x00}); header := make([]byte, 4); io.ReadFull(conn, header); var host string; switch header[3] { case 1: b := make([]byte, 4); io.ReadFull(conn, b); host = net.IP(b).String(); case 3: b := make([]byte, 1); io.ReadFull(conn, b); d := make([]byte, b[0]); io.ReadFull(conn, d); host = string(d); case 4: b := make([]byte, 16); io.ReadFull(conn, b); host = net.IP(b).String() }; portBytes := make([]byte, 2); io.ReadFull(conn, portBytes); port := binary.BigEndian.Uint16(portBytes); return net.JoinHostPort(host, fmt.Sprintf("%d", port)), nil }
 func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) (string, []byte, int, error) { reader := bufio.NewReader(io.MultiReader(bytes.NewReader(initialData), conn)); req, err := http.ReadRequest(reader); if err != nil { return "", nil, 0, err }; target := req.Host; if !strings.Contains(target, ":") { if req.Method == "CONNECT" { target += ":443" } else { target += ":80" } }; if req.Method == "CONNECT" { return target, nil, 2, nil }; var buf bytes.Buffer; req.WriteProxy(&buf); return target, buf.Bytes(), 3, nil }
 func parseServerAddr(addr string) (host, port, path string, err error) { path = "/"; if idx := strings.Index(addr, "/"); idx != -1 { path, addr = addr[idx:], addr[:idx] }; host, port, err = net.SplitHostPort(addr); if err != nil { host, port, err = addr, "443", nil }; return }
-func RunSpeedTest(serverAddr, token, globalIP string) { rawPool := strings.ReplaceAll(serverAddr, "\r\n", ";"); rawPool = strings.ReplaceAll(rawPool, "\n", ";"); nodeStrs := strings.Split(rawPool, ";"); var nodes []Node; for _, nodeStr := range nodeStrs { if trimmed := strings.TrimSpace(nodeStr); trimmed != "" { nodes = append(nodes, parseNode(trimmed)) } }; if len(nodes) == 0 { log.Println("No valid nodes found in server pool."); return }; var wg sync.WaitGroup; results := make(chan TestResult, len(nodes)); for _, node := range nodes { wg.Add(1); go func(n Node) { defer wg.Done(); parts := strings.SplitN(token, "|", 2); pingNode(n, parts[0], globalIP, results) }(node) }; wg.Wait(); close(results); var successful, failed []TestResult; for res := range results { if res.Error == nil { successful = append(successful, res) } else { failed = append(failed, res) } }; sort.Slice(successful, func(i, j int) bool { return successful[i].Delay < successful[j].Delay }); fmt.Println("\nPing Test Report"); fmt.Println("\nSuccessful Nodes"); for i, res := range successful { fmt.Printf("%d. %-40s | Delay: %v\n", i+1, formatNode(res.Node), res.Delay.Round(time.Millisecond)) }; if len(failed) > 0 { fmt.Println("\nFailed Nodes"); for _, res := range failed { fmt.Printf("- %-40s | Error: %v\n", formatNode(res.Node), res.Error) } }; fmt.Println("\n------------------------------------") }
