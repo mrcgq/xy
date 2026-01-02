@@ -1,4 +1,5 @@
 // core/core-binary.go (v21.0 - Trinity Defense Edition)
+// [修复] 补全漏掉的 "sort" 包导入
 // [架构] 实现“三级防御体系”：全局开关 -> 规则级策略 -> 智能算法
 // [状态] 完整无省略版, 生产级可用
 
@@ -24,6 +25,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort" // ★★★ 已补全 ★★★
 	"strconv"
 	"strings"
 	"sync"
@@ -113,14 +115,14 @@ type Rule struct {
 }
 
 type ProxySettings struct {
-	Server          string                  `json:"server"`
-	ServerIP        string                  `json:"server_ip"`
-	Token           string                  `json:"token"`
-	Strategy        string                  `json:"strategy"`
-	Rules           string                  `json:"rules"`
-	GlobalKeepAlive bool                    `json:"global_keep_alive"` // [v21.0] 全局沉浸模式开关
+	Server            string                  `json:"server"`
+	ServerIP          string                  `json:"server_ip"`
+	Token             string                  `json:"token"`
+	Strategy          string                  `json:"strategy"`
+	Rules             string                  `json:"rules"`
+	GlobalKeepAlive   bool                    `json:"global_keep_alive"` // [v21.0] 全局沉浸模式开关
 	ForwarderSettings *ProxyForwarderSettings `json:"proxy_settings,omitempty"`
-	NodePool        []Node                  `json:"-"`
+	NodePool          []Node                  `json:"-"`
 }
 
 type Config struct{ Inbounds []Inbound `json:"inbounds"`; Outbounds []Outbound `json:"outbounds"` }
