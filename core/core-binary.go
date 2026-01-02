@@ -40,52 +40,63 @@ import (
 )
 
 // ================== [v20.3.1 核心模块] 智能策略模块 ==================
+// ================== [v20.4 核心升级] 终极智能策略模块 ==================
 
 const (
 	ENABLE_PROACTIVE_DISCONNECT = true                // 全局开关
 	MAX_BYTES_PER_CONN          = 5 * 1024 * 1024     // 主动断流阈值: 5MB
+	ENABLE_STRATEGY_DEBUG_LOG   = false               // 设为 true 可开启详细的策略选择日志
 )
 
-// 域名关键词黑名单 (匹配这些词的域名，禁用主动断流)
+// [v20.4 终极稳定] 扩大视频免疫范围，彻底解决 YouTube 转圈问题
 var disconnectDomainBlacklist = []string{
-	"googlevideo.com", // YouTube/Google Play
+	// YouTube 全家桶
+	"youtube.com",     // 主站
+	"googlevideo.com", // 视频流 CDN
+	"ytimg.com",       // 缩略图和静态资源
+    "youtu.be",        // 短链接
+
+	// 主流流媒体
 	"nflxvideo.net",   // Netflix
 	"vimeo.com",       // Vimeo
-	"live",            // 各种直播流
-	"stream",          // 各种视频流
+    "live",            // 直播关键词
+    "stream",          // 视频流关键词
+
+    // App 长连接
 	"telesco.pe",      // Telegram CDN
 	"tdesktop.com",    // Telegram Desktop
-		// YouTube 全家桶
-	"youtube.com",     // ★★★ 新增：YouTube 主站
-	"googlevideo.com", // YouTube 视频流
-	"ytimg.com",       // YouTube 缩略图和静态资源
-    "youtu.be",        // YouTube 短链接
-	
 }
 
-// URL 后缀正则黑名单 (匹配这些后缀的，禁用主动断流)
 var disconnectSuffixRegex = regexp.MustCompile(`(?i)\.(m3u8|mp4|flv|mkv|avi|mov|ts|webm)$`)
 
-// 智能检查目标是否应禁用主动断流
+// [v20.4 终极修正] 智能检查函数，先提取纯域名再匹配
 func shouldDisableDisconnect(target string) bool {
-	// 1. 检查域名关键词
+    // 1. [关键] 先分离出 Host (纯域名/IP)，去除端口影响
+    host, portStr, err := net.SplitHostPort(target)
+    if err != nil { // 如果分离失败 (可能没有端口)，则 target 本身就是 host
+        host = target
+    }
+	host = strings.ToLower(host) // 全部转为小写，统一匹配
+
+	// 2. 检查域名关键词黑名单
 	for _, keyword := range disconnectDomainBlacklist {
-		if strings.Contains(target, keyword) {
+		if strings.Contains(host, keyword) {
 			return true
 		}
 	}
-	// 2. 检查 URL 后缀 (正则)
-	if disconnectSuffixRegex.MatchString(target) {
+	// 3. 检查 URL 后缀 (正则)
+	if disconnectSuffixRegex.MatchString(host) {
 		return true
 	}
-	// 3. 检查端口 (保护非 Web 流量)
-	_, portStr, _ := net.SplitHostPort(target)
-	if portStr != "80" && portStr != "443" {
-		return true // 对非 80/443 的未知长连接协议，默认禁用断流
+	// 4. 检查端口 (保护非 Web 流量)
+	if portStr != "80" && portStr != "443" && portStr != "" {
+		return true 
 	}
 
 	return false
 }
+
+// =================================================================
 
 // =================================================================
 
