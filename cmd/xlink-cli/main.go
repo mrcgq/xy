@@ -1,38 +1,48 @@
 package main
 
 import (
+	"flag"
 	"log"
 	"os"
 
-	// 正确地导入 core 包
-	"github.com/mrcgq/xy/core" 
+	"github.com/mrcgq/xy/core"
 )
 
 func main() {
-	// 从标准输入或文件读取配置 (这是更通用的做法)
-	// 这里我们简化一下，假设配置是通过某种方式获取的
-	// 比如，客户端会生成一个 config.json 然后通过 -c 参数传递
-    // 为了兼容您客户端的逻辑，我们让 main.go 去解析 -c
+	// 统一解析命令行参数
+	configPath := flag.String("c", "", "Path to config file (JSON)")
+	ping := flag.Bool("ping", false, "Enable ping mode")
+    // 保留旧的 flag 以便 ping 模式能获取参数
+	server := flag.String("server", "", "Server address for ping mode")
+	key := flag.String("key", "", "Secret key for ping mode")
+	ip := flag.String("ip", "", "Global IP for ping mode")
+	
+	flag.Parse()
 
-    // 简单实现一个命令行参数解析
-    var configPath string
-    if len(os.Args) > 2 && os.Args[1] == "-c" {
-        configPath = os.Args[2]
-    } else {
-        // 如果没有 -c，可以设置一个默认值或报错
-        // log.Println("Usage: program -c <path_to_config.json>")
-        // return
-        // 为了兼容旧的 flag 解析，我们可以保留 flag 逻辑
-        // 但最清晰的是只认 -c
-    }
+	// ★★★ 核心逻辑：根据 -ping 参数决定行为 ★★★
+	if *ping {
+		log.Println("Starting Ping Test Mode...")
+		// 确保 ping 模式有 server 和 key
+		if *server == "" || *key == "" {
+			log.Fatalf("Error: --server and --key are required for ping mode.")
+		}
+		core.RunSpeedTest(*server, *key, *ip)
+		return // 测速完成后直接退出
+	}
 
-    // 读取配置文件
-    configBytes, err := os.ReadFile(configPath)
-    if err != nil {
-        log.Fatalf("Failed to read config file '%s': %v", configPath, err)
-    }
+	// --- 默认的代理模式 ---
+	var configBytes []byte
+	var err error
 
-	// 调用 core 包的 StartInstance 函数
+	if *configPath != "" {
+		configBytes, err = os.ReadFile(*configPath)
+		if err != nil {
+			log.Fatalf("Failed to read config file '%s': %v", *configPath, err)
+		}
+	} else {
+		log.Fatalf("Error: Config file path is required. Use -c <path_to_config.json>")
+	}
+
 	listener, err := core.StartInstance(configBytes)
 	if err != nil {
 		log.Fatalf("Failed to start instance: %v", err)
@@ -40,7 +50,5 @@ func main() {
 	defer listener.Close()
 
 	log.Println("Xlink Kernel is running. Press Ctrl+C to exit.")
-	
-    // 阻塞主进程，让服务持续运行
 	select {}
 }
