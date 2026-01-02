@@ -6,7 +6,8 @@
 //go:build binary
 // +build binary
 
-package main // ★ 改为 main 包以独立编译
+
+package core // ★ 这才是正确的
 
 import (
 	"bufio"
