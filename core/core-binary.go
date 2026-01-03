@@ -100,7 +100,7 @@ type ProxySettings struct {
 	Token             string                  `json:"token"`
 	Strategy          string                  `json:"strategy"`
 	Rules             string                  `json:"rules"`
-	GlobalKeepAlive   bool                    `json:"global_keep_alive,omitempty"`
+	GlobalKeepAlive   bool                    `json:"global_keep_alive"` 
 	ForwarderSettings *ProxyForwarderSettings `json:"proxy_settings,omitempty"`
 	NodePool          []Node                  `json:"-"`
 }
@@ -411,7 +411,7 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 	return finalConn, currentMode, finalErr
 }
 
-// [v21.5 语法修复] 修正 pipeDirect 中的逻辑块
+// [v22.0 终极稳定] pipeDirect 函数，彻底移除 UnderlyingConn，统一协议流程
 func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int) {
 	defer ws.Close()
 	defer local.Close()
@@ -422,14 +422,9 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int) {
 	wg.Add(2)
 
 	var once sync.Once
-	closeConns := func() {
-		once.Do(func() {
-			ws.Close()
-			local.Close()
-		})
+	closeConns := func() { once.Do(func() { ws.Close(); local.Close(); }) }
 
-	}
-
+	// ★★★ 三级防御决策中心 ★★★
 	enableDisconnect := false
 	switch mode {
 	case MODE_KEEP:
@@ -448,125 +443,61 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int) {
 		}
 	}
 
-	if !enableDisconnect {
-        // ★★★ 核心修复：确保 io.Copy 运行在正确的 goroutine 中 ★★★
-		go func() {
-			defer wg.Done()
-			// 注意：这里使用 ws.UnderlyingConn() 是 v20.x 的一个优化，但为了保证协议正确性，我们应该避免它
-			// 为了编译通过且稳定，我们统一使用标准 WebSocket 读写
-			// io.Copy(ws.UnderlyingConn(), local) 
-			buf := bufPool.Get().([]byte)
-            defer bufPool.Put(buf)
-            io.CopyBuffer(ws.UnderlyingConn(), local, buf) // 暂时保留以通过编译，但注意其风险
-			closeConns()
-		}()
-		go func() {
-			defer wg.Done()
-			// io.Copy(local, ws.UnderlyingConn())
-            buf := bufPool.Get().([]byte)
-            defer bufPool.Put(buf)
-            io.CopyBuffer(local, ws.UnderlyingConn(), buf)
-			closeConns()
-		}()
-		wg.Wait()
-		return
-	}
-
-	// --- 事件驱动型管道 ---
-	resetTimer := make(chan bool, 1)
-
+	// Downlink: WS -> TCP (下行)
 	go func() {
 		defer wg.Done()
 		defer closeConns()
-		for {
-			ws.SetReadDeadline(time.Now().Add(180 * time.Second))
-			mt, r, err := ws.NextReader()
-			if err != nil {
-				return
-			}
-			if mt == websocket.BinaryMessage {
-				n, err := io.Copy(local, r)
-				if err != nil {
-					return
-				}
-				newDownBytes := atomic.AddInt64(&downBytes, n)
-				if newDownBytes > MAX_BYTES_PER_CONN {
-					log.Printf("[Core] [主动断流] %s 达到流量阈值，执行重置。", target)
-					return
-				}
-			}
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-		defer closeConns()
-		timer := time.NewTimer(time.Duration(NO_RESPONSE_TIMEOUT_MS) * time.Millisecond)
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-
-		// 启动一个独立的 goroutine 来管理 timer
-		go func() {
-			defer func() {
-				// 确保 timer 停止，防止泄露
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
-			}()
-			for {
-				select {
-				case <-timer.C:
-					log.Printf("[Core] [主动断流] %s 在发送后 %dms 内无响应，执行重置。", target, NO_RESPONSE_TIMEOUT_MS)
-					closeConns()
-					return
-				case _, ok := <-resetTimer:
-					if !ok {
-						return // 主 channel 关闭
-					}
-					if !timer.Stop() {
-						select {
-						case <-timer.C:
-						default:
-						}
-					}
-					timer.Reset(time.Duration(NO_RESPONSE_TIMEOUT_MS) * time.Millisecond)
-				}
-			}
-		}()
-
+		
 		buf := bufPool.Get().([]byte)
 		defer bufPool.Put(buf)
+		
 		for {
-			n, err := local.Read(buf)
-			if err != nil {
-				close(resetTimer)
-				return
-			}
-			if n > 0 {
-				atomic.AddInt64(&upBytes, int64(n))
-				if err := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
-					close(resetTimer)
+			// 下行保留超时，防止僵尸连接
+			ws.SetReadDeadline(time.Now().Add(180 * time.Second)) 
+			mt, r, err := ws.NextReader()
+			if err != nil { return }
+
+			if mt == websocket.BinaryMessage {
+				n, err := io.CopyBuffer(local, r, buf)
+				if err != nil { return }
+				
+				newDownBytes := atomic.AddInt64(&downBytes, n)
+				// 只有在启用时才检查阈值
+				if enableDisconnect && newDownBytes > MAX_BYTES_PER_CONN {
+					log.Printf("[Core] [主动断流] %s 达到 %.1f MB 阈值，主动重置。", target, float64(newDownBytes)/1024/1024)
 					return
 				}
-				// 非阻塞发送，防止 channel 满了卡住
-				select {
-				case resetTimer <- true:
-				default:
+			}
+		}
+	}() 
+
+	// Uplink: TCP -> WS (上行)
+	go func() {
+		defer wg.Done()
+		defer closeConns()
+		
+		buf := bufPool.Get().([]byte)
+		defer bufPool.Put(buf)
+
+		for {
+			// 上行不设超时
+			n, err := local.Read(buf)
+			if n > 0 {
+				atomic.AddInt64(&upBytes, int64(n))
+				// ★★★ 核心修正：永远使用标准的 WriteMessage ★★★
+				if err := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
+					return
 				}
 			}
+			if err != nil { return }
 		}
 	}()
 
 	wg.Wait()
 	duration := time.Since(startTime)
-	log.Printf("[Stats] %s | Up: %s | Down: %s | Time: %v", target, formatBytes(upBytes), formatBytes(downBytes), duration.Round(time.Second))
+	
+	log.Printf("[Stats] %s | Up: %s | Down: %s | Time: %v", 
+		target, formatBytes(upBytes), formatBytes(downBytes), duration.Round(time.Second))
 }
 
 func selectBackend(backends []Backend, key string) Backend { if len(backends) == 0 { return Backend{} }; if len(backends) == 1 { return backends[0] }; totalWeight := 0; for _, b := range backends { totalWeight += b.Weight }; h := md5.Sum([]byte(key)); hashVal := binary.BigEndian.Uint64(h[:8]); if totalWeight == 0 { return backends[int(hashVal%uint64(len(backends)))] }; targetVal := int(hashVal % uint64(totalWeight)); currentWeight := 0; for _, b := range backends { currentWeight += b.Weight; if targetVal < currentWeight { return b } }; return backends[0] }
@@ -576,6 +507,3 @@ func sendNanoHeaderV2(wsConn *websocket.Conn, target string, payload []byte, s5 
 func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) { handshakeBuf := make([]byte, 2); io.ReadFull(conn, handshakeBuf); conn.Write([]byte{0x05, 0x00}); header := make([]byte, 4); io.ReadFull(conn, header); var host string; switch header[3] { case 1: b := make([]byte, 4); io.ReadFull(conn, b); host = net.IP(b).String(); case 3: b := make([]byte, 1); io.ReadFull(conn, b); d := make([]byte, b[0]); io.ReadFull(conn, d); host = string(d); case 4: b := make([]byte, 16); io.ReadFull(conn, b); host = net.IP(b).String() }; portBytes := make([]byte, 2); io.ReadFull(conn, portBytes); port := binary.BigEndian.Uint16(portBytes); return net.JoinHostPort(host, fmt.Sprintf("%d", port)), nil }
 func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) (string, []byte, int, error) { reader := bufio.NewReader(io.MultiReader(bytes.NewReader(initialData), conn)); req, err := http.ReadRequest(reader); if err != nil { return "", nil, 0, err }; target := req.Host; if !strings.Contains(target, ":") { if req.Method == "CONNECT" { target += ":443" } else { target += ":80" } }; if req.Method == "CONNECT" { return target, nil, 2, nil }; var buf bytes.Buffer; req.WriteProxy(&buf); return target, buf.Bytes(), 3, nil }
 func parseServerAddr(addr string) (host, port, path string, err error) { path = "/"; if idx := strings.Index(addr, "/"); idx != -1 { path, addr = addr[idx:], addr[:idx] }; host, port, err = net.SplitHostPort(addr); if err != nil { host, port, err = addr, "443", nil }; return }
-
-
-
