@@ -1,5 +1,6 @@
 
 
+
 // core/core-binary.go (v21.5 - Final Merged & Corrected)
 // [最终修复] 合并所有重复/缺失的函数，确保代码完整性
 // [状态] 完整无省略版, 生产级可用, 可直接编译
@@ -101,6 +102,7 @@ type ProxySettings struct {
 	Strategy          string                  `json:"strategy"`
 	Rules             string                  `json:"rules"`
 	GlobalKeepAlive   bool                    `json:"global_keep_alive"` 
+	  S5                string                  `json:"s5,omitempty"` 
 	ForwarderSettings *ProxyForwarderSettings `json:"proxy_settings,omitempty"`
 	NodePool          []Node                  `json:"-"`
 }
@@ -377,37 +379,113 @@ func match(rule Rule, target string) bool {
 	}
 }
 
+// [v21.6 修正] connectNanoTunnel：修复 SOCKS5 参数传递逻辑
 func connectNanoTunnel(target string, outboundTag string, payload []byte) (*websocket.Conn, int, error) {
-	settings, ok := proxySettingsMap[outboundTag]; if !ok { return nil, MODE_AUTO, errors.New("settings not found") }
-	currentMode := MODE_AUTO; if settings.GlobalKeepAlive { currentMode = MODE_KEEP }
-	parts := strings.SplitN(settings.Token, "|", 2); secretKey := parts[0]; fallback := ""; if len(parts) > 1 { fallback = parts[1] }
-	socks5 := ""; if settings.ForwarderSettings != nil { socks5 = settings.ForwarderSettings.Socks5Address }
-	var finalConn *websocket.Conn; var finalErr error
+	settings, ok := proxySettingsMap[outboundTag]
+	if !ok {
+		return nil, MODE_AUTO, errors.New("settings not found")
+	}
+	
+	currentMode := MODE_AUTO
+	if settings.GlobalKeepAlive {
+		currentMode = MODE_KEEP
+	}
+
+	parts := strings.SplitN(settings.Token, "|", 2)
+	secretKey := parts[0]
+	fallback := ""
+	if len(parts) > 1 {
+		fallback = parts[1]
+	}
+
+	// ===================== ★★★ 核心修复在这里 ★★★ =====================
+	// 优先从 settings 直接读取 S5 字段，这是客户端 v21.x 传递的方式
+	socks5 := settings.S5 
+	// 兼容旧的 ForwarderSettings 结构 (如果存在)
+	if socks5 == "" && settings.ForwarderSettings != nil {
+		socks5 = settings.ForwarderSettings.Socks5Address
+	}
+	// =================================================================
+
+	var finalConn *websocket.Conn
+	var finalErr error
+
 	tryConnectOnce := func() error {
-		var targetNode Node; var logMsg string; var finalStrategy string; ruleHit := false
+		var targetNode Node
+		var logMsg string
+		var finalStrategy string
+		ruleHit := false
+		
 		for _, rule := range routingMap {
 			if match(rule, target) {
-				targetNode = rule.Node; finalStrategy = rule.Strategy; if finalStrategy == "" { finalStrategy = settings.Strategy }
-				if !settings.GlobalKeepAlive { currentMode = rule.DisconnectMode }
-				logMsg = fmt.Sprintf("[Core] Rule Hit -> %s | SNI: %s (Rule: %s, Algo: %s)", target, targetNode.Domain, rule.Value, finalStrategy); ruleHit = true; break
+				targetNode = rule.Node
+				finalStrategy = rule.Strategy
+				if finalStrategy == "" {
+					finalStrategy = settings.Strategy
+				}
+				if !settings.GlobalKeepAlive {
+					currentMode = rule.DisconnectMode
+				}
+				logMsg = fmt.Sprintf("[Core] Rule Hit -> %s | SNI: %s (Rule: %s, Algo: %s)", target, targetNode.Domain, rule.Value, finalStrategy)
+				ruleHit = true
+				break
 			}
 		}
+
 		if !ruleHit {
 			if len(settings.NodePool) > 0 {
-				finalStrategy = settings.Strategy; switch finalStrategy {
-				case "rr": idx := atomic.AddUint64(&globalRRIndex, 1); targetNode = settings.NodePool[idx%uint64(len(settings.NodePool))]
-				case "hash": h := md5.Sum([]byte(target)); hashVal := binary.BigEndian.Uint64(h[:8]); targetNode = settings.NodePool[hashVal%uint64(len(settings.NodePool))]
-				default: targetNode = settings.NodePool[rand.Intn(len(settings.NodePool))] }
+				finalStrategy = settings.Strategy
+				switch finalStrategy {
+				case "rr":
+					idx := atomic.AddUint64(&globalRRIndex, 1)
+					targetNode = settings.NodePool[idx%uint64(len(settings.NodePool))]
+				case "hash":
+					h := md5.Sum([]byte(target))
+					hashVal := binary.BigEndian.Uint64(h[:8])
+					targetNode = settings.NodePool[hashVal%uint64(len(settings.NodePool))]
+				default:
+					targetNode = settings.NodePool[rand.Intn(len(settings.NodePool))]
+				}
 				logMsg = fmt.Sprintf("[Core] LB -> %s | SNI: %s | Algo: %s", target, targetNode.Domain, finalStrategy)
-			} else { return errors.New("no nodes configured in pool") }
+			} else {
+				return errors.New("no nodes configured in pool")
+			}
 		}
-		log.Print(logMsg); backend := selectBackend(targetNode.Backends, target); if backend.IP == "" { backend.IP = settings.ServerIP }
-		start := time.Now(); wsConn, err := dialZeusWebSocket(targetNode.Domain, backend, secretKey); latency := time.Since(start).Milliseconds()
-		if err != nil { return err }; if backend.IP != "" { log.Printf("[Core] Tunnel -> %s (SNI) >>> %s:%s (Real) | Latency: %dms", targetNode.Domain, backend.IP, backend.Port, latency) }
-		err = sendNanoHeaderV2(wsConn, target, payload, socks5, fallback); if err != nil { wsConn.Close(); return err }
-		finalConn = wsConn; return nil
+
+		log.Print(logMsg)
+		backend := selectBackend(targetNode.Backends, target)
+		if backend.IP == "" {
+			backend.IP = settings.ServerIP
+		}
+
+		start := time.Now()
+		wsConn, err := dialZeusWebSocket(targetNode.Domain, backend, secretKey)
+		latency := time.Since(start).Milliseconds()
+		
+		if err != nil {
+			return err
+		}
+		
+		if backend.IP != "" {
+			log.Printf("[Core] Tunnel -> %s (SNI) >>> %s:%s (Real) | Latency: %dms", targetNode.Domain, backend.IP, backend.Port, latency)
+		}
+		
+		// 将正确获取到的 socks5 变量传递给打包函数
+		err = sendNanoHeaderV2(wsConn, target, payload, socks5, fallback)
+		if err != nil {
+			wsConn.Close()
+			return err
+		}
+		finalConn = wsConn
+		return nil
 	}
-	finalErr = tryConnectOnce(); if finalErr != nil && len(settings.NodePool) > 1 { log.Printf("[Core] Connect failed: %v. Retry...", finalErr); finalErr = tryConnectOnce() }
+
+	finalErr = tryConnectOnce()
+	if finalErr != nil && len(settings.NodePool) > 1 {
+		log.Printf("[Core] Connect failed: %v. Retry...", finalErr)
+		finalErr = tryConnectOnce()
+	}
+	
 	return finalConn, currentMode, finalErr
 }
 
@@ -507,3 +585,10 @@ func sendNanoHeaderV2(wsConn *websocket.Conn, target string, payload []byte, s5 
 func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) { handshakeBuf := make([]byte, 2); io.ReadFull(conn, handshakeBuf); conn.Write([]byte{0x05, 0x00}); header := make([]byte, 4); io.ReadFull(conn, header); var host string; switch header[3] { case 1: b := make([]byte, 4); io.ReadFull(conn, b); host = net.IP(b).String(); case 3: b := make([]byte, 1); io.ReadFull(conn, b); d := make([]byte, b[0]); io.ReadFull(conn, d); host = string(d); case 4: b := make([]byte, 16); io.ReadFull(conn, b); host = net.IP(b).String() }; portBytes := make([]byte, 2); io.ReadFull(conn, portBytes); port := binary.BigEndian.Uint16(portBytes); return net.JoinHostPort(host, fmt.Sprintf("%d", port)), nil }
 func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) (string, []byte, int, error) { reader := bufio.NewReader(io.MultiReader(bytes.NewReader(initialData), conn)); req, err := http.ReadRequest(reader); if err != nil { return "", nil, 0, err }; target := req.Host; if !strings.Contains(target, ":") { if req.Method == "CONNECT" { target += ":443" } else { target += ":80" } }; if req.Method == "CONNECT" { return target, nil, 2, nil }; var buf bytes.Buffer; req.WriteProxy(&buf); return target, buf.Bytes(), 3, nil }
 func parseServerAddr(addr string) (host, port, path string, err error) { path = "/"; if idx := strings.Index(addr, "/"); idx != -1 { path, addr = addr[idx:], addr[:idx] }; host, port, err = net.SplitHostPort(addr); if err != nil { host, port, err = addr, "443", nil }; return }
+
+
+
+
+
+
+
