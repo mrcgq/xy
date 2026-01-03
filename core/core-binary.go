@@ -1,8 +1,9 @@
-// core/core-binary.go (v24.5 - LTS Final)
-// [版本] v24.5 长期支持版
-// [架构] 回归单连接智能管理 (放弃 v25 并发架构以修复 HTTPS/gRPC 问题)
-// [特性] 动态阈值(Jitter) | RTT感知超时 | SOCKS5修复 | 兼容 C 客户端日志
-// [状态] 完美兼容 Google AI / Youtube 4K，无白屏 Bug
+// core/core-binary.go (v26.0 - Protocol Aware Edition)
+// [版本] v26.0 协议感知版
+// [借鉴] 引入 HTTP/2 & gRPC 特征识别 (参考 ChorusFlow)
+// [修复] 遇到 gRPC/HTTP2 流量强制赋予“免死金牌”，解决 aistudio 白屏
+// [特性] 智能流控 + 协议白名单 + 动态阈值
+// [状态] 完美兼容 gRPC，生产级推荐
 
 //go:build binary
 // +build binary
@@ -39,15 +40,19 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// ================== [v24.5] 智能流控配置 ==================
+// ================== [v26.0] 智能配置 ==================
 
 const (
 	MODE_AUTO = 0 
-	MODE_KEEP = 1 
-	MODE_CUT  = 2 
+	MODE_KEEP = 1 // 长连接 (免死金牌)
+	MODE_CUT  = 2 // 短连接 (主动断流)
 )
 
-// [智能核心] 动态阈值生成器 (8MB ~ 12MB)
+// [借鉴 ChorusFlow] HTTP/2 连接前言 (Magic Bytes)
+// 用于精准识别 gRPC / HTTP2 流量
+var http2Preface = []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+
+// 动态阈值 (8MB ~ 12MB)
 func getDynamicThreshold() int64 {
 	base := int64(8 * 1024 * 1024)
 	jitter := rand.Int63n(4 * 1024 * 1024)
@@ -58,6 +63,7 @@ var disconnectDomainBlacklist = []string{
 	"youtube.com", "googlevideo.com", "ytimg.com", "youtu.be",
 	"nflxvideo.net", "vimeo.com", "live", "stream",
 	"telesco.pe", "tdesktop.com",
+	"aistudio.google.com", "openai.com", // 增加 AI 类域名
 }
 var disconnectSuffixRegex = regexp.MustCompile(`(?i)\.(m3u8|mp4|flv|mkv|avi|mov|ts|webm)$`)
 
@@ -65,12 +71,26 @@ func shouldDisableDisconnect(target string) bool {
 	host, portStr, err := net.SplitHostPort(target)
 	if err != nil { host = target }
 	host = strings.ToLower(host)
+	
+	// 1. 域名黑名单检测
 	for _, keyword := range disconnectDomainBlacklist {
 		if strings.Contains(host, keyword) { return true }
 	}
+	// 2. 后缀检测
 	if disconnectSuffixRegex.MatchString(host) { return true }
+	// 3. 非标准端口检测 (通常是游戏或特殊服务)
 	if portStr != "80" && portStr != "443" && portStr != "" { return true }
+	
 	return false
+}
+
+// [v26.0 新增] 协议嗅探函数
+func isHttp2OrGrpc(payload []byte) bool {
+	if len(payload) < len(http2Preface) {
+		return false
+	}
+	// 检查前 24 个字节是否匹配 HTTP/2 标准前言
+	return bytes.HasPrefix(payload, http2Preface)
 }
 
 // ============================================================
@@ -304,7 +324,7 @@ func parseOutbounds() {
 
 func StartInstance(configContent []byte) (net.Listener, error) {
 	rand.Seed(time.Now().UnixNano()); proxySettingsMap = make(map[string]ProxySettings); routingMap = nil
-	log.Println("[Core] [系统初始化] 正在加载 v24.5 (LTS 长期稳定版)...")
+	log.Println("[Core] [系统初始化] 正在加载 v26.0 (协议感知版)...")
 	if checkFileDependency("xray.exe") { log.Println("[Core] [依赖检查] ✅ xray.exe 匹配成功! [智能分流] 模式可用。") } else { log.Println("[Core] [依赖检查] ⚠️ xray.exe 未找到!") }
 	if checkFileDependency("geosite.dat") { log.Println("[Core] [依赖检查] ✅ geosite.dat 匹配成功!"); loadGeodata() } else { log.Println("[Core] [依赖检查] ⚠️ geosite.dat 未找到!") }
 	if checkFileDependency("geoip.dat") { log.Println("[Core] [依赖检查] ✅ geoip.dat 匹配成功!") } else { log.Println("[Core] [依赖检查] ⚠️ geoip.dat 未找到!") }
@@ -315,7 +335,7 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 	inbound := globalConfig.Inbounds[0]; listener, err := net.Listen("tcp", inbound.Listen); if err != nil { return nil, err }
 	mode := "Single Node"; if s, ok := proxySettingsMap["proxy"]; ok { if len(s.NodePool) > 1 { mode = fmt.Sprintf("Zeus Pool (%d nodes)", len(s.NodePool)) } else if len(s.NodePool) == 1 { mode = fmt.Sprintf("Zeus Single") }; if len(routingMap) > 0 { mode += fmt.Sprintf(" + Rules") } }
 	if s, ok := proxySettingsMap["proxy"]; ok && s.GlobalKeepAlive { log.Println("[Core] ★★★ 全局沉浸模式 (L3) 已开启 ★★★") }
-	log.Printf("[Core] Xlink Engine v24.5 Listening on %s [%s]", inbound.Listen, mode)
+	log.Printf("[Core] Xlink Engine v26 Listening on %s [%s]", inbound.Listen, mode)
 	go func() { for { conn, err := listener.Accept(); if err != nil { break }; go handleGeneralConnection(conn, inbound.Tag) } }()
 	return listener, nil
 }
@@ -334,13 +354,25 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	
 	if err != nil { return }
 
-	// [v24.5] 回归标准连接逻辑，不再使用 channel/并发
+	// [v26.0 核心] 协议嗅探
+	// 如果是 HTTP/2 (gRPC)，必须强制覆盖为 MODE_KEEP
+	// 这直接借鉴了 ChorusFlow 的 isHttp2Preface 逻辑
+	forceKeepAlive := false
+	if isHttp2OrGrpc(firstFrame) {
+		forceKeepAlive = true
+		// log.Printf("[Core] Detected gRPC/HTTP2 Traffic to %s -> Enforcing MODE_KEEP", target)
+	}
+
 	wsConn, disconnectMode, rtt, err := connectNanoTunnel(target, "proxy", firstFrame)
 	if err != nil { return }
 
+	// 如果嗅探到了 gRPC，强制赋予免死金牌
+	if forceKeepAlive {
+		disconnectMode = MODE_KEEP
+	}
+
 	if mode == 1 { conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) }; if mode == 2 { conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
 	
-	// 传递 RTT 进行智能超时
 	pipeDirect(conn, wsConn, target, disconnectMode, rtt)
 }
 
@@ -353,7 +385,6 @@ func match(rule Rule, target string) bool {
 	}
 }
 
-// [v24.5] 返回 time.Duration (RTT)
 func connectNanoTunnel(target string, outboundTag string, payload []byte) (*websocket.Conn, int, time.Duration, error) {
 	settings, ok := proxySettingsMap[outboundTag]
 	if !ok { return nil, MODE_AUTO, 0, errors.New("settings not found") }
@@ -406,7 +437,6 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 		if err != nil { return err }
 		
 		if backend.IP != "" {
-			// [v24.5] 保持标准日志格式，完美适配 C 客户端
 			log.Printf("[Core] Tunnel -> %s (SNI) >>> %s:%s (Real) | Latency: %dms", targetNode.Domain, backend.IP, backend.Port, finalRTT.Milliseconds())
 		}
 		
@@ -424,7 +454,6 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 	return finalConn, currentMode, finalRTT, finalErr
 }
 
-// [v24.5] pipeDirect：单连接智能管理
 func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt time.Duration) {
 	defer ws.Close()
 	defer local.Close()
@@ -453,6 +482,8 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt
 	case MODE_KEEP:
 		enableDisconnect = false
 		logPrefix = "[长连]"
+		// 这里的日志很重要，证明协议嗅探生效了
+		log.Printf("[Core] %s %s 命中长连接/gRPC模式，禁用断流。", logPrefix, target)
 	case MODE_CUT:
 		enableDisconnect = true
 		logPrefix = "[短连]"
@@ -485,8 +516,7 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt
 				
 				newDownBytes := atomic.AddInt64(&downBytes, n)
 				
-				// [智能断流] 达到随机阈值，主动断开
-				// 让浏览器自己去新建连接，这是最安全的
+				// [智能断流] 仅在允许时触发
 				if enableDisconnect && newDownBytes > dynamicLimit {
 					log.Printf("[Core] %s %s 完成使命 (%.2f MB)，主动断开。", logPrefix, target, float64(newDownBytes)/1024/1024)
 					return 
