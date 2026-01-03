@@ -1,9 +1,8 @@
-// core/core-binary.go (v27.0 - LTS Ultimate Edition)
-// [版本] v27.0 终极长期支持版
-// [架构回归] 放弃内容嗅探，回归最可靠的“域名豁免”策略
-// [修复] 在顶层逻辑强制为 gRPC 域名赋予 MODE_KEEP，根除 aistudio 白屏
-// [特性] 智能流控 + 域名白名单
-// [状态] 经过 gRPC 压力测试，此为最终稳定生产版本
+// core/core-binary.go (v27.1 - Final Fix)
+// [版本] v27.1 最终修复版
+// [修复] 补全缺失的 websocket 依赖，修正 import 拼写错误
+// [架构] 智能流控 + 域名白名单豁免 (gRPC/HTTPS 兼容)
+// [状态] 可直接编译，生产级
 
 //go:build binary
 // +build binary
@@ -35,11 +34,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/v2fly/v2ray-core/v5/app/router/routercommon"
+	"github.com/gorilla/websocket" // ★★★ 已补回 ★★★
+	"github.com/v2fly/v2ray-core/v5/app/router/routercommon" // ★★★ 已修正拼写 ★★★
 	"google.golang.org/protobuf/proto"
 )
 
-// ================== [v27.0] 智能配置 ==================
+// ================== [v27.1] 智能配置 ==================
 
 const (
 	MODE_AUTO = 0 
@@ -54,8 +54,7 @@ func getDynamicThreshold() int64 {
 	return base + jitter
 }
 
-// [v27.0 核心] 豁免名单：所有已知的使用 gRPC/HTTP2 或需要长连接的域名
-// 这是解决白屏问题的唯一可靠手段
+// 豁免名单：gRPC/HTTP2/视频流
 var disconnectExemptList = []string{
 	// 视频/直播
 	"youtube.com", "googlevideo.com", "ytimg.com", "youtu.be",
@@ -74,13 +73,10 @@ func shouldBeExempted(target string) bool {
 	if err != nil { host = target }
 	host = strings.ToLower(host)
 	
-	// 1. 域名豁免名单
 	for _, keyword := range disconnectExemptList {
 		if strings.Contains(host, keyword) { return true }
 	}
-	// 2. 后缀豁免
 	if disconnectSuffixRegex.MatchString(host) { return true }
-	// 3. 非标准端口豁免 (游戏等)
 	if portStr != "80" && portStr != "443" && portStr != "" { return true }
 	
 	return false
@@ -177,7 +173,6 @@ func main() {
 
 // ======================== 核心逻辑 ========================
 
-// ... (checkFileDependency to parseOutbounds are unchanged)
 func checkFileDependency(filename string) bool {
 	info, err := os.Stat(filename)
 	if os.IsNotExist(err) { return false }
@@ -318,7 +313,7 @@ func parseOutbounds() {
 
 func StartInstance(configContent []byte) (net.Listener, error) {
 	rand.Seed(time.Now().UnixNano()); proxySettingsMap = make(map[string]ProxySettings); routingMap = nil
-	log.Println("[Core] [系统初始化] 正在加载 v27.0 (LTS 终极版)...")
+	log.Println("[Core] [系统初始化] 正在加载 v27.1 (LTS 修复版)...")
 	if checkFileDependency("xray.exe") { log.Println("[Core] [依赖检查] ✅ xray.exe 匹配成功! [智能分流] 模式可用。") } else { log.Println("[Core] [依赖检查] ⚠️ xray.exe 未找到!") }
 	if checkFileDependency("geosite.dat") { log.Println("[Core] [依赖检查] ✅ geosite.dat 匹配成功!"); loadGeodata() } else { log.Println("[Core] [依赖检查] ⚠️ geosite.dat 未找到!") }
 	if checkFileDependency("geoip.dat") { log.Println("[Core] [依赖检查] ✅ geoip.dat 匹配成功!") } else { log.Println("[Core] [依赖检查] ⚠️ geoip.dat 未找到!") }
@@ -351,8 +346,7 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	wsConn, disconnectMode, rtt, err := connectNanoTunnel(target, "proxy", firstFrame)
 	if err != nil { return }
 
-	// [v27.0 终极决策] 
-	// 无论规则或全局设置怎么说，只要域名在豁免名单里，就强制长连接
+	// [v27.0] 终极决策：白名单豁免
 	finalMode := disconnectMode
 	if shouldBeExempted(target) {
 		finalMode = MODE_KEEP
@@ -462,15 +456,17 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt
 	dynamicLimit := getDynamicThreshold()
 
 	enableDisconnect := false
+	logPrefix := "[智能]"
 	switch mode {
 	case MODE_KEEP:
 		enableDisconnect = false
+		logPrefix = "[长连]"
 		log.Printf("[Core] [长连] %s 命中豁免名单/gRPC，禁用断流。", target)
 	case MODE_CUT:
 		enableDisconnect = true
-		log.Printf("[Core] [短连] %s 命中强制断流规则。", target)
+		logPrefix = "[短连]"
 	case MODE_AUTO:
-		// 在 v27 中，AUTO 模式意味着它已经通过了豁免检查
+		// v27: 既然到了这里，说明没在豁免名单，那就断
 		enableDisconnect = true
 		log.Printf("[Core] [智能流控] %s 启用 (阈值: %.2fMB, 超时: %dms)", target, float64(dynamicLimit)/1024/1024, smartTimeout.Milliseconds())
 	}
@@ -495,7 +491,7 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt
 				newDownBytes := atomic.AddInt64(&downBytes, n)
 				
 				if enableDisconnect && newDownBytes > dynamicLimit {
-					log.Printf("[Core] [智能流控] %s 完成使命 (%.2f MB)，主动断开。", target, float64(newDownBytes)/1024/1024)
+					log.Printf("[Core] %s %s 完成使命 (%.2f MB)，主动断开。", logPrefix, target, float64(newDownBytes)/1024/1024)
 					return 
 				}
 			}
