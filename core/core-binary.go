@@ -1,8 +1,8 @@
-// core/core-binary.go (v25.4 - Visual Stable Edition)
-// [版本] v25.4 可视稳定版
-// [特性] 正常流量阈值(8-12MB) | 混合日志显示
-// [效果] 主连接显示中文翻译，预连接显示原始空中加油日志
-// [状态] 生产级可用，推荐长期使用
+// core/core-binary.go (v25.5 - Ultimate Stable Edition)
+// [版本] v25.5 终极稳定版
+// [架构修正] 彻底分离 Uplink/Downlink，根除并发竞态 Bug
+// [稳定性] 生产级，解决“打开网站卡空白”问题
+// [状态] 推荐用于所有环境的最终版本
 
 //go:build binary
 // +build binary
@@ -39,7 +39,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// ================== [v25.4] 生产环境配置 ==================
+// ================== [v25.5] 生产环境配置 ==================
 
 const (
 	MODE_AUTO = 0
@@ -47,11 +47,10 @@ const (
 	MODE_CUT  = 2
 )
 
-// [恢复正常] 动态阈值：8MB ~ 12MB
-// 既能通过随机性欺骗 CF，又不会频繁握手消耗资源
+// 动态阈值：8MB ~ 12MB
 func getDynamicThreshold() int64 {
-	base := int64(8 * 1024 * 1024)           // 基础 8MB
-	jitter := rand.Int63n(4 * 1024 * 1024)   // 随机增加 0~4MB
+	base := int64(8 * 1024 * 1024)
+	jitter := rand.Int63n(4 * 1024 * 1024)
 	return base + jitter
 }
 
@@ -63,7 +62,6 @@ var disconnectDomainBlacklist = []string{
 var disconnectSuffixRegex = regexp.MustCompile(`(?i)\.(m3u8|mp4|flv|mkv|avi|mov|ts|webm)$`)
 
 func shouldDisableDisconnect(target string) bool {
-	// [恢复正常] 恢复智能判断逻辑
 	host, portStr, err := net.SplitHostPort(target)
 	if err != nil { host = target }
 	host = strings.ToLower(host)
@@ -105,8 +103,8 @@ type ProxySettings struct {
 	Token             string                  `json:"token"`
 	Strategy          string                  `json:"strategy"`
 	Rules             string                  `json:"rules"`
-	GlobalKeepAlive   bool                    `json:"global_keep_alive"` 
-	S5                string                  `json:"s5,omitempty"` 
+	GlobalKeepAlive   bool                    `json:"global_keep_alive"`
+	S5                string                  `json:"s5,omitempty"`
 	ForwarderSettings *ProxyForwarderSettings `json:"proxy_settings,omitempty"`
 	NodePool          []Node                  `json:"-"`
 }
@@ -131,6 +129,24 @@ type ConnCapsule struct {
 	Mode    int
 	RTT     time.Duration
 	Err     error
+}
+
+// [v25.5 架构修正] 共享连接指针，带锁保护，确保Uplink协程能安全切换目标
+type SharedConn struct {
+	mu   sync.RWMutex
+	conn *websocket.Conn
+}
+
+func (sc *SharedConn) Get() *websocket.Conn {
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+	return sc.conn
+}
+
+func (sc *SharedConn) Set(conn *websocket.Conn) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	sc.conn = conn
 }
 
 // ======================== 主入口 ========================
@@ -167,12 +183,13 @@ func main() {
 		log.Fatalf("Failed to start instance: %v", err)
 	}
 	
-	select {} 
+	select {}
 	_ = listener
 }
 
 // ======================== 核心逻辑 ========================
 
+// ... (checkFileDependency, loadGeodata, matchDomainRule, parseNode, parseRules, parseOutbounds, StartInstance, pingNode, RunSpeedTest, formatNode 均保持不变)
 func checkFileDependency(filename string) bool {
 	info, err := os.Stat(filename)
 	if os.IsNotExist(err) { return false }
@@ -313,7 +330,7 @@ func parseOutbounds() {
 
 func StartInstance(configContent []byte) (net.Listener, error) {
 	rand.Seed(time.Now().UnixNano()); proxySettingsMap = make(map[string]ProxySettings); routingMap = nil
-	log.Println("[Core] [系统初始化] 正在加载 v25.4 (可视稳定版)...")
+	log.Println("[Core] [系统初始化] 正在加载 v25.5 (终极稳定版)...")
 	if checkFileDependency("xray.exe") { log.Println("[Core] [依赖检查] ✅ xray.exe 匹配成功! [智能分流] 模式可用。") } else { log.Println("[Core] [依赖检查] ⚠️ xray.exe 未找到!") }
 	if checkFileDependency("geosite.dat") { log.Println("[Core] [依赖检查] ✅ geosite.dat 匹配成功!"); loadGeodata() } else { log.Println("[Core] [依赖检查] ⚠️ geosite.dat 未找到!") }
 	if checkFileDependency("geoip.dat") { log.Println("[Core] [依赖检查] ✅ geoip.dat 匹配成功!") } else { log.Println("[Core] [依赖检查] ⚠️ geoip.dat 未找到!") }
@@ -338,11 +355,11 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	defer conn.Close()
 	buf := make([]byte, 1)
 	if _, err := io.ReadFull(conn, buf); err != nil { return }
-	
+
 	var target string
 	var err error
 	var firstFrame []byte
-	var mode int // 1:Socks5, 2:HTTP
+	var mode int
 
 	switch buf[0] {
 	case 0x05:
@@ -353,6 +370,8 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	}
 	
 	if err != nil { return }
+
+	// ================= [v25.5 核心架构变化] =================
 	
 	nextConnChan := make(chan ConnCapsule, 1)
 
@@ -362,7 +381,10 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	}
 
 	firstCapsule := dialer(false)
-	if firstCapsule.Err != nil { return }
+	if firstCapsule.Err != nil {
+		log.Printf("[Core] Initial connection failed: %v", firstCapsule.Err)
+		return
+	}
 
 	if mode == 1 {
 		conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
@@ -371,21 +393,46 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	}
 
 	currentCapsule := firstCapsule
+	sharedConn := &SharedConn{conn: currentCapsule.Conn}
+
+	// [架构修正] 创建唯一的、持久的上行协程
+	go func() {
+		buf := bufPool.Get().([]byte)
+		defer bufPool.Put(buf)
+		// io.Copy anstatt manueller Loop für Effizienz
+		// Aber io.Copy kann nicht unterbrochen werden. Wir brauchen den Loop für die Weiche.
+		for {
+			n, err := conn.Read(buf)
+			if n > 0 {
+				ws := sharedConn.Get()
+				if ws != nil {
+					if err := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
+						// WS Schreibfehler, Downlink wird das erkennen und einen Wechsel auslösen
+					}
+				}
+			}
+			if err != nil {
+				// local connection closed by browser or error
+				// Close the current websocket to terminate the downlink loop
+				ws := sharedConn.Get()
+				if ws != nil {
+					ws.Close()
+				}
+				return
+			}
+		}
+	}()
 
 	for {
 		triggerPreDial := make(chan bool, 1)
 		
 		go func() {
-			select {
-			case <-triggerPreDial:
-				// [空中加油] 触发
-				nextConnChan <- dialer(true)
-			case <-time.After(30 * time.Minute):
-				return
-			}
+			<-triggerPreDial
+			nextConnChan <- dialer(true)
 		}()
 
-		needSwitch := pipeDirect(conn, currentCapsule.Conn, target, currentCapsule.Mode, currentCapsule.RTT, triggerPreDial)
+		// [架构修正] pipeDownlinkOnly 只负责下行和触发切换
+		needSwitch := pipeDownlinkOnly(conn, currentCapsule.Conn, target, currentCapsule.Mode, currentCapsule.RTT, triggerPreDial)
 
 		if !needSwitch {
 			return 
@@ -394,8 +441,12 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 		nextCapsule := <-nextConnChan
 		
 		if nextCapsule.Err != nil {
+			log.Printf("[Core] Pre-dial failed, terminating session. Error: %v", nextCapsule.Err)
 			return
 		}
+		
+		// [架构修正] 安全地更新共享连接指针
+		sharedConn.Set(nextCapsule.Conn)
 		currentCapsule = nextCapsule
 	}
 }
@@ -409,7 +460,6 @@ func match(rule Rule, target string) bool {
 	}
 }
 
-// [v25.4 修改] 混合日志逻辑
 func connectNanoTunnel(target string, outboundTag string, payload []byte, isPreDial bool) (*websocket.Conn, int, time.Duration, error) {
 	settings, ok := proxySettingsMap[outboundTag]
 	if !ok { return nil, MODE_AUTO, 0, errors.New("settings not found") }
@@ -462,12 +512,9 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte, isPreD
 		if err != nil { return err }
 		
 		if backend.IP != "" {
-			// [v25.4 混合日志]
 			if isPreDial {
-				// 预拨号：使用 PreConn，客户端不翻译，显示原始日志，证明空中加油存在
 				log.Printf("[Core] [空中加油] PreConn -> %s (SNI) >>> %s:%s (Real) | Latency: %dms", targetNode.Domain, backend.IP, backend.Port, finalRTT.Milliseconds())
 			} else {
-				// 普通拨号：使用 Tunnel，客户端翻译为“隧道建立”，保持界面美观
 				log.Printf("[Core] Tunnel -> %s (SNI) >>> %s:%s (Real) | Latency: %dms", targetNode.Domain, backend.IP, backend.Port, finalRTT.Milliseconds())
 			}
 		}
@@ -486,13 +533,10 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte, isPreD
 	return finalConn, currentMode, finalRTT, finalErr
 }
 
-func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt time.Duration, preDialTrigger chan<- bool) bool {
+// [架构修正] 新函数，只处理下行流量和切换逻辑
+func pipeDownlinkOnly(local net.Conn, ws *websocket.Conn, target string, mode int, rtt time.Duration, preDialTrigger chan<- bool) bool {
 	defer ws.Close()
-	var upBytes, downBytes int64
-	var wg sync.WaitGroup
-	wg.Add(2)
-	quit := make(chan bool)
-
+	
 	smartTimeout := rtt * 4
 	if smartTimeout < 300 * time.Millisecond {
 		smartTimeout = 300 * time.Millisecond
@@ -500,92 +544,59 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt
 		smartTimeout = 5 * time.Second
 	}
 
-	// [正常阈值] 8MB ~ 12MB
 	dynamicLimit := getDynamicThreshold()
 	preDialLimit := int64(float64(dynamicLimit) * 0.8)
 
 	enableDisconnect := false
 	switch mode {
-	case MODE_KEEP: enableDisconnect = false; 
-	case MODE_CUT: enableDisconnect = true; 
+	case MODE_KEEP: enableDisconnect = false
+	case MODE_CUT: enableDisconnect = true
 	case MODE_AUTO:
 		if shouldDisableDisconnect(target) {
-			enableDisconnect = false; 
+			enableDisconnect = false
 		} else {
 			enableDisconnect = true
 		}
 	}
 	
 	var handoffTriggered int32 = 0
-	var needSwitching bool = false
+	var totalDownBytes int64 = 0
 
-	go func() {
-		defer wg.Done()
-		buf := bufPool.Get().([]byte)
-		defer bufPool.Put(buf)
-		
-		for {
-			ws.SetReadDeadline(time.Now().Add(smartTimeout)) 
-			mt, r, err := ws.NextReader()
-			if err != nil { close(quit); return }
+	buf := bufPool.Get().([]byte)
+	defer bufPool.Put(buf)
+	
+	for {
+		ws.SetReadDeadline(time.Now().Add(smartTimeout))
+		mt, r, err := ws.NextReader()
+		if err != nil {
+			// Websocket-Fehler oder Timeout, könnte ein normaler Wechsel sein oder ein echter Fehler
+			// Rückgabewert hängt davon ab, ob wir einen Wechsel absichtlich ausgelöst haben
+			return atomic.LoadInt32(&handoffTriggered) == 1
+		}
 
-			if mt == websocket.BinaryMessage {
-				n, err := io.CopyBuffer(local, r, buf)
-				if err != nil { close(quit); return } 
-				
-				newDownBytes := atomic.AddInt64(&downBytes, n)
-				
-				if enableDisconnect {
+		if mt == websocket.BinaryMessage {
+			n, err := io.CopyBuffer(local, r, buf)
+			if err != nil {
+				// Lokale Verbindung wurde geschlossen, Session beenden
+				return false
+			}
+			
+			totalDownBytes += n
+			
+			if enableDisconnect {
+				if atomic.LoadInt32(&handoffTriggered) == 0 && totalDownBytes > preDialLimit {
 					if atomic.CompareAndSwapInt32(&handoffTriggered, 0, 1) {
-						if newDownBytes > preDialLimit {
-							select {
-							case preDialTrigger <- true:
-							default:
-							}
-						} else {
-							atomic.StoreInt32(&handoffTriggered, 0)
-						}
+						close(preDialTrigger) // Signal senden und Kanal schließen
 					}
+				}
 
-					if newDownBytes > dynamicLimit {
-						select {
-						case preDialTrigger <- true:
-						default:
-						}
-						needSwitching = true
-						close(quit)
-						return 
-					}
+				if totalDownBytes > dynamicLimit {
+					// Lebensdauer erreicht, normalen Wechsel auslösen
+					return true
 				}
 			}
 		}
-	}() 
-
-	go func() {
-		defer wg.Done()
-		buf := bufPool.Get().([]byte)
-		defer bufPool.Put(buf)
-		for {
-			select {
-			case <-quit:
-				return 
-			default:
-				local.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-				n, err := local.Read(buf)
-				if n > 0 {
-					atomic.AddInt64(&upBytes, int64(n))
-					if err := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil { return }
-				}
-				if err != nil {
-					if netErr, ok := err.(net.Error); ok && netErr.Timeout() { continue }
-					return 
-				}
-			}
-		}
-	}()
-
-	wg.Wait()
-	return needSwitching
+	}
 }
 
 func selectBackend(backends []Backend, key string) Backend { if len(backends) == 0 { return Backend{} }; if len(backends) == 1 { return backends[0] }; totalWeight := 0; for _, b := range backends { totalWeight += b.Weight }; h := md5.Sum([]byte(key)); hashVal := binary.BigEndian.Uint64(h[:8]); if totalWeight == 0 { return backends[int(hashVal%uint64(len(backends)))] }; targetVal := int(hashVal % uint64(totalWeight)); currentWeight := 0; for _, b := range backends { currentWeight += b.Weight; if targetVal < currentWeight { return b } }; return backends[0] }
