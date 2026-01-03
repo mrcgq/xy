@@ -1,7 +1,6 @@
-// core/core-binary.go (v25.1 - Final Stable)
-// [版本] v25.1 钻石稳定版
-// [修复] 修复 C客户端延迟显示 N/A 问题
-// [修复] 优化切换逻辑为阻塞等待，防止断流重连
+// core/core-binary.go (v25.2 - Visual Debug Edition)
+// [版本] v25.2 可视化验证版
+// [特性] 区分显示"空中加油"日志 | 绕过客户端翻译层
 // [状态] 生产级可用
 
 //go:build binary
@@ -39,7 +38,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// ================== [v25.1] 配置常量 ==================
+// ================== [v25.2] 配置常量 ==================
 
 const (
 	MODE_AUTO = 0
@@ -47,7 +46,6 @@ const (
 	MODE_CUT  = 2
 )
 
-// [智能核心] 动态阈值：8MB ~ 12MB
 func getDynamicThreshold() int64 {
 	base := int64(8 * 1024 * 1024)
 	jitter := rand.Int63n(4 * 1024 * 1024)
@@ -124,7 +122,6 @@ var (
 
 var bufPool = sync.Pool{New: func() interface{} { return make([]byte, 32*1024) }}
 
-// [v25.0 架构升级] 连接胶囊
 type ConnCapsule struct {
 	Conn    *websocket.Conn
 	Mode    int
@@ -312,7 +309,7 @@ func parseOutbounds() {
 
 func StartInstance(configContent []byte) (net.Listener, error) {
 	rand.Seed(time.Now().UnixNano()); proxySettingsMap = make(map[string]ProxySettings); routingMap = nil
-	log.Println("[Core] [系统初始化] 正在加载 v25.1 (钻石稳定版)...")
+	log.Println("[Core] [系统初始化] 正在加载 v25.2 (可视化验证版)...")
 	if checkFileDependency("xray.exe") { log.Println("[Core] [依赖检查] ✅ xray.exe 匹配成功! [智能分流] 模式可用。") } else { log.Println("[Core] [依赖检查] ⚠️ xray.exe 未找到!") }
 	if checkFileDependency("geosite.dat") { log.Println("[Core] [依赖检查] ✅ geosite.dat 匹配成功!"); loadGeodata() } else { log.Println("[Core] [依赖检查] ⚠️ geosite.dat 未找到!") }
 	if checkFileDependency("geoip.dat") { log.Println("[Core] [依赖检查] ✅ geoip.dat 匹配成功!") } else { log.Println("[Core] [依赖检查] ⚠️ geoip.dat 未找到!") }
@@ -352,20 +349,17 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	}
 	
 	if err != nil { return }
-
-	// ================= [v25.1 核心架构变化] =================
 	
-	// 预连接通道
 	nextConnChan := make(chan ConnCapsule, 1)
 
-	// 定义拨号器函数
-	dialer := func() ConnCapsule {
-		ws, dMode, rtt, e := connectNanoTunnel(target, "proxy", firstFrame)
+	// [v25.2 修改] 传入 bool 参数区分预拨号
+	dialer := func(isPreDial bool) ConnCapsule {
+		ws, dMode, rtt, e := connectNanoTunnel(target, "proxy", firstFrame, isPreDial)
 		return ConnCapsule{Conn: ws, Mode: dMode, RTT: rtt, Err: e}
 	}
 
-	// 1. 首次拨号 (同步)
-	firstCapsule := dialer()
+	// 1. 首次拨号 (false)
+	firstCapsule := dialer(false)
 	if firstCapsule.Err != nil { return }
 
 	if mode == 1 {
@@ -382,32 +376,25 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 		go func() {
 			select {
 			case <-triggerPreDial:
-				// [空中加油] 收到信号，立即开始拨号
-				nextConnChan <- dialer()
+				// [空中加油] 这里传入 true
+				nextConnChan <- dialer(true)
 			case <-time.After(30 * time.Minute):
 				return
 			}
 		}()
 
-		// [v25.1] pipeDirect 现在返回是否需要切换
 		needSwitch := pipeDirect(conn, currentCapsule.Conn, target, currentCapsule.Mode, currentCapsule.RTT, triggerPreDial)
 
 		if !needSwitch {
-			// 正常结束 (EOF) 或 错误，退出循环关闭连接
 			return 
 		}
 
-		// [v25.1 核心修复] 必须阻塞等待下一个连接！
-		// 如果这里使用 default: return，会导致新连接没好就断开，引发客户端掉线重连
-		// 我们已经在 80% 处预拨号了，所以这里的等待时间通常极短
 		nextCapsule := <-nextConnChan
 		
 		if nextCapsule.Err != nil {
-			// 预拨号失败，无法继续接力，退出
 			return
 		}
 		currentCapsule = nextCapsule
-		// 循环继续，0等待无缝使用新连接
 	}
 }
 
@@ -420,7 +407,8 @@ func match(rule Rule, target string) bool {
 	}
 }
 
-func connectNanoTunnel(target string, outboundTag string, payload []byte) (*websocket.Conn, int, time.Duration, error) {
+// [v25.2 修改] 增加 isPreDial 参数
+func connectNanoTunnel(target string, outboundTag string, payload []byte, isPreDial bool) (*websocket.Conn, int, time.Duration, error) {
 	settings, ok := proxySettingsMap[outboundTag]
 	if !ok { return nil, MODE_AUTO, 0, errors.New("settings not found") }
 	
@@ -472,8 +460,16 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 		if err != nil { return err }
 		
 		if backend.IP != "" {
-			// [修复] 改回 Latency，适配客户端日志抓取
-			log.Printf("[Core] Tunnel -> %s (SNI) >>> %s:%s (Real) | Latency: %dms", targetNode.Domain, backend.IP, backend.Port, finalRTT.Milliseconds())
+			// [v25.2 可视化]
+			// 如果是预拨号，使用 "PreConn" 关键字，客户端不会翻译，直接显示原始内容
+			// 如果是普通拨号，使用 "Tunnel"，客户端会翻译成 "隧道建立"
+			keyword := "Tunnel"
+			prefix := ""
+			if isPreDial {
+				keyword = "PreConn" // 关键修改：客户端不认识这个词，会原文输出
+				prefix = "[空中加油] "
+			}
+			log.Printf("[Core] %s%s -> %s (SNI) >>> %s:%s (Real) | Latency: %dms", prefix, keyword, targetNode.Domain, backend.IP, backend.Port, finalRTT.Milliseconds())
 		}
 		
 		err = sendNanoHeaderV2(wsConn, target, payload, socks5, fallback)
@@ -490,15 +486,11 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 	return finalConn, currentMode, finalRTT, finalErr
 }
 
-// [v25.1] pipeDirect 升级：返回 bool 告知是否需要切换
 func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt time.Duration, preDialTrigger chan<- bool) bool {
 	defer ws.Close()
-	// 注意：不能 defer local.Close()，因为要复用
-
 	var upBytes, downBytes int64
 	var wg sync.WaitGroup
 	wg.Add(2)
-	
 	quit := make(chan bool)
 
 	// 1. 智能超时 (RTT * 4)
@@ -526,8 +518,6 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt
 	}
 	
 	var handoffTriggered int32 = 0
-	
-	// 返回值：是否因为限流而退出 (true=切换, false=结束)
 	var needSwitching bool = false
 
 	// Downlink: WS -> TCP
@@ -535,14 +525,10 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt
 		defer wg.Done()
 		buf := bufPool.Get().([]byte)
 		defer bufPool.Put(buf)
-		
 		for {
 			ws.SetReadDeadline(time.Now().Add(smartTimeout)) 
 			mt, r, err := ws.NextReader()
-			if err != nil { 
-				close(quit)
-				return 
-			}
+			if err != nil { close(quit); return }
 
 			if mt == websocket.BinaryMessage {
 				n, err := io.CopyBuffer(local, r, buf)
@@ -569,7 +555,7 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt
 						case preDialTrigger <- true:
 						default:
 						}
-						needSwitching = true // 标记为需要切换
+						needSwitching = true
 						close(quit)
 						return 
 					}
@@ -590,18 +576,12 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt
 			default:
 				local.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 				n, err := local.Read(buf)
-				
 				if n > 0 {
 					atomic.AddInt64(&upBytes, int64(n))
-					if err := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
-						return 
-					}
+					if err := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil { return }
 				}
-				
 				if err != nil {
-					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-						continue 
-					}
+					if netErr, ok := err.(net.Error); ok && netErr.Timeout() { continue }
 					return 
 				}
 			}
