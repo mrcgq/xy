@@ -1,7 +1,8 @@
-// core/core-binary.go (v25.0 - Diamond Edition)
-// [版本] v25.0 无缝并发版 (Zero-Wait)
-// [特性] 空中加油(Pre-dialing) | 动态阈值 | RTT感知 | 0ms切换
-// [状态] 生产级可用，架构升级
+// core/core-binary.go (v25.1 - Final Stable)
+// [版本] v25.1 钻石稳定版
+// [修复] 修复 C客户端延迟显示 N/A 问题
+// [修复] 优化切换逻辑为阻塞等待，防止断流重连
+// [状态] 生产级可用
 
 //go:build binary
 // +build binary
@@ -38,7 +39,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// ================== [v25.0] 配置常量 ==================
+// ================== [v25.1] 配置常量 ==================
 
 const (
 	MODE_AUTO = 0
@@ -123,7 +124,7 @@ var (
 
 var bufPool = sync.Pool{New: func() interface{} { return make([]byte, 32*1024) }}
 
-// [v25.0 架构升级] 连接胶囊：封装预连接所需的所有信息
+// [v25.0 架构升级] 连接胶囊
 type ConnCapsule struct {
 	Conn    *websocket.Conn
 	Mode    int
@@ -311,7 +312,7 @@ func parseOutbounds() {
 
 func StartInstance(configContent []byte) (net.Listener, error) {
 	rand.Seed(time.Now().UnixNano()); proxySettingsMap = make(map[string]ProxySettings); routingMap = nil
-	log.Println("[Core] [系统初始化] 正在加载 v25.0 (无缝并发版)...")
+	log.Println("[Core] [系统初始化] 正在加载 v25.1 (钻石稳定版)...")
 	if checkFileDependency("xray.exe") { log.Println("[Core] [依赖检查] ✅ xray.exe 匹配成功! [智能分流] 模式可用。") } else { log.Println("[Core] [依赖检查] ⚠️ xray.exe 未找到!") }
 	if checkFileDependency("geosite.dat") { log.Println("[Core] [依赖检查] ✅ geosite.dat 匹配成功!"); loadGeodata() } else { log.Println("[Core] [依赖检查] ⚠️ geosite.dat 未找到!") }
 	if checkFileDependency("geoip.dat") { log.Println("[Core] [依赖检查] ✅ geoip.dat 匹配成功!") } else { log.Println("[Core] [依赖检查] ⚠️ geoip.dat 未找到!") }
@@ -352,13 +353,12 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	
 	if err != nil { return }
 
-	// ================= [v25 核心架构变化] =================
+	// ================= [v25.1 核心架构变化] =================
 	
-	// 预连接通道：用于存放下一个准备好的连接
-	// 容量为1，避免无限创建
+	// 预连接通道
 	nextConnChan := make(chan ConnCapsule, 1)
 
-	// 定义拨号器函数：封装拨号逻辑，便于复用和异步调用
+	// 定义拨号器函数
 	dialer := func() ConnCapsule {
 		ws, dMode, rtt, e := connectNanoTunnel(target, "proxy", firstFrame)
 		return ConnCapsule{Conn: ws, Mode: dMode, RTT: rtt, Err: e}
@@ -368,7 +368,6 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	firstCapsule := dialer()
 	if firstCapsule.Err != nil { return }
 
-	// 向客户端发送握手响应
 	if mode == 1 {
 		conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 	} else if mode == 2 {
@@ -378,41 +377,37 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	currentCapsule := firstCapsule
 
 	for {
-		// 触发预拨号的信号灯 (One-shot signal)
 		triggerPreDial := make(chan bool, 1)
 		
-		// 启动异步监视器：一旦触发信号，立即拨号下一个
 		go func() {
 			select {
 			case <-triggerPreDial:
-				// [空中加油] 收到信号，立即开始拨号下一个连接
+				// [空中加油] 收到信号，立即开始拨号
 				nextConnChan <- dialer()
-			case <-time.After(30 * time.Minute): // 防止 goroutine 泄露的保底
+			case <-time.After(30 * time.Minute):
 				return
 			}
 		}()
 
-		// 执行数据管道，传入触发器
-		// pipeDirect 现在负责在流量达标时调用 triggerPreDial <- true
-		pipeDirect(conn, currentCapsule.Conn, target, currentCapsule.Mode, currentCapsule.RTT, triggerPreDial)
+		// [v25.1] pipeDirect 现在返回是否需要切换
+		needSwitch := pipeDirect(conn, currentCapsule.Conn, target, currentCapsule.Mode, currentCapsule.RTT, triggerPreDial)
 
-		// 当前连接结束，检查是否因错误退出
-		// 如果 pipeDirect 正常返回，说明触发了轮换
-		// 此时 nextConnChan 里应该正在拨号或已经拨号完成
+		if !needSwitch {
+			// 正常结束 (EOF) 或 错误，退出循环关闭连接
+			return 
+		}
+
+		// [v25.1 核心修复] 必须阻塞等待下一个连接！
+		// 如果这里使用 default: return，会导致新连接没好就断开，引发客户端掉线重连
+		// 我们已经在 80% 处预拨号了，所以这里的等待时间通常极短
+		nextCapsule := <-nextConnChan
 		
-		select {
-		case nextCapsule := <-nextConnChan:
-			// [无缝切换] 拿到下一个连接
-			if nextCapsule.Err != nil {
-				// 如果预连接失败，尝试同步重试一次，或者直接退出
-				return
-			}
-			currentCapsule = nextCapsule
-			// 循环继续，立即使用新连接，0等待
-		default:
-			// 这种情况一般不应该发生，除非 pipeDirect 异常退出
+		if nextCapsule.Err != nil {
+			// 预拨号失败，无法继续接力，退出
 			return
 		}
+		currentCapsule = nextCapsule
+		// 循环继续，0等待无缝使用新连接
 	}
 }
 
@@ -425,7 +420,6 @@ func match(rule Rule, target string) bool {
 	}
 }
 
-// [v25.0] 封装后的拨号函数
 func connectNanoTunnel(target string, outboundTag string, payload []byte) (*websocket.Conn, int, time.Duration, error) {
 	settings, ok := proxySettingsMap[outboundTag]
 	if !ok { return nil, MODE_AUTO, 0, errors.New("settings not found") }
@@ -478,8 +472,8 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 		if err != nil { return err }
 		
 		if backend.IP != "" {
-			// 开启日志，观察空中加油效果
-			log.Printf("[Core] [预拨号] Tunnel -> %s (SNI) >>> %s:%s (Real) | RTT: %dms", targetNode.Domain, backend.IP, backend.Port, finalRTT.Milliseconds())
+			// [修复] 改回 Latency，适配客户端日志抓取
+			log.Printf("[Core] Tunnel -> %s (SNI) >>> %s:%s (Real) | Latency: %dms", targetNode.Domain, backend.IP, backend.Port, finalRTT.Milliseconds())
 		}
 		
 		err = sendNanoHeaderV2(wsConn, target, payload, socks5, fallback)
@@ -496,18 +490,15 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 	return finalConn, currentMode, finalRTT, finalErr
 }
 
-// [v25.0] pipeDirect 升级：支持预拨号触发器
-func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt time.Duration, preDialTrigger chan<- bool) {
+// [v25.1] pipeDirect 升级：返回 bool 告知是否需要切换
+func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt time.Duration, preDialTrigger chan<- bool) bool {
 	defer ws.Close()
-	// 注意：不能 defer local.Close()，因为 local 连接要在多个 WS 连接间复用！
-	// 只有在 pipeDirect 彻底出错或者不需要重连时，才由外层关闭 local
+	// 注意：不能 defer local.Close()，因为要复用
 
 	var upBytes, downBytes int64
-	// startTime := time.Now()
 	var wg sync.WaitGroup
 	wg.Add(2)
 	
-	// 控制内部 goroutine 退出的信号
 	quit := make(chan bool)
 
 	// 1. 智能超时 (RTT * 4)
@@ -520,24 +511,24 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt
 
 	// 2. 动态阈值
 	dynamicLimit := getDynamicThreshold()
-	// 预拨号阈值 (80%)
 	preDialLimit := int64(float64(dynamicLimit) * 0.8)
 
 	enableDisconnect := false
-	// logPrefix := "[智能]"
 	switch mode {
-	case MODE_KEEP: enableDisconnect = false; // logPrefix = "[长连]"
-	case MODE_CUT: enableDisconnect = true; // logPrefix = "[短连]"
+	case MODE_KEEP: enableDisconnect = false; 
+	case MODE_CUT: enableDisconnect = true; 
 	case MODE_AUTO:
 		if shouldDisableDisconnect(target) {
-			enableDisconnect = false; // logPrefix = "[自动]"
+			enableDisconnect = false; 
 		} else {
 			enableDisconnect = true
 		}
 	}
 	
-	// 标记是否已触发预拨号，避免重复触发
 	var handoffTriggered int32 = 0
+	
+	// 返回值：是否因为限流而退出 (true=切换, false=结束)
+	var needSwitching bool = false
 
 	// Downlink: WS -> TCP
 	go func() {
@@ -549,14 +540,13 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt
 			ws.SetReadDeadline(time.Now().Add(smartTimeout)) 
 			mt, r, err := ws.NextReader()
 			if err != nil { 
-				// WS 断开，通知 uplink 退出
 				close(quit)
 				return 
 			}
 
 			if mt == websocket.BinaryMessage {
 				n, err := io.CopyBuffer(local, r, buf)
-				if err != nil { close(quit); return } // 本地连接断开，彻底结束
+				if err != nil { close(quit); return } 
 				
 				newDownBytes := atomic.AddInt64(&downBytes, n)
 				
@@ -569,18 +559,17 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt
 							default:
 							}
 						} else {
-							atomic.StoreInt32(&handoffTriggered, 0) // 没达到，还原标记
+							atomic.StoreInt32(&handoffTriggered, 0)
 						}
 					}
 
-					// [阶段二] 寿命终结
+					// [阶段二] 寿命终结，需要切换
 					if newDownBytes > dynamicLimit {
-						// 确保触发了预拨号 (防止流量瞬间暴增跳过阶段一)
 						select {
 						case preDialTrigger <- true:
 						default:
 						}
-						// 退出循环，关闭 WS，外层 loop 会接管 local 并使用 nextConn
+						needSwitching = true // 标记为需要切换
 						close(quit)
 						return 
 					}
@@ -597,34 +586,22 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt
 		for {
 			select {
 			case <-quit:
-				return // 下行已断，上行随之结束
+				return 
 			default:
-				// 设置一个极短的 ReadDeadline 以便能响应 quit 信号?
-				// 不，local 是 net.Conn，不能随便 SetReadDeadline 否则会影响复用
-				// 这里依赖 local.Read 的阻塞。如果 WS 断开，我们需要一种方法中断 local.Read 吗？
-				// 不需要，因为如果我们要切换连接，local 不需要断。
-				// 但是 local.Read 是阻塞的。
-				// 这是一个 v25 的技术难点：如何从 pipeDirect 返回但保持 local 不断？
-				// 方案：Uplink 协程在 v25 中其实不需要退出！
-				// 只要 WS 发送失败，它就会报错。
-				
-				// 简单处理：使用 SetReadDeadline 轮询检查 quit
 				local.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 				n, err := local.Read(buf)
 				
 				if n > 0 {
 					atomic.AddInt64(&upBytes, int64(n))
 					if err := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
-						return // WS 写失败，切换
+						return 
 					}
 				}
 				
 				if err != nil {
 					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-						continue // 超时继续
+						continue 
 					}
-					// 真正的读取错误（本地断开），彻底结束
-					// 这种情况下外层也应该退出
 					return 
 				}
 			}
@@ -632,6 +609,7 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt
 	}()
 
 	wg.Wait()
+	return needSwitching
 }
 
 func selectBackend(backends []Backend, key string) Backend { if len(backends) == 0 { return Backend{} }; if len(backends) == 1 { return backends[0] }; totalWeight := 0; for _, b := range backends { totalWeight += b.Weight }; h := md5.Sum([]byte(key)); hashVal := binary.BigEndian.Uint64(h[:8]); if totalWeight == 0 { return backends[int(hashVal%uint64(len(backends)))] }; targetVal := int(hashVal % uint64(totalWeight)); currentWeight := 0; for _, b := range backends { currentWeight += b.Weight; if targetVal < currentWeight { return b } }; return backends[0] }
