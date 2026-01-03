@@ -100,7 +100,7 @@ type ProxySettings struct {
 	Token             string                  `json:"token"`
 	Strategy          string                  `json:"strategy"`
 	Rules             string                  `json:"rules"`
-	GlobalKeepAlive   bool                    `json:"global_keep_alive"`
+	GlobalKeepAlive   bool                    `json:"global_keep_alive,omitempty"`
 	ForwarderSettings *ProxyForwarderSettings `json:"proxy_settings,omitempty"`
 	NodePool          []Node                  `json:"-"`
 }
