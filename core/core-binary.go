@@ -1,8 +1,8 @@
-// core/core-binary.go (v25.3 - Fast Debug Edition)
-// [版本] v25.3 急速验证版
-// [修改1] 阈值降为 200KB -> 稍微用一下就会触发预拨号
-// [修改2] 日志关键词变更 -> 强制显示原始日志，不让客户端翻译
-// [用途] 仅供调试观察“空中加油”现象，验证完毕后建议改回 v25.1
+// core/core-binary.go (v25.4 - Visual Stable Edition)
+// [版本] v25.4 可视稳定版
+// [特性] 正常流量阈值(8-12MB) | 混合日志显示
+// [效果] 主连接显示中文翻译，预连接显示原始空中加油日志
+// [状态] 生产级可用，推荐长期使用
 
 //go:build binary
 // +build binary
@@ -39,7 +39,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// ================== [v25.3] 调试配置 ==================
+// ================== [v25.4] 生产环境配置 ==================
 
 const (
 	MODE_AUTO = 0
@@ -47,11 +47,11 @@ const (
 	MODE_CUT  = 2
 )
 
-// [暴力调试] 阈值设为极低的 200KB ~ 300KB
-// 只要打开网页，立马触发多次空中加油
+// [恢复正常] 动态阈值：8MB ~ 12MB
+// 既能通过随机性欺骗 CF，又不会频繁握手消耗资源
 func getDynamicThreshold() int64 {
-	base := int64(200 * 1024)          // 200KB
-	jitter := rand.Int63n(100 * 1024)  // +0~100KB
+	base := int64(8 * 1024 * 1024)           // 基础 8MB
+	jitter := rand.Int63n(4 * 1024 * 1024)   // 随机增加 0~4MB
 	return base + jitter
 }
 
@@ -63,9 +63,16 @@ var disconnectDomainBlacklist = []string{
 var disconnectSuffixRegex = regexp.MustCompile(`(?i)\.(m3u8|mp4|flv|mkv|avi|mov|ts|webm)$`)
 
 func shouldDisableDisconnect(target string) bool {
-	// [调试版] 即使是视频网站，也强制开启断流，以便观察效果
-	// 正常版本请勿保留此逻辑
-	return false 
+	// [恢复正常] 恢复智能判断逻辑
+	host, portStr, err := net.SplitHostPort(target)
+	if err != nil { host = target }
+	host = strings.ToLower(host)
+	for _, keyword := range disconnectDomainBlacklist {
+		if strings.Contains(host, keyword) { return true }
+	}
+	if disconnectSuffixRegex.MatchString(host) { return true }
+	if portStr != "80" && portStr != "443" && portStr != "" { return true }
+	return false
 }
 
 // ============================================================
@@ -306,7 +313,7 @@ func parseOutbounds() {
 
 func StartInstance(configContent []byte) (net.Listener, error) {
 	rand.Seed(time.Now().UnixNano()); proxySettingsMap = make(map[string]ProxySettings); routingMap = nil
-	log.Println("[Core] [系统初始化] 正在加载 v25.3 (急速验证版)...")
+	log.Println("[Core] [系统初始化] 正在加载 v25.4 (可视稳定版)...")
 	if checkFileDependency("xray.exe") { log.Println("[Core] [依赖检查] ✅ xray.exe 匹配成功! [智能分流] 模式可用。") } else { log.Println("[Core] [依赖检查] ⚠️ xray.exe 未找到!") }
 	if checkFileDependency("geosite.dat") { log.Println("[Core] [依赖检查] ✅ geosite.dat 匹配成功!"); loadGeodata() } else { log.Println("[Core] [依赖检查] ⚠️ geosite.dat 未找到!") }
 	if checkFileDependency("geoip.dat") { log.Println("[Core] [依赖检查] ✅ geoip.dat 匹配成功!") } else { log.Println("[Core] [依赖检查] ⚠️ geoip.dat 未找到!") }
@@ -402,6 +409,7 @@ func match(rule Rule, target string) bool {
 	}
 }
 
+// [v25.4 修改] 混合日志逻辑
 func connectNanoTunnel(target string, outboundTag string, payload []byte, isPreDial bool) (*websocket.Conn, int, time.Duration, error) {
 	settings, ok := proxySettingsMap[outboundTag]
 	if !ok { return nil, MODE_AUTO, 0, errors.New("settings not found") }
@@ -454,16 +462,14 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte, isPreD
 		if err != nil { return err }
 		
 		if backend.IP != "" {
-			// [v25.3 暴力显形] 
-			// 将关键词改成 TunnelV25 (首连) 和 PreConn (空连)
-			// 这样 C 客户端因为匹配不到 "Tunnel ->" (注意空格) 而停止翻译，直接吐出原文
-			keyword := "TunnelV25" 
-			prefix := ""
+			// [v25.4 混合日志]
 			if isPreDial {
-				keyword = "PreConn" 
-				prefix = "[空中加油] "
+				// 预拨号：使用 PreConn，客户端不翻译，显示原始日志，证明空中加油存在
+				log.Printf("[Core] [空中加油] PreConn -> %s (SNI) >>> %s:%s (Real) | Latency: %dms", targetNode.Domain, backend.IP, backend.Port, finalRTT.Milliseconds())
+			} else {
+				// 普通拨号：使用 Tunnel，客户端翻译为“隧道建立”，保持界面美观
+				log.Printf("[Core] Tunnel -> %s (SNI) >>> %s:%s (Real) | Latency: %dms", targetNode.Domain, backend.IP, backend.Port, finalRTT.Milliseconds())
 			}
-			log.Printf("[Core] %s%s -> %s (SNI) >>> %s:%s (Real) | Latency: %dms", prefix, keyword, targetNode.Domain, backend.IP, backend.Port, finalRTT.Milliseconds())
 		}
 		
 		err = sendNanoHeaderV2(wsConn, target, payload, socks5, fallback)
@@ -487,7 +493,6 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt
 	wg.Add(2)
 	quit := make(chan bool)
 
-	// 1. 智能超时 (RTT * 4)
 	smartTimeout := rtt * 4
 	if smartTimeout < 300 * time.Millisecond {
 		smartTimeout = 300 * time.Millisecond
@@ -495,7 +500,7 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt
 		smartTimeout = 5 * time.Second
 	}
 
-	// 2. 动态阈值 (200KB)
+	// [正常阈值] 8MB ~ 12MB
 	dynamicLimit := getDynamicThreshold()
 	preDialLimit := int64(float64(dynamicLimit) * 0.8)
 
@@ -505,8 +510,7 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt
 	case MODE_CUT: enableDisconnect = true; 
 	case MODE_AUTO:
 		if shouldDisableDisconnect(target) {
-			// [调试强制开启] 
-			enableDisconnect = true 
+			enableDisconnect = false; 
 		} else {
 			enableDisconnect = true
 		}
@@ -515,7 +519,6 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt
 	var handoffTriggered int32 = 0
 	var needSwitching bool = false
 
-	// Downlink: WS -> TCP
 	go func() {
 		defer wg.Done()
 		buf := bufPool.Get().([]byte)
@@ -533,7 +536,6 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt
 				newDownBytes := atomic.AddInt64(&downBytes, n)
 				
 				if enableDisconnect {
-					// [阶段一] 空中加油
 					if atomic.CompareAndSwapInt32(&handoffTriggered, 0, 1) {
 						if newDownBytes > preDialLimit {
 							select {
@@ -545,7 +547,6 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt
 						}
 					}
 
-					// [阶段二] 寿命终结
 					if newDownBytes > dynamicLimit {
 						select {
 						case preDialTrigger <- true:
@@ -560,7 +561,6 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt
 		}
 	}() 
 
-	// Uplink: TCP -> WS
 	go func() {
 		defer wg.Done()
 		buf := bufPool.Get().([]byte)
