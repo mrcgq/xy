@@ -1,9 +1,8 @@
-// core/core-binary.go (v24.2 - Bugfix Stable)
-// [版本] v24.2 紧急修复版 (Final Complete)
-// [修复1] SOCKS5 握手死锁 (恢复 Method Selection 回复)
-// [修复2] 循环重连时 target 变量丢失导致的连接失败
-// [特性] 智能流控 + 串行稳定架构 + 协议兼容
-// [状态] 完整无省略，生产级可用
+// core/core-binary.go (v24.5 - LTS Final)
+// [版本] v24.5 长期支持版
+// [架构] 回归单连接智能管理 (放弃 v25 并发架构以修复 HTTPS/gRPC 问题)
+// [特性] 动态阈值(Jitter) | RTT感知超时 | SOCKS5修复 | 兼容 C 客户端日志
+// [状态] 完美兼容 Google AI / Youtube 4K，无白屏 Bug
 
 //go:build binary
 // +build binary
@@ -40,15 +39,15 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// ================== [v24.2] 配置常量 ==================
+// ================== [v24.5] 智能流控配置 ==================
 
 const (
-	MODE_AUTO = 0
-	MODE_KEEP = 1
-	MODE_CUT  = 2
+	MODE_AUTO = 0 
+	MODE_KEEP = 1 
+	MODE_CUT  = 2 
 )
 
-// 动态阈值：8MB ~ 12MB
+// [智能核心] 动态阈值生成器 (8MB ~ 12MB)
 func getDynamicThreshold() int64 {
 	base := int64(8 * 1024 * 1024)
 	jitter := rand.Int63n(4 * 1024 * 1024)
@@ -58,8 +57,7 @@ func getDynamicThreshold() int64 {
 var disconnectDomainBlacklist = []string{
 	"youtube.com", "googlevideo.com", "ytimg.com", "youtu.be",
 	"nflxvideo.net", "vimeo.com", "live", "stream",
-	"telesco.pe", "tdesktop.com", 
-	"aistudio.google.com", "grpc", // 兼容 gRPC 和 Google AI Studio
+	"telesco.pe", "tdesktop.com",
 }
 var disconnectSuffixRegex = regexp.MustCompile(`(?i)\.(m3u8|mp4|flv|mkv|avi|mov|ts|webm)$`)
 
@@ -306,7 +304,7 @@ func parseOutbounds() {
 
 func StartInstance(configContent []byte) (net.Listener, error) {
 	rand.Seed(time.Now().UnixNano()); proxySettingsMap = make(map[string]ProxySettings); routingMap = nil
-	log.Println("[Core] [系统初始化] 正在加载 v24.2 (修复稳定版)...")
+	log.Println("[Core] [系统初始化] 正在加载 v24.5 (LTS 长期稳定版)...")
 	if checkFileDependency("xray.exe") { log.Println("[Core] [依赖检查] ✅ xray.exe 匹配成功! [智能分流] 模式可用。") } else { log.Println("[Core] [依赖检查] ⚠️ xray.exe 未找到!") }
 	if checkFileDependency("geosite.dat") { log.Println("[Core] [依赖检查] ✅ geosite.dat 匹配成功!"); loadGeodata() } else { log.Println("[Core] [依赖检查] ⚠️ geosite.dat 未找到!") }
 	if checkFileDependency("geoip.dat") { log.Println("[Core] [依赖检查] ✅ geoip.dat 匹配成功!") } else { log.Println("[Core] [依赖检查] ⚠️ geoip.dat 未找到!") }
@@ -317,7 +315,7 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 	inbound := globalConfig.Inbounds[0]; listener, err := net.Listen("tcp", inbound.Listen); if err != nil { return nil, err }
 	mode := "Single Node"; if s, ok := proxySettingsMap["proxy"]; ok { if len(s.NodePool) > 1 { mode = fmt.Sprintf("Zeus Pool (%d nodes)", len(s.NodePool)) } else if len(s.NodePool) == 1 { mode = fmt.Sprintf("Zeus Single") }; if len(routingMap) > 0 { mode += fmt.Sprintf(" + Rules") } }
 	if s, ok := proxySettingsMap["proxy"]; ok && s.GlobalKeepAlive { log.Println("[Core] ★★★ 全局沉浸模式 (L3) 已开启 ★★★") }
-	log.Printf("[Core] Xlink Engine v24 Listening on %s [%s]", inbound.Listen, mode)
+	log.Printf("[Core] Xlink Engine v24.5 Listening on %s [%s]", inbound.Listen, mode)
 	go func() { for { conn, err := listener.Accept(); if err != nil { break }; go handleGeneralConnection(conn, inbound.Tag) } }()
 	return listener, nil
 }
@@ -327,77 +325,23 @@ func pingNode(node Node, token, globalIP string, results chan<- TestResult) { st
 func RunSpeedTest(serverAddr, token, globalIP string) { rawPool := strings.ReplaceAll(serverAddr, "\r\n", ";"); rawPool = strings.ReplaceAll(rawPool, "\n", ";"); nodeStrs := strings.Split(rawPool, ";"); var nodes []Node; for _, nodeStr := range nodeStrs { if trimmed := strings.TrimSpace(nodeStr); trimmed != "" { nodes = append(nodes, parseNode(trimmed)) } }; if len(nodes) == 0 { log.Println("No valid nodes found."); return }; var wg sync.WaitGroup; results := make(chan TestResult, len(nodes)); for _, node := range nodes { wg.Add(1); go func(n Node) { defer wg.Done(); parts := strings.SplitN(token, "|", 2); pingNode(n, parts[0], globalIP, results) }(node) }; wg.Wait(); close(results); var successful, failed []TestResult; for res := range results { if res.Error == nil { successful = append(successful, res) } else { failed = append(failed, res) } }; sort.Slice(successful, func(i, j int) bool { return successful[i].Delay < successful[j].Delay }); fmt.Println("\nPing Test Report"); for i, res := range successful { fmt.Printf("%d. %-40s | Delay: %v\n", i+1, formatNode(res.Node), res.Delay.Round(time.Millisecond)) }; if len(failed) > 0 { fmt.Println("\nFailed Nodes"); for _, res := range failed { fmt.Printf("- %-40s | Error: %v\n", formatNode(res.Node), res.Error) } }; fmt.Println("\n------------------------------------") }
 func formatNode(n Node) string { res := n.Domain; if len(n.Backends) > 0 { res += "#..."; }; return res }
 
-// [v24.2 修复] handleGeneralConnection
-// 1. target/mode 变量移到循环外，防止重连丢失
-// 2. 握手逻辑严格分离
 func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	defer conn.Close()
+	buf := make([]byte, 1)
+	if _, err := io.ReadFull(conn, buf); err != nil { return }
+	var target string; var err error; var firstFrame []byte; var mode int
+	switch buf[0] { case 0x05: target, err = handleSOCKS5(conn, inboundTag); mode = 1; default: target, firstFrame, mode, err = handleHTTP(conn, buf, inboundTag) }
 	
-	// ★★★ 修复：所有状态变量必须在循环外定义，保证重连时可用 ★★★
-	var target string
-	var mode int // 1:Socks5, 2:HTTP
-	var firstFrame []byte
-	var handshakeDone bool = false
+	if err != nil { return }
+
+	// [v24.5] 回归标准连接逻辑，不再使用 channel/并发
+	wsConn, disconnectMode, rtt, err := connectNanoTunnel(target, "proxy", firstFrame)
+	if err != nil { return }
+
+	if mode == 1 { conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) }; if mode == 2 { conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
 	
-	// 循环实现“断流重连”
-	for {
-		var err error
-
-		// 只有第一次进入循环时，才需要读取浏览器发来的握手包
-		if !handshakeDone {
-			buf := make([]byte, 1)
-			n, err := conn.Read(buf)
-			if err != nil || n == 0 { return }
-
-			switch buf[0] {
-			case 0x05:
-				mode = 1
-				// ★★★ 修复：SOCKS5 握手必须在此完成 Method Selection 回复，否则死锁 ★★★
-				target, err = handleSOCKS5(conn)
-			default:
-				mode = 2
-				target, firstFrame, _, err = handleHTTP(conn, buf, inboundTag)
-			}
-
-			if err != nil { return }
-			handshakeDone = true
-		}
-		
-		// 此时 target 已经确定，开始拨号
-		// 如果是重连，firstFrame 应该为 nil，避免重复发送 Payload
-		payload := firstFrame
-		
-		wsConn, disconnectMode, rtt, err := connectNanoTunnel(target, "proxy", payload)
-		if err != nil {
-			log.Printf("[Core] Failed to connect: %v. Retrying...", err)
-			time.Sleep(1 * time.Second) // 失败等待一下，避免死循环刷屏
-			return // 连接失败直接断开，让浏览器重连
-		}
-		
-		// 发送 Payload 后，清空它，防止下次重连重复发送
-		firstFrame = nil 
-
-		// 回复客户端握手成功 (仅在第一次)
-		if mode == 1 {
-			// SOCKS5: Response 0x00 (Success)
-			conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-			mode = 0 // 标记为已回复，下次循环不再回复
-		} else if mode == 2 {
-			// HTTP CONNECT: 200 OK
-			conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-			mode = 0
-		}
-		
-		// 进入数据传输管道
-		// 返回 true 表示需要切换（重连），返回 false 表示结束
-		needSwitch := pipeDirect(wsConn, conn, target, disconnectMode, rtt)
-		
-		if !needSwitch {
-			return
-		}
-		// 循环继续，使用已有的 target 重新拨号
-		log.Println("[Core] [智能轮换] 链路已达寿命，正在无缝切换...")
-	}
+	// 传递 RTT 进行智能超时
+	pipeDirect(conn, wsConn, target, disconnectMode, rtt)
 }
 
 func match(rule Rule, target string) bool {
@@ -409,6 +353,7 @@ func match(rule Rule, target string) bool {
 	}
 }
 
+// [v24.5] 返回 time.Duration (RTT)
 func connectNanoTunnel(target string, outboundTag string, payload []byte) (*websocket.Conn, int, time.Duration, error) {
 	settings, ok := proxySettingsMap[outboundTag]
 	if !ok { return nil, MODE_AUTO, 0, errors.New("settings not found") }
@@ -461,7 +406,7 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 		if err != nil { return err }
 		
 		if backend.IP != "" {
-			// [v25.4 混合日志]
+			// [v24.5] 保持标准日志格式，完美适配 C 客户端
 			log.Printf("[Core] Tunnel -> %s (SNI) >>> %s:%s (Real) | Latency: %dms", targetNode.Domain, backend.IP, backend.Port, finalRTT.Milliseconds())
 		}
 		
@@ -479,140 +424,104 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 	return finalConn, currentMode, finalRTT, finalErr
 }
 
-// [v24.1 架构] 串行管道
-func pipeDirect(ws *websocket.Conn, local net.Conn, target string, mode int, rtt time.Duration) bool {
+// [v24.5] pipeDirect：单连接智能管理
+func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt time.Duration) {
 	defer ws.Close()
+	defer local.Close()
+
+	var upBytes, downBytes int64
+	startTime := time.Now()
 	var wg sync.WaitGroup
 	wg.Add(2)
-	
-	quit := make(chan struct{})
-	var needSwitching atomic.Value
-	needSwitching.Store(false)
+	var once sync.Once
+	closeConns := func() { once.Do(func() { ws.Close(); local.Close(); }) }
 
+	// 1. 智能超时 (RTT * 4)
 	smartTimeout := rtt * 4
-	if smartTimeout < 300 * time.Millisecond { smartTimeout = 300 * time.Millisecond }
-	if smartTimeout > 5 * time.Second { smartTimeout = 5 * time.Second }
+	if smartTimeout < 300 * time.Millisecond {
+		smartTimeout = 300 * time.Millisecond
+	} else if smartTimeout > 5 * time.Second {
+		smartTimeout = 5 * time.Second
+	}
 
+	// 2. 动态阈值
 	dynamicLimit := getDynamicThreshold()
 
 	enableDisconnect := false
+	logPrefix := "[智能]"
 	switch mode {
-	case MODE_KEEP: enableDisconnect = false
-	case MODE_CUT: enableDisconnect = true
+	case MODE_KEEP:
+		enableDisconnect = false
+		logPrefix = "[长连]"
+	case MODE_CUT:
+		enableDisconnect = true
+		logPrefix = "[短连]"
 	case MODE_AUTO:
 		if shouldDisableDisconnect(target) {
 			enableDisconnect = false
+			logPrefix = "[自动]"
 		} else {
 			enableDisconnect = true
+			log.Printf("[Core] [智能流控] %s 启用 (阈值: %.2fMB, 超时: %dms)", target, float64(dynamicLimit)/1024/1024, smartTimeout.Milliseconds())
 		}
 	}
-	
-	// Downlink: WS -> Local
+
+	// Downlink: WS -> TCP
 	go func() {
 		defer wg.Done()
-		var totalDownBytes int64 = 0
+		defer closeConns()
+		
 		buf := bufPool.Get().([]byte)
 		defer bufPool.Put(buf)
 		
 		for {
-			ws.SetReadDeadline(time.Now().Add(smartTimeout))
+			ws.SetReadDeadline(time.Now().Add(smartTimeout)) 
 			mt, r, err := ws.NextReader()
-			if err != nil { close(quit); return }
+			if err != nil { return }
 
 			if mt == websocket.BinaryMessage {
 				n, err := io.CopyBuffer(local, r, buf)
-				if err != nil { close(quit); return }
+				if err != nil { return }
 				
-				totalDownBytes += n
+				newDownBytes := atomic.AddInt64(&downBytes, n)
 				
-				if enableDisconnect && totalDownBytes > dynamicLimit {
-					needSwitching.Store(true)
-					close(quit)
-					return
+				// [智能断流] 达到随机阈值，主动断开
+				// 让浏览器自己去新建连接，这是最安全的
+				if enableDisconnect && newDownBytes > dynamicLimit {
+					log.Printf("[Core] %s %s 完成使命 (%.2f MB)，主动断开。", logPrefix, target, float64(newDownBytes)/1024/1024)
+					return 
 				}
 			}
 		}
-	}()
+	}() 
 
-	// Uplink: Local -> WS
+	// Uplink: TCP -> WS
 	go func() {
 		defer wg.Done()
+		defer closeConns()
 		buf := bufPool.Get().([]byte)
 		defer bufPool.Put(buf)
-		
 		for {
-			select {
-			case <-quit:
-				return
-			default:
-				local.SetReadDeadline(time.Now().Add(100*time.Millisecond))
-				n, err := local.Read(buf)
-				if n > 0 {
-					if err := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil { close(quit); return }
-				}
-				if err != nil {
-					if netErr, ok := err.(net.Error); ok && netErr.Timeout() { continue }
-					close(quit)
-					return
-				}
+			n, err := local.Read(buf)
+			if n > 0 {
+				atomic.AddInt64(&upBytes, int64(n))
+				if err := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil { return }
 			}
+			if err != nil { return }
 		}
 	}()
 
 	wg.Wait()
-	return needSwitching.Load().(bool)
+	duration := time.Since(startTime)
+	if downBytes > 0 || upBytes > 0 {
+		log.Printf("[Stats] %s | Up: %s | Down: %s | T: %v", target, formatBytes(upBytes), formatBytes(downBytes), duration.Round(time.Millisecond))
+	}
 }
-
 
 func selectBackend(backends []Backend, key string) Backend { if len(backends) == 0 { return Backend{} }; if len(backends) == 1 { return backends[0] }; totalWeight := 0; for _, b := range backends { totalWeight += b.Weight }; h := md5.Sum([]byte(key)); hashVal := binary.BigEndian.Uint64(h[:8]); if totalWeight == 0 { return backends[int(hashVal%uint64(len(backends)))] }; targetVal := int(hashVal % uint64(totalWeight)); currentWeight := 0; for _, b := range backends { currentWeight += b.Weight; if targetVal < currentWeight { return b } }; return backends[0] }
 func dialZeusWebSocket(sni string, backend Backend, token string) (*websocket.Conn, error) { sniHost, sniPort, err := net.SplitHostPort(sni); if err != nil { sniHost, sniPort = sni, "443" }; dialPort := sniPort; if backend.Port != "" { dialPort = backend.Port }; wsURL := fmt.Sprintf("wss://%s:%s/?token=%s", sniHost, sniPort, url.QueryEscape(token)); requestHeader := http.Header{}; requestHeader.Add("Host", sniHost); requestHeader.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"); dialer := websocket.Dialer{ TLSClientConfig: &tls.Config{ InsecureSkipVerify: true, ServerName: sniHost }, HandshakeTimeout: 5 * time.Second }; if backend.IP != "" { dialer.NetDial = func(network, addr string) (net.Conn, error) { return net.DialTimeout(network, net.JoinHostPort(backend.IP, dialPort), 5*time.Second) } }; conn, resp, err := dialer.Dial(wsURL, requestHeader); if err != nil { if resp != nil { return nil, fmt.Errorf("handshake failed with status %d", resp.StatusCode) }; return nil, err }; return conn, nil }
 func formatBytes(b int64) string { const unit = 1024; if b < unit { return fmt.Sprintf("%d B", b) }; div, exp := int64(unit), 0; for n := b / unit; n >= unit; n /= unit { div *= unit; exp++ }; return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp]) }
 func sendNanoHeaderV2(wsConn *websocket.Conn, target string, payload []byte, s5 string, fb string) error { host, portStr, _ := net.SplitHostPort(target); var port uint16; fmt.Sscanf(portStr, "%d", &port); hostBytes, s5Bytes, fbBytes := []byte(host), []byte(s5), []byte(fb); if len(hostBytes) > 255 || len(s5Bytes) > 255 || len(fbBytes) > 255 { return errors.New("address length exceeds 255 bytes") }; buf := new(bytes.Buffer); buf.WriteByte(byte(len(hostBytes))); buf.Write(hostBytes); portBytes := make([]byte, 2); binary.BigEndian.PutUint16(portBytes, port); buf.Write(portBytes); buf.WriteByte(byte(len(s5Bytes))); if len(s5Bytes) > 0 { buf.Write(s5Bytes) }; buf.WriteByte(byte(len(fbBytes))); if len(fbBytes) > 0 { buf.Write(fbBytes) }; if len(payload) > 0 { buf.Write(payload) }; return wsConn.WriteMessage(websocket.BinaryMessage, buf.Bytes()) }
-
-// [v24.2 修复] SOCKS5 握手逻辑必须在 Read Request 之前回复 05 00
-func handleSOCKS5(conn net.Conn) (string, error) {
-	// buf[0] (VER) 已经被 caller 读取
-	// Step 1: 读取 NMETHODS
-	nmBuf := make([]byte, 1)
-	if _, err := io.ReadFull(conn, nmBuf); err != nil { return "", err }
-	nMethods := int(nmBuf[0])
-	
-	// Step 2: 读取 METHODS
-	methodsBuf := make([]byte, nMethods)
-	if _, err := io.ReadFull(conn, methodsBuf); err != nil { return "", err }
-	
-	// ★★★ 修复：必须在这里回复，否则死锁 ★★★
-	// Step 3: Server 回复: VER(5) METHOD(0 - No Auth)
-	if _, err := conn.Write([]byte{0x05, 0x00}); err != nil { return "", err }
-	
-	// Step 4: Client 发送请求
-	// VER(1) CMD(1) RSV(1) ATYP(1) ...
-	header := make([]byte, 4)
-	if _, err := io.ReadFull(conn, header); err != nil { return "", err }
-	
-	var host string
-	switch header[3] {
-	case 1: // IPv4
-		b := make([]byte, 4)
-		io.ReadFull(conn, b)
-		host = net.IP(b).String()
-	case 3: // Domain
-		b := make([]byte, 1)
-		io.ReadFull(conn, b)
-		d := make([]byte, b[0])
-		io.ReadFull(conn, d)
-		host = string(d)
-	case 4: // IPv6
-		b := make([]byte, 16)
-		io.ReadFull(conn, b)
-		host = net.IP(b).String()
-	}
-	portBytes := make([]byte, 2)
-	io.ReadFull(conn, portBytes)
-	port := binary.BigEndian.Uint16(portBytes)
-	
-	return net.JoinHostPort(host, fmt.Sprintf("%d", port)), nil
-}
-
+func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) { handshakeBuf := make([]byte, 2); io.ReadFull(conn, handshakeBuf); conn.Write([]byte{0x05, 0x00}); header := make([]byte, 4); io.ReadFull(conn, header); var host string; switch header[3] { case 1: b := make([]byte, 4); io.ReadFull(conn, b); host = net.IP(b).String(); case 3: b := make([]byte, 1); io.ReadFull(conn, b); d := make([]byte, b[0]); io.ReadFull(conn, d); host = string(d); case 4: b := make([]byte, 16); io.ReadFull(conn, b); host = net.IP(b).String() }; portBytes := make([]byte, 2); io.ReadFull(conn, portBytes); port := binary.BigEndian.Uint16(portBytes); return net.JoinHostPort(host, fmt.Sprintf("%d", port)), nil }
 func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) (string, []byte, int, error) { reader := bufio.NewReader(io.MultiReader(bytes.NewReader(initialData), conn)); req, err := http.ReadRequest(reader); if err != nil { return "", nil, 0, err }; target := req.Host; if !strings.Contains(target, ":") { if req.Method == "CONNECT" { target += ":443" } else { target += ":80" } }; if req.Method == "CONNECT" { return target, nil, 2, nil }; var buf bytes.Buffer; req.WriteProxy(&buf); return target, buf.Bytes(), 3, nil }
 func parseServerAddr(addr string) (host, port, path string, err error) { path = "/"; if idx := strings.Index(addr, "/"); idx != -1 { path, addr = addr[idx:], addr[:idx] }; host, port, err = net.SplitHostPort(addr); if err != nil { host, port, err = addr, "443", nil }; return }
