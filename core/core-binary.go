@@ -478,8 +478,8 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 		if err != nil { return err }
 		
 		if backend.IP != "" {
-			// 在 v25 中减少日志频率，避免并发拨号刷屏
-			// log.Printf(...) 
+			// 开启日志，观察空中加油效果
+			log.Printf("[Core] [预拨号] Tunnel -> %s (SNI) >>> %s:%s (Real) | RTT: %dms", targetNode.Domain, backend.IP, backend.Port, finalRTT.Milliseconds())
 		}
 		
 		err = sendNanoHeaderV2(wsConn, target, payload, socks5, fallback)
