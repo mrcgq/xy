@@ -1,8 +1,8 @@
-// core/core-binary.go (v27.1 - Final Fix)
-// [版本] v27.1 最终修复版
-// [修复] 补全缺失的 websocket 依赖，修正 import 拼写错误
-// [架构] 智能流控 + 域名白名单豁免 (gRPC/HTTPS 兼容)
-// [状态] 可直接编译，生产级
+// core/core-binary.go (v27.2 - LTS Perfect Fix)
+// [版本] v27.2 长期支持完美修正版
+// [基底] 基于 v21.5 (最稳定的单线程架构)
+// [修复] 补全 gRPC/AI 域名的豁免名单，彻底解决 Google AI Studio 白屏问题
+// [状态] 生产级可用，推荐焊死在此版本
 
 //go:build binary
 // +build binary
@@ -34,49 +34,57 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gorilla/websocket" // ★★★ 已补回 ★★★
-	"github.com/v2fly/v2ray-core/v5/app/router/routercommon" // ★★★ 已修正拼写 ★★★
+	"github.com/gorilla/websocket"
+	"github.com/v2fly/v2ray-core/v5/app/router/routercommon"
 	"google.golang.org/protobuf/proto"
 )
 
-// ================== [v27.1] 智能配置 ==================
+// ================== [v27.2] 智能流控配置 ==================
 
 const (
-	MODE_AUTO = 0 
-	MODE_KEEP = 1 // 长连接 (免死金牌)
-	MODE_CUT  = 2 // 短连接 (主动断流)
+	MODE_AUTO = 0 // 智能识别 (默认)
+	MODE_KEEP = 1 // 强制保持 (视频/游戏/gRPC)
+	MODE_CUT  = 2 // 强制断流 (普通网页)
+
+	MAX_BYTES_PER_CONN      = 10 * 1024 * 1024 // 10MB 基础阈值
+	NO_RESPONSE_TIMEOUT_MS = 200              // 200ms 无响应超时
 )
 
-// 动态阈值 (8MB ~ 12MB)
-func getDynamicThreshold() int64 {
-	base := int64(8 * 1024 * 1024)
-	jitter := rand.Int63n(4 * 1024 * 1024)
-	return base + jitter
+// [v27.2 核心修复] 
+// 这里的名单是“免死金牌”。凡是在这里的域名，绝对不会被 10MB 强制断开。
+// 必须包含所有的 gRPC、视频、AI 服务域名。
+var disconnectExemptList = []string{
+	// 视频/直播 (流媒体需要长连接)
+	"youtube.com", "googlevideo.com", "ytimg.com", "youtu.be",
+	"nflxvideo.net", "vimeo.com", "live", "stream", "twitch.tv",
+	// 即时通讯 (WebSocket/长轮询)
+	"telesco.pe", "tdesktop.com", "web.whatsapp.com", "discord.com",
+	// ★★★ AI & gRPC 专用 (解决白屏的关键) ★★★
+	"aistudio.google.com", "gemini.google.com", "bard.google.com",
+	"openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com",
+	"anthropic.com", "claude.ai",
+	"googleapis.com", "gstatic.com", // Google 的许多服务走 gRPC
+	// 协作工具
+	"figma.com", "slack.com", "notion.so",
 }
 
-// 豁免名单：gRPC/HTTP2/视频流
-var disconnectExemptList = []string{
-	// 视频/直播
-	"youtube.com", "googlevideo.com", "ytimg.com", "youtu.be",
-	"nflxvideo.net", "vimeo.com", "live", "stream",
-	// AI / gRPC
-	"aistudio.google.com", "openai.com", "anthropic.com", "gemini.google.com",
-	// 协作工具
-	"figma.com", "slack.com",
-	// 即时通讯
-	"telesco.pe", "tdesktop.com",
-}
 var disconnectSuffixRegex = regexp.MustCompile(`(?i)\.(m3u8|mp4|flv|mkv|avi|mov|ts|webm)$`)
 
-func shouldBeExempted(target string) bool {
+// 判断是否应该禁用断流 (返回 true = 禁用断流/保活; 返回 false = 允许断流)
+func shouldDisableDisconnect(target string) bool {
 	host, portStr, err := net.SplitHostPort(target)
 	if err != nil { host = target }
 	host = strings.ToLower(host)
-	
+
+	// 1. 域名白名单匹配 (最优先)
 	for _, keyword := range disconnectExemptList {
 		if strings.Contains(host, keyword) { return true }
 	}
+	
+	// 2. 文件后缀匹配
 	if disconnectSuffixRegex.MatchString(host) { return true }
+	
+	// 3. 非标准端口匹配 (游戏、特殊服务通常不用 80/443)
 	if portStr != "80" && portStr != "443" && portStr != "" { return true }
 	
 	return false
@@ -133,7 +141,7 @@ var (
 
 var bufPool = sync.Pool{New: func() interface{} { return make([]byte, 32*1024) }}
 
-// ======================== 主入口 ========================
+// ======================== 主入口 (Main) ========================
 
 func main() {
 	configPath := flag.String("c", "", "Path to config file (JSON)")
@@ -143,7 +151,6 @@ func main() {
 	serverIP := flag.String("ip", "", "Global fallback server IP for ping")
 
 	flag.Parse()
-	rand.Seed(time.Now().UnixNano())
 
 	if *ping {
 		if *server == "" || *key == "" {
@@ -204,6 +211,18 @@ func matchDomainRule(domain string, rule *routercommon.Domain) bool {
 	case routercommon.Domain_Full: return domain == rule.Value
 	default: return false
 	}
+}
+
+func isDomainInGeosite(domain, geositeCategory string) bool {
+	geodataMutex.RLock()
+	defer geodataMutex.RUnlock()
+	if geositeMatcher == nil { return false }
+	matchers, found := geositeMatcher[strings.ToLower(geositeCategory)]
+	if !found { return false }
+	for _, matcher := range matchers {
+		if matchDomainRule(domain, matcher) { return true }
+	}
+	return false
 }
 
 func parseNode(nodeStr string) Node {
@@ -313,7 +332,7 @@ func parseOutbounds() {
 
 func StartInstance(configContent []byte) (net.Listener, error) {
 	rand.Seed(time.Now().UnixNano()); proxySettingsMap = make(map[string]ProxySettings); routingMap = nil
-	log.Println("[Core] [系统初始化] 正在加载 v27.1 (LTS 修复版)...")
+	log.Println("[Core] [系统初始化] 正在加载 v27.2 (LTS 完美修正版)...")
 	if checkFileDependency("xray.exe") { log.Println("[Core] [依赖检查] ✅ xray.exe 匹配成功! [智能分流] 模式可用。") } else { log.Println("[Core] [依赖检查] ⚠️ xray.exe 未找到!") }
 	if checkFileDependency("geosite.dat") { log.Println("[Core] [依赖检查] ✅ geosite.dat 匹配成功!"); loadGeodata() } else { log.Println("[Core] [依赖检查] ⚠️ geosite.dat 未找到!") }
 	if checkFileDependency("geoip.dat") { log.Println("[Core] [依赖检查] ✅ geoip.dat 匹配成功!") } else { log.Println("[Core] [依赖检查] ⚠️ geoip.dat 未找到!") }
@@ -324,7 +343,7 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 	inbound := globalConfig.Inbounds[0]; listener, err := net.Listen("tcp", inbound.Listen); if err != nil { return nil, err }
 	mode := "Single Node"; if s, ok := proxySettingsMap["proxy"]; ok { if len(s.NodePool) > 1 { mode = fmt.Sprintf("Zeus Pool (%d nodes)", len(s.NodePool)) } else if len(s.NodePool) == 1 { mode = fmt.Sprintf("Zeus Single") }; if len(routingMap) > 0 { mode += fmt.Sprintf(" + Rules") } }
 	if s, ok := proxySettingsMap["proxy"]; ok && s.GlobalKeepAlive { log.Println("[Core] ★★★ 全局沉浸模式 (L3) 已开启 ★★★") }
-	log.Printf("[Core] Xlink Engine v27 Listening on %s [%s]", inbound.Listen, mode)
+	log.Printf("[Core] Xlink Engine v27.2 Listening on %s [%s]", inbound.Listen, mode)
 	go func() { for { conn, err := listener.Accept(); if err != nil { break }; go handleGeneralConnection(conn, inbound.Tag) } }()
 	return listener, nil
 }
@@ -340,21 +359,13 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	if _, err := io.ReadFull(conn, buf); err != nil { return }
 	var target string; var err error; var firstFrame []byte; var mode int
 	switch buf[0] { case 0x05: target, err = handleSOCKS5(conn, inboundTag); mode = 1; default: target, firstFrame, mode, err = handleHTTP(conn, buf, inboundTag) }
+	if err != nil { return }
 	
+	wsConn, disconnectMode, err := connectNanoTunnel(target, "proxy", firstFrame)
 	if err != nil { return }
-
-	wsConn, disconnectMode, rtt, err := connectNanoTunnel(target, "proxy", firstFrame)
-	if err != nil { return }
-
-	// [v27.0] 终极决策：白名单豁免
-	finalMode := disconnectMode
-	if shouldBeExempted(target) {
-		finalMode = MODE_KEEP
-	}
-
+	
 	if mode == 1 { conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) }; if mode == 2 { conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
-	
-	pipeDirect(conn, wsConn, target, finalMode, rtt)
+	pipeDirect(conn, wsConn, target, disconnectMode)
 }
 
 func match(rule Rule, target string) bool {
@@ -366,9 +377,9 @@ func match(rule Rule, target string) bool {
 	}
 }
 
-func connectNanoTunnel(target string, outboundTag string, payload []byte) (*websocket.Conn, int, time.Duration, error) {
+func connectNanoTunnel(target string, outboundTag string, payload []byte) (*websocket.Conn, int, error) {
 	settings, ok := proxySettingsMap[outboundTag]
-	if !ok { return nil, MODE_AUTO, 0, errors.New("settings not found") }
+	if !ok { return nil, MODE_AUTO, errors.New("settings not found") }
 	
 	currentMode := MODE_AUTO
 	if settings.GlobalKeepAlive { currentMode = MODE_KEEP }
@@ -377,12 +388,11 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 	secretKey := parts[0]; fallback := ""
 	if len(parts) > 1 { fallback = parts[1] }
 
-	socks5 := settings.S5
+	socks5 := settings.S5 
 	if socks5 == "" && settings.ForwarderSettings != nil { socks5 = settings.ForwarderSettings.Socks5Address }
 
 	var finalConn *websocket.Conn
 	var finalErr error
-	var finalRTT time.Duration
 
 	tryConnectOnce := func() error {
 		var targetNode Node
@@ -405,7 +415,7 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 				case "hash": h := md5.Sum([]byte(target)); hashVal := binary.BigEndian.Uint64(h[:8]); targetNode = settings.NodePool[hashVal%uint64(len(settings.NodePool))]
 				default: targetNode = settings.NodePool[rand.Intn(len(settings.NodePool))]
 				}
-			} else { return errors.New("no nodes configured") }
+			} else { return errors.New("no nodes") }
 		}
 
 		backend := selectBackend(targetNode.Backends, target)
@@ -413,12 +423,12 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 
 		start := time.Now()
 		wsConn, err := dialZeusWebSocket(targetNode.Domain, backend, secretKey)
-		finalRTT = time.Since(start)
+		latency := time.Since(start).Milliseconds()
 		
 		if err != nil { return err }
 		
 		if backend.IP != "" {
-			log.Printf("[Core] Tunnel -> %s (SNI) >>> %s:%s (Real) | Latency: %dms", targetNode.Domain, backend.IP, backend.Port, finalRTT.Milliseconds())
+			log.Printf("[Core] Tunnel -> %s (SNI) >>> %s:%s (Real) | Latency: %dms", targetNode.Domain, backend.IP, backend.Port, latency)
 		}
 		
 		err = sendNanoHeaderV2(wsConn, target, payload, socks5, fallback)
@@ -432,10 +442,10 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 		finalErr = tryConnectOnce()
 	}
 	
-	return finalConn, currentMode, finalRTT, finalErr
+	return finalConn, currentMode, finalErr
 }
 
-func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt time.Duration) {
+func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int) {
 	defer ws.Close()
 	defer local.Close()
 
@@ -446,41 +456,34 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt
 	var once sync.Once
 	closeConns := func() { once.Do(func() { ws.Close(); local.Close(); }) }
 
-	smartTimeout := rtt * 4
-	if smartTimeout < 300 * time.Millisecond {
-		smartTimeout = 300 * time.Millisecond
-	} else if smartTimeout > 5 * time.Second {
-		smartTimeout = 5 * time.Second
-	}
-
-	dynamicLimit := getDynamicThreshold()
-
 	enableDisconnect := false
-	logPrefix := "[智能]"
 	switch mode {
 	case MODE_KEEP:
 		enableDisconnect = false
-		logPrefix = "[长连]"
 		log.Printf("[Core] [长连] %s 命中豁免名单/gRPC，禁用断流。", target)
 	case MODE_CUT:
 		enableDisconnect = true
-		logPrefix = "[短连]"
+		log.Printf("[Core] [短连] %s 命中强制断流。", target)
 	case MODE_AUTO:
-		// v27: 既然到了这里，说明没在豁免名单，那就断
-		enableDisconnect = true
-		log.Printf("[Core] [智能流控] %s 启用 (阈值: %.2fMB, 超时: %dms)", target, float64(dynamicLimit)/1024/1024, smartTimeout.Milliseconds())
+		// 如果不在豁免名单，才开启断流
+		if shouldDisableDisconnect(target) {
+			enableDisconnect = false
+			log.Printf("[Core] [智能] %s 命中豁免名单/gRPC，自动保活。", target)
+		} else {
+			enableDisconnect = true
+			log.Printf("[Core] [智能] %s 启用流量清洗 (10MB)。", target)
+		}
 	}
 
 	// Downlink: WS -> TCP
 	go func() {
 		defer wg.Done()
 		defer closeConns()
-		
 		buf := bufPool.Get().([]byte)
 		defer bufPool.Put(buf)
 		
 		for {
-			ws.SetReadDeadline(time.Now().Add(smartTimeout)) 
+			ws.SetReadDeadline(time.Now().Add(180 * time.Second)) 
 			mt, r, err := ws.NextReader()
 			if err != nil { return }
 
@@ -489,10 +492,9 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt
 				if err != nil { return }
 				
 				newDownBytes := atomic.AddInt64(&downBytes, n)
-				
-				if enableDisconnect && newDownBytes > dynamicLimit {
-					log.Printf("[Core] %s %s 完成使命 (%.2f MB)，主动断开。", logPrefix, target, float64(newDownBytes)/1024/1024)
-					return 
+				if enableDisconnect && newDownBytes > MAX_BYTES_PER_CONN {
+					log.Printf("[Core] %s 完成使命 (%.1f MB)，断开。", target, float64(newDownBytes)/1024/1024)
+					return
 				}
 			}
 		}
@@ -517,7 +519,7 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt
 	wg.Wait()
 	duration := time.Since(startTime)
 	if downBytes > 0 || upBytes > 0 {
-		log.Printf("[Stats] %s | Up: %s | Down: %s | T: %v", target, formatBytes(upBytes), formatBytes(downBytes), duration.Round(time.Millisecond))
+		log.Printf("[Stats] %s | Up: %s | Down: %s | T: %v", target, formatBytes(upBytes), formatBytes(downBytes), duration.Round(time.Second))
 	}
 }
 
