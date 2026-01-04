@@ -1,8 +1,9 @@
-// core/core-binary.go (v28.2 - API Compatible Fix)
-// [版本] v28.2 接口兼容修复版
-// [修复] RunSpeedTest 参数改回 string，完美兼容外部 main.go 调用
-// [特性] 包含 v28 所有自适应功能 (健康探测/智能负载/熔断器)
-// [状态] 最终完整版，可直接编译通过
+// core/core-binary.go (v28.3 - Emergency Fix)
+// [版本] v28.3 紧急修复版
+// [修复1] 移除导致 Panic 的全局熔断器锁 (sync: unlock of unlocked mutex)
+// [修复2] 解决误判浏览器并发连接为"恶意重连"的问题
+// [保留] 保留 v28 的"主动健康探测"和"智能负载均衡"
+// [状态] 稳定可用，不再崩溃
 
 //go:build binary
 // +build binary
@@ -39,7 +40,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// ================== [v28.2] 智能配置 ==================
+// ================== [v28.3] 智能配置 ==================
 
 const (
 	MODE_AUTO = 0 
@@ -88,6 +89,7 @@ type Backend struct { IP, Port string; Weight int }
 type Node struct {
 	Domain   string
 	Backends []Backend
+	// 健康状态监控
 	mu       sync.RWMutex
 	latency  time.Duration
 	alive    bool
@@ -153,7 +155,6 @@ func main() {
 		if *server == "" || *key == "" {
 			log.Fatal("Ping mode requires -server and -key")
 		}
-		// 这里直接传字符串，RunSpeedTest 内部会处理
 		RunSpeedTest(*server, *key, *serverIP)
 		return
 	}
@@ -224,7 +225,7 @@ func isDomainInGeosite(domain, geositeCategory string) bool {
 }
 
 func parseNode(nodeStr string) *Node {
-	n := &Node{alive: true, latency: time.Hour}
+	n := &Node{alive: true, latency: time.Hour} // 默认初始化
 	parts := strings.SplitN(nodeStr, "#", 2)
 	n.Domain = strings.TrimSpace(parts[0])
 	if len(parts) != 2 || parts[1] == "" { return n }
@@ -330,7 +331,7 @@ func parseOutbounds() {
 
 func StartInstance(configContent []byte) (net.Listener, error) {
 	rand.Seed(time.Now().UnixNano()); proxySettingsMap = make(map[string]ProxySettings); routingMap = nil
-	log.Println("[Core] [系统初始化] 正在加载 v28.2 (自适应兼容版)...")
+	log.Println("[Core] [系统初始化] 正在加载 v28.3 (紧急修复版)...")
 	if checkFileDependency("xray.exe") { log.Println("[Core] [依赖检查] ✅ xray.exe 匹配成功! [智能分流] 模式可用。") } else { log.Println("[Core] [依赖检查] ⚠️ xray.exe 未找到!") }
 	if checkFileDependency("geosite.dat") { log.Println("[Core] [依赖检查] ✅ geosite.dat 匹配成功!"); loadGeodata() } else { log.Println("[Core] [依赖检查] ⚠️ geosite.dat 未找到!") }
 	if checkFileDependency("geoip.dat") { log.Println("[Core] [依赖检查] ✅ geoip.dat 匹配成功!") } else { log.Println("[Core] [依赖检查] ⚠️ geoip.dat 未找到!") }
@@ -339,7 +340,7 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 	parseOutbounds(); 
 	if s, ok := proxySettingsMap["proxy"]; ok { 
 		parseRules(s.NodePool)
-		go healthChecker(s.NodePool, s.Token, s.ServerIP)
+		go healthChecker(s.NodePool, s.Token, s.ServerIP) // 启动健康检查
 	}
 	if len(globalConfig.Inbounds) == 0 { return nil, errors.New("no inbounds") }
 	inbound := globalConfig.Inbounds[0]; listener, err := net.Listen("tcp", inbound.Listen); if err != nil { return nil, err }
@@ -353,7 +354,7 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 type TestResult struct { Node *Node; Delay time.Duration; Error error }
 func pingNode(node *Node, token, globalIP string, results chan<- TestResult) { startTime := time.Now(); backend := selectBackend(node.Backends, ""); if backend.IP == "" { backend.IP = globalIP }; conn, err := dialZeusWebSocket(node.Domain, backend, token); if err != nil { results <- TestResult{Node: node, Error: err}; return }; conn.Close(); delay := time.Since(startTime); results <- TestResult{Node: node, Delay: delay} }
 
-// 辅助函数：解析字符串为节点列表
+// 辅助函数
 func parseNodesForPing(serverAddr string) []*Node {
 	var nodes []*Node
 	rawPool := strings.ReplaceAll(serverAddr, "\r\n", ";")
@@ -367,11 +368,8 @@ func parseNodesForPing(serverAddr string) []*Node {
 	return nodes
 }
 
-// [v28.2] 修复：RunSpeedTest 接收 string 参数，内部解析
 func RunSpeedTest(serverAddr string, token, globalIP string) { 
-	// 内部解析，兼容接口
 	nodes := parseNodesForPing(serverAddr)
-	
 	if len(nodes) == 0 { log.Println("No valid nodes found."); return }; var wg sync.WaitGroup; results := make(chan TestResult, len(nodes)); for _, node := range nodes { wg.Add(1); go func(n *Node) { defer wg.Done(); parts := strings.SplitN(token, "|", 2); pingNode(n, parts[0], globalIP, results) }(node) }; wg.Wait(); close(results); var successful, failed []TestResult; for res := range results { if res.Error == nil { successful = append(successful, res) } else { failed = append(failed, res) } }; sort.Slice(successful, func(i, j int) bool { return successful[i].Delay < successful[j].Delay }); fmt.Println("\nPing Test Report"); for i, res := range successful { fmt.Printf("%d. %-40s | Delay: %v\n", i+1, formatNode(res.Node), res.Delay.Round(time.Millisecond)) }; if len(failed) > 0 { fmt.Println("\nFailed Nodes"); for _, res := range failed { fmt.Printf("- %-40s | Error: %v\n", formatNode(res.Node), res.Error) } }; fmt.Println("\n------------------------------------") 
 }
 
@@ -416,27 +414,10 @@ func healthChecker(nodes []*Node, token, globalIP string) {
 	}
 }
 
-var (
-	reconnectMux      sync.Mutex
-	reconnectCount    int
-	lastReconnectTime time.Time
-)
-
+// [v28.3 修复] 移除了全局熔断逻辑，直接处理连接
 func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	defer conn.Close()
 	
-	reconnectMux.Lock()
-	if reconnectCount > 5 && time.Since(lastReconnectTime) < 3*time.Second {
-		reconnectMux.Unlock()
-		log.Printf("[Core] [熔断] 3秒内重连次数过多，进入冷静期 5 秒...")
-		time.Sleep(5 * time.Second)
-	} else if time.Since(lastReconnectTime) >= 3*time.Second {
-		reconnectCount = 0
-	}
-	reconnectCount++
-	lastReconnectTime = time.Now()
-	reconnectMux.Unlock()
-
 	buf := make([]byte, 1)
 	if _, err := io.ReadFull(conn, buf); err != nil { return }
 	var target string; var err error; var firstFrame []byte; var mode int
@@ -483,6 +464,7 @@ func selectSmartNode(nodes []*Node) *Node {
 		return nodes[rand.Intn(len(nodes))]
 	}
 
+	// 智能选择：按延迟排序
 	sort.Slice(aliveNodes, func(i, j int) bool {
 		aliveNodes[i].mu.RLock()
 		aliveNodes[j].mu.RLock()
