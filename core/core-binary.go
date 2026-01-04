@@ -1,7 +1,8 @@
-// core/core-binary.go (v28.1 - Final Compile Fix)
-// [版本] v28.1 编译修复版
-// [修复] 修正 main 函数中调用 RunSpeedTest 时的类型不匹配问题
-// [状态] 完整无误，可直接编译
+// core/core-binary.go (v28.2 - API Compatible Fix)
+// [版本] v28.2 接口兼容修复版
+// [修复] RunSpeedTest 参数改回 string，完美兼容外部 main.go 调用
+// [特性] 包含 v28 所有自适应功能 (健康探测/智能负载/熔断器)
+// [状态] 最终完整版，可直接编译通过
 
 //go:build binary
 // +build binary
@@ -38,7 +39,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// ================== [v28.1] 智能配置 ==================
+// ================== [v28.2] 智能配置 ==================
 
 const (
 	MODE_AUTO = 0 
@@ -152,10 +153,8 @@ func main() {
 		if *server == "" || *key == "" {
 			log.Fatal("Ping mode requires -server and -key")
 		}
-		// ★★★ 编译修复 ★★★
-		// 调用新的辅助函数来解析字符串为节点指针切片
-		tempNodes := parseNodesForPing(*server)
-		RunSpeedTest(tempNodes, *key, *serverIP)
+		// 这里直接传字符串，RunSpeedTest 内部会处理
+		RunSpeedTest(*server, *key, *serverIP)
 		return
 	}
 
@@ -331,7 +330,7 @@ func parseOutbounds() {
 
 func StartInstance(configContent []byte) (net.Listener, error) {
 	rand.Seed(time.Now().UnixNano()); proxySettingsMap = make(map[string]ProxySettings); routingMap = nil
-	log.Println("[Core] [系统初始化] 正在加载 v28.1 (自适应版)...")
+	log.Println("[Core] [系统初始化] 正在加载 v28.2 (自适应兼容版)...")
 	if checkFileDependency("xray.exe") { log.Println("[Core] [依赖检查] ✅ xray.exe 匹配成功! [智能分流] 模式可用。") } else { log.Println("[Core] [依赖检查] ⚠️ xray.exe 未找到!") }
 	if checkFileDependency("geosite.dat") { log.Println("[Core] [依赖检查] ✅ geosite.dat 匹配成功!"); loadGeodata() } else { log.Println("[Core] [依赖检查] ⚠️ geosite.dat 未找到!") }
 	if checkFileDependency("geoip.dat") { log.Println("[Core] [依赖检查] ✅ geoip.dat 匹配成功!") } else { log.Println("[Core] [依赖检查] ⚠️ geoip.dat 未找到!") }
@@ -354,7 +353,7 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 type TestResult struct { Node *Node; Delay time.Duration; Error error }
 func pingNode(node *Node, token, globalIP string, results chan<- TestResult) { startTime := time.Now(); backend := selectBackend(node.Backends, ""); if backend.IP == "" { backend.IP = globalIP }; conn, err := dialZeusWebSocket(node.Domain, backend, token); if err != nil { results <- TestResult{Node: node, Error: err}; return }; conn.Close(); delay := time.Since(startTime); results <- TestResult{Node: node, Delay: delay} }
 
-// ★★★ 编译修复：新增的辅助函数 ★★★
+// 辅助函数：解析字符串为节点列表
 func parseNodesForPing(serverAddr string) []*Node {
 	var nodes []*Node
 	rawPool := strings.ReplaceAll(serverAddr, "\r\n", ";")
@@ -368,7 +367,14 @@ func parseNodesForPing(serverAddr string) []*Node {
 	return nodes
 }
 
-func RunSpeedTest(nodes []*Node, token, globalIP string) { if len(nodes) == 0 { log.Println("No valid nodes found."); return }; var wg sync.WaitGroup; results := make(chan TestResult, len(nodes)); for _, node := range nodes { wg.Add(1); go func(n *Node) { defer wg.Done(); parts := strings.SplitN(token, "|", 2); pingNode(n, parts[0], globalIP, results) }(node) }; wg.Wait(); close(results); var successful, failed []TestResult; for res := range results { if res.Error == nil { successful = append(successful, res) } else { failed = append(failed, res) } }; sort.Slice(successful, func(i, j int) bool { return successful[i].Delay < successful[j].Delay }); fmt.Println("\nPing Test Report"); for i, res := range successful { fmt.Printf("%d. %-40s | Delay: %v\n", i+1, formatNode(res.Node), res.Delay.Round(time.Millisecond)) }; if len(failed) > 0 { fmt.Println("\nFailed Nodes"); for _, res := range failed { fmt.Printf("- %-40s | Error: %v\n", formatNode(res.Node), res.Error) } }; fmt.Println("\n------------------------------------") }
+// [v28.2] 修复：RunSpeedTest 接收 string 参数，内部解析
+func RunSpeedTest(serverAddr string, token, globalIP string) { 
+	// 内部解析，兼容接口
+	nodes := parseNodesForPing(serverAddr)
+	
+	if len(nodes) == 0 { log.Println("No valid nodes found."); return }; var wg sync.WaitGroup; results := make(chan TestResult, len(nodes)); for _, node := range nodes { wg.Add(1); go func(n *Node) { defer wg.Done(); parts := strings.SplitN(token, "|", 2); pingNode(n, parts[0], globalIP, results) }(node) }; wg.Wait(); close(results); var successful, failed []TestResult; for res := range results { if res.Error == nil { successful = append(successful, res) } else { failed = append(failed, res) } }; sort.Slice(successful, func(i, j int) bool { return successful[i].Delay < successful[j].Delay }); fmt.Println("\nPing Test Report"); for i, res := range successful { fmt.Printf("%d. %-40s | Delay: %v\n", i+1, formatNode(res.Node), res.Delay.Round(time.Millisecond)) }; if len(failed) > 0 { fmt.Println("\nFailed Nodes"); for _, res := range failed { fmt.Printf("- %-40s | Error: %v\n", formatNode(res.Node), res.Error) } }; fmt.Println("\n------------------------------------") 
+}
+
 func formatNode(n *Node) string { if n == nil { return "" }; res := n.Domain; if len(n.Backends) > 0 { res += "#..."; }; return res }
 
 func healthChecker(nodes []*Node, token, globalIP string) {
