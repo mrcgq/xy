@@ -1,9 +1,8 @@
-// core/core-binary.go (v28.3 - Emergency Fix)
-// [版本] v28.3 紧急修复版
-// [修复1] 移除导致 Panic 的全局熔断器锁 (sync: unlock of unlocked mutex)
-// [修复2] 解决误判浏览器并发连接为"恶意重连"的问题
-// [保留] 保留 v28 的"主动健康探测"和"智能负载均衡"
-// [状态] 稳定可用，不再崩溃
+// core/core-binary.go (v28.3 - Logic Patch)
+// [版本] v28.3 逻辑修正版
+// [修复] 修复白名单域名(如 YouTube)因智能超时过短而被误杀的问题
+// [机制] 白名单域名使用 180s 宽容超时，普通域名使用 RTTx3 激进超时
+// [状态] 稳定，修复了"Youtube打不开"的Bug
 
 //go:build binary
 // +build binary
@@ -89,7 +88,6 @@ type Backend struct { IP, Port string; Weight int }
 type Node struct {
 	Domain   string
 	Backends []Backend
-	// 健康状态监控
 	mu       sync.RWMutex
 	latency  time.Duration
 	alive    bool
@@ -155,7 +153,8 @@ func main() {
 		if *server == "" || *key == "" {
 			log.Fatal("Ping mode requires -server and -key")
 		}
-		RunSpeedTest(*server, *key, *serverIP)
+		tempNodes := parseNodesForPing(*server)
+		RunSpeedTest(tempNodes, *key, *serverIP)
 		return
 	}
 
@@ -225,7 +224,7 @@ func isDomainInGeosite(domain, geositeCategory string) bool {
 }
 
 func parseNode(nodeStr string) *Node {
-	n := &Node{alive: true, latency: time.Hour} // 默认初始化
+	n := &Node{alive: true, latency: time.Hour}
 	parts := strings.SplitN(nodeStr, "#", 2)
 	n.Domain = strings.TrimSpace(parts[0])
 	if len(parts) != 2 || parts[1] == "" { return n }
@@ -331,7 +330,7 @@ func parseOutbounds() {
 
 func StartInstance(configContent []byte) (net.Listener, error) {
 	rand.Seed(time.Now().UnixNano()); proxySettingsMap = make(map[string]ProxySettings); routingMap = nil
-	log.Println("[Core] [系统初始化] 正在加载 v28.3 (紧急修复版)...")
+	log.Println("[Core] [系统初始化] 正在加载 v28.3 (逻辑修正版)...")
 	if checkFileDependency("xray.exe") { log.Println("[Core] [依赖检查] ✅ xray.exe 匹配成功! [智能分流] 模式可用。") } else { log.Println("[Core] [依赖检查] ⚠️ xray.exe 未找到!") }
 	if checkFileDependency("geosite.dat") { log.Println("[Core] [依赖检查] ✅ geosite.dat 匹配成功!"); loadGeodata() } else { log.Println("[Core] [依赖检查] ⚠️ geosite.dat 未找到!") }
 	if checkFileDependency("geoip.dat") { log.Println("[Core] [依赖检查] ✅ geoip.dat 匹配成功!") } else { log.Println("[Core] [依赖检查] ⚠️ geoip.dat 未找到!") }
@@ -340,7 +339,7 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 	parseOutbounds(); 
 	if s, ok := proxySettingsMap["proxy"]; ok { 
 		parseRules(s.NodePool)
-		go healthChecker(s.NodePool, s.Token, s.ServerIP) // 启动健康检查
+		go healthChecker(s.NodePool, s.Token, s.ServerIP)
 	}
 	if len(globalConfig.Inbounds) == 0 { return nil, errors.New("no inbounds") }
 	inbound := globalConfig.Inbounds[0]; listener, err := net.Listen("tcp", inbound.Listen); if err != nil { return nil, err }
@@ -354,7 +353,6 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 type TestResult struct { Node *Node; Delay time.Duration; Error error }
 func pingNode(node *Node, token, globalIP string, results chan<- TestResult) { startTime := time.Now(); backend := selectBackend(node.Backends, ""); if backend.IP == "" { backend.IP = globalIP }; conn, err := dialZeusWebSocket(node.Domain, backend, token); if err != nil { results <- TestResult{Node: node, Error: err}; return }; conn.Close(); delay := time.Since(startTime); results <- TestResult{Node: node, Delay: delay} }
 
-// 辅助函数
 func parseNodesForPing(serverAddr string) []*Node {
 	var nodes []*Node
 	rawPool := strings.ReplaceAll(serverAddr, "\r\n", ";")
@@ -414,7 +412,7 @@ func healthChecker(nodes []*Node, token, globalIP string) {
 	}
 }
 
-// [v28.3 修复] 移除了全局熔断逻辑，直接处理连接
+// [v28.3] 移除了全局熔断器锁，防止 Panic
 func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	defer conn.Close()
 	
@@ -464,7 +462,6 @@ func selectSmartNode(nodes []*Node) *Node {
 		return nodes[rand.Intn(len(nodes))]
 	}
 
-	// 智能选择：按延迟排序
 	sort.Slice(aliveNodes, func(i, j int) bool {
 		aliveNodes[i].mu.RLock()
 		aliveNodes[j].mu.RLock()
@@ -544,6 +541,7 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 	return finalConn, currentMode, finalRTT, finalErr
 }
 
+// [v28.3 核心] 智能分级超时
 func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt time.Duration) {
 	defer ws.Close()
 	defer local.Close()
@@ -555,6 +553,7 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt
 	var once sync.Once
 	closeConns := func() { once.Do(func() { ws.Close(); local.Close(); }) }
 
+	// 1. 计算"激进"的智能超时 (用于普通浏览)
 	smartTimeout := rtt * 3
 	if smartTimeout < 300 * time.Millisecond {
 		smartTimeout = 300 * time.Millisecond
@@ -566,21 +565,30 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt
 
 	enableDisconnect := false
 	logPrefix := "[智能]"
+	
+	// 2. 决定是否断流，并决定使用哪种超时策略
+	var currentReadTimeout time.Duration
+
 	switch mode {
 	case MODE_KEEP:
 		enableDisconnect = false
 		logPrefix = "[长连]"
-		log.Printf("[Core] %s %s 命中长连接模式，禁用断流。", logPrefix, target)
+		currentReadTimeout = 180 * time.Second // ★★★ 豁免域名：给予 180s 宽容超时 ★★★
+		log.Printf("[Core] %s %s 命中长连接模式，使用 180s 超时。", logPrefix, target)
 	case MODE_CUT:
 		enableDisconnect = true
 		logPrefix = "[短连]"
+		currentReadTimeout = smartTimeout // 强制短连：使用激进超时
+		log.Printf("[Core] %s %s 强制短连，使用 %dms 超时。", logPrefix, target, smartTimeout.Milliseconds())
 	case MODE_AUTO:
 		if shouldDisableDisconnect(target) {
 			enableDisconnect = false
 			logPrefix = "[豁免]"
-			log.Printf("[Core] %s %s 命中豁免名单/gRPC，自动保活。", logPrefix, target)
+			currentReadTimeout = 180 * time.Second // ★★★ 豁免域名：给予 180s 宽容超时 ★★★
+			log.Printf("[Core] %s %s 命中豁免名单，使用 180s 超时。", logPrefix, target)
 		} else {
 			enableDisconnect = true
+			currentReadTimeout = smartTimeout // 普通流量：使用激进超时
 			log.Printf("[Core] %s %s 启用智能流控 (阈值: %.2fMB, 超时: %dms)。", logPrefix, float64(dynamicLimit)/1024/1024, smartTimeout.Milliseconds())
 		}
 	}
@@ -593,7 +601,8 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt
 		defer bufPool.Put(buf)
 		
 		for {
-			ws.SetReadDeadline(time.Now().Add(smartTimeout)) 
+			// ★★★ 使用分级策略确定的超时时间 ★★★
+			ws.SetReadDeadline(time.Now().Add(currentReadTimeout)) 
 			mt, r, err := ws.NextReader()
 			if err != nil { return }
 
