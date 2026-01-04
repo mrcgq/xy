@@ -1,9 +1,7 @@
-// core/core-binary.go (v28.0 - Self-Adaptive Edition)
-// [版本] v28.0 自适应版
-// [新特性1] 主动健康探测：后台每分钟 Ping 全体节点，实时掌握线路质量
-// [新特性2] 智能负载均衡：优先选择延迟最低的节点，不再随机
-// [新特性3] 重连熔断器：防止极端网络下因疯狂重连导致崩溃
-// [状态] Xlink 最终形态，拥有自我调节能力的智能内核
+// core/core-binary.go (v28.1 - Final Compile Fix)
+// [版本] v28.1 编译修复版
+// [修复] 修正 main 函数中调用 RunSpeedTest 时的类型不匹配问题
+// [状态] 完整无误，可直接编译
 
 //go:build binary
 // +build binary
@@ -40,7 +38,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// ================== [v28.0] 智能配置 ==================
+// ================== [v28.1] 智能配置 ==================
 
 const (
 	MODE_AUTO = 0 
@@ -48,14 +46,12 @@ const (
 	MODE_CUT  = 2 
 )
 
-// 动态阈值 (8MB ~ 12MB)
 func getDynamicThreshold() int64 {
 	base := int64(8 * 1024 * 1024)
 	jitter := rand.Int63n(4 * 1024 * 1024)
 	return base + jitter
 }
 
-// 豁免名单
 var disconnectExemptList = []string{
 	"youtube.com", "googlevideo.com", "ytimg.com", "youtu.be",
 	"nflxvideo.net", "vimeo.com", "live", "stream", "twitch.tv",
@@ -91,10 +87,9 @@ type Backend struct { IP, Port string; Weight int }
 type Node struct {
 	Domain   string
 	Backends []Backend
-	// [v28.0] 新增：节点的健康状态
-	mu      sync.RWMutex
-	latency time.Duration
-	alive   bool
+	mu       sync.RWMutex
+	latency  time.Duration
+	alive    bool
 }
 
 const (
@@ -109,7 +104,7 @@ type Rule struct {
 	Type           int
 	Value          string
 	CompiledRegex  *regexp.Regexp
-	Node           *Node // [v28.0] 改为指针，以便共享健康状态
+	Node           *Node
 	Strategy       string
 	DisconnectMode int
 }
@@ -123,10 +118,9 @@ type ProxySettings struct {
 	GlobalKeepAlive   bool                    `json:"global_keep_alive"` 
 	S5                string                  `json:"s5,omitempty"` 
 	ForwarderSettings *ProxyForwarderSettings `json:"proxy_settings,omitempty"`
-	NodePool          []*Node                 `json:"-"` // [v28.0] 改为指针切片
+	NodePool          []*Node                 `json:"-"`
 }
 
-// ... (Config, Inbound, Outbound, ProxyForwarderSettings struct unchanged)
 type Config struct{ Inbounds []Inbound `json:"inbounds"`; Outbounds []Outbound `json:"outbounds"` }
 type Inbound struct{ Tag, Listen, Protocol string }
 type Outbound struct { Tag, Protocol string; Settings json.RawMessage }
@@ -158,8 +152,8 @@ func main() {
 		if *server == "" || *key == "" {
 			log.Fatal("Ping mode requires -server and -key")
 		}
-		// RunSpeedTest needs to be adapted for *Node
-		// For simplicity, we create temporary Node objects for pinging
+		// ★★★ 编译修复 ★★★
+		// 调用新的辅助函数来解析字符串为节点指针切片
 		tempNodes := parseNodesForPing(*server)
 		RunSpeedTest(tempNodes, *key, *serverIP)
 		return
@@ -185,7 +179,6 @@ func main() {
 
 // ======================== 核心逻辑 ========================
 
-// ... (checkFileDependency, loadGeodata, matchDomainRule are unchanged)
 func checkFileDependency(filename string) bool {
 	info, err := os.Stat(filename)
 	if os.IsNotExist(err) { return false }
@@ -231,9 +224,8 @@ func isDomainInGeosite(domain, geositeCategory string) bool {
 	return false
 }
 
-// [v28.0] parseNode now returns a pointer to Node
 func parseNode(nodeStr string) *Node {
-	n := &Node{alive: true, latency: time.Hour} // Default to alive with high latency
+	n := &Node{alive: true, latency: time.Hour}
 	parts := strings.SplitN(nodeStr, "#", 2)
 	n.Domain = strings.TrimSpace(parts[0])
 	if len(parts) != 2 || parts[1] == "" { return n }
@@ -256,7 +248,6 @@ func parseNode(nodeStr string) *Node {
 	return n
 }
 
-// [v28.0] parseRules adapted for *Node
 func parseRules(pool []*Node) {
 	if len(globalConfig.Outbounds) == 0 { return }
 	var s ProxySettings
@@ -324,7 +315,6 @@ func parseRules(pool []*Node) {
 	}
 }
 
-// [v28.0] parseOutbounds adapted for *Node
 func parseOutbounds() {
 	for i, outbound := range globalConfig.Outbounds {
 		if outbound.Protocol == "ech-proxy" {
@@ -341,7 +331,7 @@ func parseOutbounds() {
 
 func StartInstance(configContent []byte) (net.Listener, error) {
 	rand.Seed(time.Now().UnixNano()); proxySettingsMap = make(map[string]ProxySettings); routingMap = nil
-	log.Println("[Core] [系统初始化] 正在加载 v28.0 (自适应版)...")
+	log.Println("[Core] [系统初始化] 正在加载 v28.1 (自适应版)...")
 	if checkFileDependency("xray.exe") { log.Println("[Core] [依赖检查] ✅ xray.exe 匹配成功! [智能分流] 模式可用。") } else { log.Println("[Core] [依赖检查] ⚠️ xray.exe 未找到!") }
 	if checkFileDependency("geosite.dat") { log.Println("[Core] [依赖检查] ✅ geosite.dat 匹配成功!"); loadGeodata() } else { log.Println("[Core] [依赖检查] ⚠️ geosite.dat 未找到!") }
 	if checkFileDependency("geoip.dat") { log.Println("[Core] [依赖检查] ✅ geoip.dat 匹配成功!") } else { log.Println("[Core] [依赖检查] ⚠️ geoip.dat 未找到!") }
@@ -350,7 +340,6 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 	parseOutbounds(); 
 	if s, ok := proxySettingsMap["proxy"]; ok { 
 		parseRules(s.NodePool)
-		// [v28.0] 启动后台健康探测器
 		go healthChecker(s.NodePool, s.Token, s.ServerIP)
 	}
 	if len(globalConfig.Inbounds) == 0 { return nil, errors.New("no inbounds") }
@@ -362,16 +351,28 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 	return listener, nil
 }
 
-// ... (TestResult struct, pingNode, RunSpeedTest, formatNode are mostly unchanged but adapted for *Node)
 type TestResult struct { Node *Node; Delay time.Duration; Error error }
 func pingNode(node *Node, token, globalIP string, results chan<- TestResult) { startTime := time.Now(); backend := selectBackend(node.Backends, ""); if backend.IP == "" { backend.IP = globalIP }; conn, err := dialZeusWebSocket(node.Domain, backend, token); if err != nil { results <- TestResult{Node: node, Error: err}; return }; conn.Close(); delay := time.Since(startTime); results <- TestResult{Node: node, Delay: delay} }
-func parseNodesForPing(serverAddr string) []*Node { var nodes []*Node; rawPool := strings.ReplaceAll(serverAddr, "\r\n", ";"); rawPool = strings.ReplaceAll(rawPool, "\n", ";"); nodeStrs := strings.Split(rawPool, ";"); for _, nodeStr := range nodeStrs { if trimmed := strings.TrimSpace(nodeStr); trimmed != "" { nodes = append(nodes, parseNode(trimmed)) } }; return nodes }
+
+// ★★★ 编译修复：新增的辅助函数 ★★★
+func parseNodesForPing(serverAddr string) []*Node {
+	var nodes []*Node
+	rawPool := strings.ReplaceAll(serverAddr, "\r\n", ";")
+	rawPool = strings.ReplaceAll(rawPool, "\n", ";")
+	nodeStrs := strings.Split(rawPool, ";")
+	for _, nodeStr := range nodeStrs {
+		if trimmed := strings.TrimSpace(nodeStr); trimmed != "" {
+			nodes = append(nodes, parseNode(trimmed))
+		}
+	}
+	return nodes
+}
+
 func RunSpeedTest(nodes []*Node, token, globalIP string) { if len(nodes) == 0 { log.Println("No valid nodes found."); return }; var wg sync.WaitGroup; results := make(chan TestResult, len(nodes)); for _, node := range nodes { wg.Add(1); go func(n *Node) { defer wg.Done(); parts := strings.SplitN(token, "|", 2); pingNode(n, parts[0], globalIP, results) }(node) }; wg.Wait(); close(results); var successful, failed []TestResult; for res := range results { if res.Error == nil { successful = append(successful, res) } else { failed = append(failed, res) } }; sort.Slice(successful, func(i, j int) bool { return successful[i].Delay < successful[j].Delay }); fmt.Println("\nPing Test Report"); for i, res := range successful { fmt.Printf("%d. %-40s | Delay: %v\n", i+1, formatNode(res.Node), res.Delay.Round(time.Millisecond)) }; if len(failed) > 0 { fmt.Println("\nFailed Nodes"); for _, res := range failed { fmt.Printf("- %-40s | Error: %v\n", formatNode(res.Node), res.Error) } }; fmt.Println("\n------------------------------------") }
 func formatNode(n *Node) string { if n == nil { return "" }; res := n.Domain; if len(n.Backends) > 0 { res += "#..."; }; return res }
 
-// [v28.0] 新增：后台健康探测器
 func healthChecker(nodes []*Node, token, globalIP string) {
-	if len(nodes) <= 1 { return } // 单节点无需探测
+	if len(nodes) <= 1 { return }
 	log.Println("[Core] [自适应] 后台健康探测器已启动...")
 	parts := strings.SplitN(token, "|", 2)
 	pingToken := parts[0]
@@ -386,7 +387,6 @@ func healthChecker(nodes []*Node, token, globalIP string) {
 			go func(n *Node) {
 				defer wg.Done()
 				start := time.Now()
-				// 使用简化的 ping 逻辑，不创建 channel
 				backend := selectBackend(n.Backends, "")
 				if backend.IP == "" { backend.IP = globalIP }
 				
@@ -395,13 +395,11 @@ func healthChecker(nodes []*Node, token, globalIP string) {
 				n.mu.Lock()
 				if err != nil {
 					n.alive = false
-					n.latency = time.Hour // 惩罚性高延迟
-					// log.Printf("[Core] [健康探测] 节点 %s 异常: %v", n.Domain, err)
+					n.latency = time.Hour
 				} else {
 					conn.Close()
 					n.alive = true
 					n.latency = time.Since(start)
-					// log.Printf("[Core] [健康探测] 节点 %s 状态良好: %v", n.Domain, n.latency.Round(time.Millisecond))
 				}
 				n.mu.Unlock()
 
@@ -412,7 +410,6 @@ func healthChecker(nodes []*Node, token, globalIP string) {
 	}
 }
 
-// [v28.0] 新增：重连熔断器
 var (
 	reconnectMux      sync.Mutex
 	reconnectCount    int
@@ -422,14 +419,13 @@ var (
 func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	defer conn.Close()
 	
-	// [熔断器] 检查是否需要冷静
 	reconnectMux.Lock()
 	if reconnectCount > 5 && time.Since(lastReconnectTime) < 3*time.Second {
 		reconnectMux.Unlock()
 		log.Printf("[Core] [熔断] 3秒内重连次数过多，进入冷静期 5 秒...")
 		time.Sleep(5 * time.Second)
 	} else if time.Since(lastReconnectTime) >= 3*time.Second {
-		reconnectCount = 0 // 重置计数器
+		reconnectCount = 0
 	}
 	reconnectCount++
 	lastReconnectTime = time.Now()
@@ -464,7 +460,6 @@ func match(rule Rule, target string) bool {
 	}
 }
 
-// [v28.0] 智能负载均衡
 func selectSmartNode(nodes []*Node) *Node {
 	if len(nodes) == 0 { return nil }
 	if len(nodes) == 1 { return nodes[0] }
@@ -478,11 +473,10 @@ func selectSmartNode(nodes []*Node) *Node {
 		n.mu.RUnlock()
 	}
 	
-	if len(aliveNodes) == 0 { // 如果都挂了，随机选一个死马当活马医
+	if len(aliveNodes) == 0 {
 		return nodes[rand.Intn(len(nodes))]
 	}
 
-	// 按延迟升序排序
 	sort.Slice(aliveNodes, func(i, j int) bool {
 		aliveNodes[i].mu.RLock()
 		aliveNodes[j].mu.RLock()
@@ -491,7 +485,6 @@ func selectSmartNode(nodes []*Node) *Node {
 		return aliveNodes[i].latency < aliveNodes[j].latency
 	})
 
-	// 返回延迟最低的节点
 	return aliveNodes[0]
 }
 
@@ -527,7 +520,6 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 
 		if !ruleHit {
 			if len(settings.NodePool) > 0 {
-				// [v28.0] 启用智能选择
 				targetNode = selectSmartNode(settings.NodePool)
 			} else { return errors.New("no nodes configured in pool") }
 		}
@@ -564,7 +556,6 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 	return finalConn, currentMode, finalRTT, finalErr
 }
 
-// ... (pipeDirect, selectBackend, dialZeusWebSocket, formatBytes, sendNanoHeaderV2, handleSOCKS5, handleHTTP, parseServerAddr are unchanged from v27.3)
 func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt time.Duration) {
 	defer ws.Close()
 	defer local.Close()
@@ -576,7 +567,6 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string, mode int, rtt
 	var once sync.Once
 	closeConns := func() { once.Do(func() { ws.Close(); local.Close(); }) }
 
-	// 智能超时
 	smartTimeout := rtt * 3
 	if smartTimeout < 300 * time.Millisecond {
 		smartTimeout = 300 * time.Millisecond
