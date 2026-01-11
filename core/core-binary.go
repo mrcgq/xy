@@ -125,7 +125,7 @@ func NewDNSResolver(config DNSConfig) *DNSResolver {
 			DualStack: true,
 		}).DialContext,
 		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: false,
+			InsecureSkipVerify: true,
 		},
 		MaxIdleConns:        10,
 		IdleConnTimeout:     30 * time.Second,
