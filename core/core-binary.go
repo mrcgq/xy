@@ -54,14 +54,16 @@ const (
 	DNSStrategyPreferIPv4  DNSStrategy = "PreferIPv4"  // 优先返回 IPv4
 )
 
-// DNSConfig DNS 配置
+
+
+// 内核 DNSConfig 结构体修改
 type DNSConfig struct {
-	Enabled       bool        `json:"enabled"`
-	Strategy      DNSStrategy `json:"strategy"`
-	Servers       []string    `json:"servers"`        // DoH 服务器列表
-	FallbackDNS   []string    `json:"fallback_dns"`   // 备用 DNS
-	CacheTTL      int         `json:"cache_ttl"`      // 缓存时间（秒）
-	TimeoutMs     int         `json:"timeout_ms"`     // 超时时间
+    Enabled          bool        `json:"enabled"`
+    Strategy         DNSStrategy `json:"strategy"`
+    Servers          []string    `json:"servers"`
+    FallbackToRemote bool        `json:"fallback_to_remote"`  // 新增
+    CacheTTL         int         `json:"cache_ttl"`
+    TimeoutMs        int         `json:"timeout_ms"`
 }
 
 // SniffingConfig 流量嗅探配置
@@ -207,42 +209,47 @@ func (r *DNSResolver) ResolveToIPv6(domain string) (string, bool) {
 	return ipv6s[0].String(), true
 }
 
-// resolveAll 同时解析 IPv4 和 IPv6
+
+
+
 func (r *DNSResolver) resolveAll(domain string) ([]net.IP, []net.IP, error) {
-	var ipv4s, ipv6s []net.IP
-	var lastErr error
+    var ipv4s, ipv6s []net.IP
+    var lastErr error
 
-	// 尝试 DoH 服务器
-	for _, server := range r.config.Servers {
-		v4, v6, err := r.resolveDoH(server, domain)
-		if err == nil {
-			ipv4s = append(ipv4s, v4...)
-			ipv6s = append(ipv6s, v6...)
-			if len(ipv4s) > 0 || len(ipv6s) > 0 {
-				return ipv4s, ipv6s, nil
-			}
-		}
-		lastErr = err
-	}
+    // 尝试 DoH 服务器
+    for _, server := range r.config.Servers {
+        v4, v6, err := r.resolveDoH(server, domain)
+        if err == nil && (len(v4) > 0 || len(v6) > 0) {
+            return v4, v6, nil
+        }
+        lastErr = err
+    }
 
-	// DoH 失败，使用系统 DNS
-	ips, err := r.resolveSystem(domain)
-	if err == nil {
-		for _, ip := range ips {
-			if ip.To4() != nil {
-				ipv4s = append(ipv4s, ip)
-			} else {
-				ipv6s = append(ipv6s, ip)
-			}
-		}
-		return ipv4s, ipv6s, nil
-	}
+    // 检查是否允许回退到系统 DNS
+    if r.config.FallbackToRemote {
+        log.Printf("[DNS] DoH failed, falling back to system DNS for %s", domain)
+        ips, err := r.resolveSystem(domain)
+        if err == nil {
+            for _, ip := range ips {
+                if ip.To4() != nil {
+                    ipv4s = append(ipv4s, ip)
+                } else {
+                    ipv6s = append(ipv6s, ip)
+                }
+            }
+            return ipv4s, ipv6s, nil
+        }
+        lastErr = err
+    }
 
-	if lastErr != nil {
-		return nil, nil, lastErr
-	}
-	return nil, nil, err
+    return nil, nil, lastErr
 }
+
+
+
+
+
+
 
 // resolveDoH 使用 DoH 解析
 func (r *DNSResolver) resolveDoH(server, domain string) ([]net.IP, []net.IP, error) {
