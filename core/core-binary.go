@@ -73,6 +73,8 @@ type SniffingConfig struct {
 	RouteOnly    bool     `json:"route_only"`    // 仅用于路由，不重写目标
 }
 
+
+
 // 默认配置
 var defaultDNSConfig = DNSConfig{
 	Enabled:  true,
@@ -81,21 +83,23 @@ var defaultDNSConfig = DNSConfig{
 		"https://cloudflare-dns.com/dns-query",
 		"https://dns.google/dns-query",
 	},
-	FallbackDNS: []string{
-		"8.8.8.8:53",
-		"1.1.1.1:53",
-		"[2606:4700:4700::1111]:53",
-		"[2001:4860:4860::8888]:53",
-	},
-	CacheTTL:  300,
-	TimeoutMs: 3000,
+	// ✅ 修复：移除了不存在的 FallbackDNS，改为 FallbackToRemote
+	FallbackToRemote: true,
+	CacheTTL:         300,
+	TimeoutMs:        3000,
 }
+
+
 
 var defaultSniffingConfig = SniffingConfig{
 	Enabled:      true,
 	DestOverride: []string{"http", "tls"},
 	RouteOnly:    false,
 }
+
+
+
+
 
 // 全局 DNS 缓存
 var dnsCache = struct {
