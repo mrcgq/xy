@@ -1,8 +1,10 @@
 // =========================================================================================
-// Xlink Core v21.6 (IPv6 Enhanced Kernel)
-// [新增] 完整 DNS 解析能力 (DoH, IPv4/IPv6 双栈)
-// [新增] TLS/HTTP Sniffing 功能 (恢复原始域名)
-// [优化] 入站协议完整支持 IPv6 数据包封装
+// Xlink Core v22.0.0 内核代码 (CF WAF Evasion Kernel)
+// [核心改进] Early Data — 协议头 Base64 编码后藏入 Sec-WebSocket-Protocol HTTP 头
+//           上行 WebSocket 首帧零协议特征，完美适配 Xlink 22.0 服务端 (CF WAF 深度免杀版)
+// [保留] 完整 DNS 解析能力 (DoH, IPv4/IPv6 双栈)
+// [保留] TLS/HTTP Sniffing 功能 (恢复原始域名)
+// [保留] 入站协议完整支持 IPv6 数据包封装
 // [编译] go build -tags binary -ldflags "-s -w" -o xlink-cli-binary.exe
 // =========================================================================================
 
@@ -17,6 +19,7 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/tls"
+	"encoding/base64" // [v22.0 NEW] Early Data Base64 编码
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -47,33 +50,29 @@ var globalRRIndex uint64
 type DNSStrategy string
 
 const (
-	DNSStrategyUseIP       DNSStrategy = "UseIP"       // 同时查询 A 和 AAAA，返回所有
-	DNSStrategyUseIPv4     DNSStrategy = "UseIPv4"     // 只查询 A 记录
-	DNSStrategyUseIPv6     DNSStrategy = "UseIPv6"     // 只查询 AAAA 记录
-	DNSStrategyPreferIPv6  DNSStrategy = "PreferIPv6"  // 优先返回 IPv6
-	DNSStrategyPreferIPv4  DNSStrategy = "PreferIPv4"  // 优先返回 IPv4
+	DNSStrategyUseIP      DNSStrategy = "UseIP"
+	DNSStrategyUseIPv4    DNSStrategy = "UseIPv4"
+	DNSStrategyUseIPv6    DNSStrategy = "UseIPv6"
+	DNSStrategyPreferIPv6 DNSStrategy = "PreferIPv6"
+	DNSStrategyPreferIPv4 DNSStrategy = "PreferIPv4"
 )
 
-
-
-// 内核 DNSConfig 结构体修改
+// DNSConfig 结构体
 type DNSConfig struct {
-    Enabled          bool        `json:"enabled"`
-    Strategy         DNSStrategy `json:"strategy"`
-    Servers          []string    `json:"servers"`
-    FallbackToRemote bool        `json:"fallback_to_remote"`  // 新增
-    CacheTTL         int         `json:"cache_ttl"`
-    TimeoutMs        int         `json:"timeout_ms"`
+	Enabled          bool        `json:"enabled"`
+	Strategy         DNSStrategy `json:"strategy"`
+	Servers          []string    `json:"servers"`
+	FallbackToRemote bool        `json:"fallback_to_remote"`
+	CacheTTL         int         `json:"cache_ttl"`
+	TimeoutMs        int         `json:"timeout_ms"`
 }
 
 // SniffingConfig 流量嗅探配置
 type SniffingConfig struct {
 	Enabled      bool     `json:"enabled"`
-	DestOverride []string `json:"dest_override"` // ["http", "tls", "quic"]
-	RouteOnly    bool     `json:"route_only"`    // 仅用于路由，不重写目标
+	DestOverride []string `json:"dest_override"`
+	RouteOnly    bool     `json:"route_only"`
 }
-
-
 
 // 默认配置
 var defaultDNSConfig = DNSConfig{
@@ -83,23 +82,16 @@ var defaultDNSConfig = DNSConfig{
 		"https://cloudflare-dns.com/dns-query",
 		"https://dns.google/dns-query",
 	},
-	// ✅ 修复：移除了不存在的 FallbackDNS，改为 FallbackToRemote
 	FallbackToRemote: true,
 	CacheTTL:         300,
 	TimeoutMs:        3000,
 }
-
-
 
 var defaultSniffingConfig = SniffingConfig{
 	Enabled:      true,
 	DestOverride: []string{"http", "tls"},
 	RouteOnly:    false,
 }
-
-
-
-
 
 // 全局 DNS 缓存
 var dnsCache = struct {
@@ -117,13 +109,11 @@ type dnsCacheEntry struct {
 
 // ======================== DNS 解析模块 ========================
 
-// DNSResolver DNS 解析器
 type DNSResolver struct {
 	config     DNSConfig
 	httpClient *http.Client
 }
 
-// NewDNSResolver 创建 DNS 解析器
 func NewDNSResolver(config DNSConfig) *DNSResolver {
 	transport := &http.Transport{
 		DialContext: (&net.Dialer{
@@ -147,54 +137,38 @@ func NewDNSResolver(config DNSConfig) *DNSResolver {
 	}
 }
 
-// ResolveIP 解析域名，根据策略返回 IP
 func (r *DNSResolver) ResolveIP(domain string) (string, error) {
 	if !r.config.Enabled {
-		return domain, nil // 不启用 DNS 解析，直接返回域名
+		return domain, nil
 	}
-
-	// 如果已经是 IP 地址，直接返回
 	if ip := net.ParseIP(domain); ip != nil {
 		return domain, nil
 	}
-
-	// 检查缓存
 	if cached := r.getFromCache(domain); cached != "" {
 		log.Printf("[DNS] Cache hit: %s -> %s", domain, cached)
 		return cached, nil
 	}
-
-	// 执行 DNS 解析
 	ipv4s, ipv6s, err := r.resolveAll(domain)
 	if err != nil {
 		log.Printf("[DNS] Resolve failed for %s: %v", domain, err)
-		return domain, err // 失败时返回原域名，让远程服务器解析
+		return domain, err
 	}
-
-	// 缓存结果
 	r.saveToCache(domain, ipv4s, ipv6s)
-
-	// 根据策略选择 IP
 	result := r.selectIP(ipv4s, ipv6s)
 	if result == "" {
-		return domain, nil // 无结果时返回原域名
+		return domain, nil
 	}
-
 	log.Printf("[DNS] Resolved: %s -> %s (Strategy: %s)", domain, result, r.config.Strategy)
 	return result, nil
 }
 
-// ResolveToIPv6 尝试解析为 IPv6，失败则返回原值
 func (r *DNSResolver) ResolveToIPv6(domain string) (string, bool) {
 	if !r.config.Enabled {
 		return domain, false
 	}
-
 	if ip := net.ParseIP(domain); ip != nil {
-		return domain, ip.To4() == nil // 已经是 IP，返回是否为 IPv6
+		return domain, ip.To4() == nil
 	}
-
-	// 检查缓存
 	dnsCache.RLock()
 	if entry, ok := dnsCache.entries[domain]; ok && time.Now().Before(entry.expires) {
 		if len(entry.ipv6) > 0 {
@@ -203,68 +177,47 @@ func (r *DNSResolver) ResolveToIPv6(domain string) (string, bool) {
 		}
 	}
 	dnsCache.RUnlock()
-
-	// 解析
 	_, ipv6s, err := r.resolveAll(domain)
 	if err != nil || len(ipv6s) == 0 {
 		return domain, false
 	}
-
 	return ipv6s[0].String(), true
 }
 
-
-
-
 func (r *DNSResolver) resolveAll(domain string) ([]net.IP, []net.IP, error) {
-    var ipv4s, ipv6s []net.IP
-    var lastErr error
-
-    // 尝试 DoH 服务器
-    for _, server := range r.config.Servers {
-        v4, v6, err := r.resolveDoH(server, domain)
-        if err == nil && (len(v4) > 0 || len(v6) > 0) {
-            return v4, v6, nil
-        }
-        lastErr = err
-    }
-
-    // 检查是否允许回退到系统 DNS
-    if r.config.FallbackToRemote {
-        log.Printf("[DNS] DoH failed, falling back to system DNS for %s", domain)
-        ips, err := r.resolveSystem(domain)
-        if err == nil {
-            for _, ip := range ips {
-                if ip.To4() != nil {
-                    ipv4s = append(ipv4s, ip)
-                } else {
-                    ipv6s = append(ipv6s, ip)
-                }
-            }
-            return ipv4s, ipv6s, nil
-        }
-        lastErr = err
-    }
-
-    return nil, nil, lastErr
+	var ipv4s, ipv6s []net.IP
+	var lastErr error
+	for _, server := range r.config.Servers {
+		v4, v6, err := r.resolveDoH(server, domain)
+		if err == nil && (len(v4) > 0 || len(v6) > 0) {
+			return v4, v6, nil
+		}
+		lastErr = err
+	}
+	if r.config.FallbackToRemote {
+		log.Printf("[DNS] DoH failed, falling back to system DNS for %s", domain)
+		ips, err := r.resolveSystem(domain)
+		if err == nil {
+			for _, ip := range ips {
+				if ip.To4() != nil {
+					ipv4s = append(ipv4s, ip)
+				} else {
+					ipv6s = append(ipv6s, ip)
+				}
+			}
+			return ipv4s, ipv6s, nil
+		}
+		lastErr = err
+	}
+	return nil, nil, lastErr
 }
 
-
-
-
-
-
-
-// resolveDoH 使用 DoH 解析
 func (r *DNSResolver) resolveDoH(server, domain string) ([]net.IP, []net.IP, error) {
 	var ipv4s, ipv6s []net.IP
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-
-	// 根据策略决定查询类型
 	queryA := r.config.Strategy != DNSStrategyUseIPv6
 	queryAAAA := r.config.Strategy != DNSStrategyUseIPv4
-
 	if queryA {
 		wg.Add(1)
 		go func() {
@@ -277,7 +230,6 @@ func (r *DNSResolver) resolveDoH(server, domain string) ([]net.IP, []net.IP, err
 			}
 		}()
 	}
-
 	if queryAAAA {
 		wg.Add(1)
 		go func() {
@@ -290,64 +242,51 @@ func (r *DNSResolver) resolveDoH(server, domain string) ([]net.IP, []net.IP, err
 			}
 		}()
 	}
-
 	wg.Wait()
 	return ipv4s, ipv6s, nil
 }
 
-// doHQuery 执行单个 DoH 查询
 func (r *DNSResolver) doHQuery(server, domain, recordType string) ([]net.IP, error) {
 	reqURL := fmt.Sprintf("%s?name=%s&type=%s", server, url.QueryEscape(domain), recordType)
-	
 	req, err := http.NewRequest("GET", reqURL, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/dns-json")
-
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(r.config.TimeoutMs)*time.Millisecond)
 	defer cancel()
 	req = req.WithContext(ctx)
-
 	resp, err := r.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("DoH returned status %d", resp.StatusCode)
 	}
-
 	var result struct {
 		Answer []struct {
 			Type int    `json:"type"`
 			Data string `json:"data"`
 		} `json:"Answer"`
 	}
-
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}
-
 	var ips []net.IP
 	for _, ans := range result.Answer {
-		// Type 1 = A, Type 28 = AAAA
 		if (recordType == "A" && ans.Type == 1) || (recordType == "AAAA" && ans.Type == 28) {
 			if ip := net.ParseIP(ans.Data); ip != nil {
 				ips = append(ips, ip)
 			}
 		}
 	}
-
 	return ips, nil
 }
 
-// resolveSystem 使用系统 DNS 解析
 func (r *DNSResolver) resolveSystem(domain string) ([]net.IP, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(r.config.TimeoutMs)*time.Millisecond)
 	defer cancel()
-
 	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", domain)
 	if err != nil {
 		return nil, err
@@ -355,7 +294,6 @@ func (r *DNSResolver) resolveSystem(domain string) ([]net.IP, error) {
 	return ips, nil
 }
 
-// selectIP 根据策略选择 IP
 func (r *DNSResolver) selectIP(ipv4s, ipv6s []net.IP) string {
 	switch r.config.Strategy {
 	case DNSStrategyUseIPv6:
@@ -380,8 +318,7 @@ func (r *DNSResolver) selectIP(ipv4s, ipv6s []net.IP) string {
 		if len(ipv6s) > 0 {
 			return ipv6s[0].String()
 		}
-	default: // UseIP
-		// 随机选择一个
+	default:
 		all := append(ipv6s, ipv4s...)
 		if len(all) > 0 {
 			return all[rand.Intn(len(all))].String()
@@ -390,24 +327,19 @@ func (r *DNSResolver) selectIP(ipv4s, ipv6s []net.IP) string {
 	return ""
 }
 
-// getFromCache 从缓存获取
 func (r *DNSResolver) getFromCache(domain string) string {
 	dnsCache.RLock()
 	defer dnsCache.RUnlock()
-
 	entry, ok := dnsCache.entries[domain]
 	if !ok || time.Now().After(entry.expires) {
 		return ""
 	}
-
 	return r.selectIP(entry.ipv4, entry.ipv6)
 }
 
-// saveToCache 保存到缓存
 func (r *DNSResolver) saveToCache(domain string, ipv4s, ipv6s []net.IP) {
 	dnsCache.Lock()
 	defer dnsCache.Unlock()
-
 	dnsCache.entries[domain] = &dnsCacheEntry{
 		ipv4:    ipv4s,
 		ipv6:    ipv6s,
@@ -417,30 +349,24 @@ func (r *DNSResolver) saveToCache(domain string, ipv4s, ipv6s []net.IP) {
 
 // ======================== Sniffing 模块 ========================
 
-// SniffResult 嗅探结果
 type SniffResult struct {
 	Domain   string
-	Protocol string // "tls", "http", "quic"
+	Protocol string
 	Success  bool
 }
 
-// Sniffer 流量嗅探器
 type Sniffer struct {
 	config SniffingConfig
 }
 
-// NewSniffer 创建嗅探器
 func NewSniffer(config SniffingConfig) *Sniffer {
 	return &Sniffer{config: config}
 }
 
-// Sniff 嗅探流量，尝试提取域名
 func (s *Sniffer) Sniff(data []byte) SniffResult {
 	if !s.config.Enabled || len(data) == 0 {
 		return SniffResult{Success: false}
 	}
-
-	// 尝试 TLS 嗅探
 	for _, override := range s.config.DestOverride {
 		switch override {
 		case "tls":
@@ -457,122 +383,85 @@ func (s *Sniffer) Sniff(data []byte) SniffResult {
 			}
 		}
 	}
-
 	return SniffResult{Success: false}
 }
 
-// sniffTLS 嗅探 TLS ClientHello，提取 SNI
 func (s *Sniffer) sniffTLS(data []byte) SniffResult {
 	result := SniffResult{Protocol: "tls", Success: false}
-
 	if len(data) < 5 {
 		return result
 	}
-
-	// TLS Record Header: ContentType(1) + Version(2) + Length(2)
-	// ContentType 22 = Handshake
 	if data[0] != 0x16 {
 		return result
 	}
-
-	// 检查版本 (TLS 1.0, 1.1, 1.2, 1.3)
 	version := binary.BigEndian.Uint16(data[1:3])
 	if version < 0x0301 || version > 0x0304 {
-		// 也接受 0x0300 (SSL 3.0) 的 ClientHello
 		if version != 0x0300 {
 			return result
 		}
 	}
-
 	recordLen := binary.BigEndian.Uint16(data[3:5])
 	if len(data) < int(5+recordLen) {
 		return result
 	}
-
-	// Handshake Header: HandshakeType(1) + Length(3)
 	handshakeData := data[5:]
 	if len(handshakeData) < 4 {
 		return result
 	}
-
-	// HandshakeType 1 = ClientHello
 	if handshakeData[0] != 0x01 {
 		return result
 	}
-
 	handshakeLen := int(handshakeData[1])<<16 | int(handshakeData[2])<<8 | int(handshakeData[3])
 	if len(handshakeData) < 4+handshakeLen {
 		return result
 	}
-
 	clientHello := handshakeData[4:]
 	return s.parseClientHello(clientHello)
 }
 
-// parseClientHello 解析 ClientHello，提取 SNI
 func (s *Sniffer) parseClientHello(data []byte) SniffResult {
 	result := SniffResult{Protocol: "tls", Success: false}
-
 	if len(data) < 38 {
 		return result
 	}
-
-	// ClientHello 结构:
-	// Version(2) + Random(32) + SessionIDLen(1) + SessionID(var) + ...
-
-	pos := 2 + 32 // Skip version and random
-
-	// Session ID
+	pos := 2 + 32
 	if pos >= len(data) {
 		return result
 	}
 	sessionIDLen := int(data[pos])
 	pos += 1 + sessionIDLen
-
-	// Cipher Suites
 	if pos+2 > len(data) {
 		return result
 	}
 	cipherSuitesLen := int(binary.BigEndian.Uint16(data[pos:]))
 	pos += 2 + cipherSuitesLen
-
-	// Compression Methods
 	if pos >= len(data) {
 		return result
 	}
 	compMethodsLen := int(data[pos])
 	pos += 1 + compMethodsLen
-
-	// Extensions
 	if pos+2 > len(data) {
 		return result
 	}
 	extensionsLen := int(binary.BigEndian.Uint16(data[pos:]))
 	pos += 2
-
 	if pos+extensionsLen > len(data) {
 		return result
 	}
-
 	extensionsData := data[pos : pos+extensionsLen]
 	return s.parseExtensions(extensionsData)
 }
 
-// parseExtensions 解析扩展，找到 SNI
 func (s *Sniffer) parseExtensions(data []byte) SniffResult {
 	result := SniffResult{Protocol: "tls", Success: false}
-
 	pos := 0
 	for pos+4 <= len(data) {
 		extType := binary.BigEndian.Uint16(data[pos:])
 		extLen := int(binary.BigEndian.Uint16(data[pos+2:]))
 		pos += 4
-
 		if pos+extLen > len(data) {
 			break
 		}
-
-		// Extension Type 0 = SNI
 		if extType == 0 {
 			sni := s.parseSNI(data[pos : pos+extLen])
 			if sni != "" {
@@ -581,60 +470,43 @@ func (s *Sniffer) parseExtensions(data []byte) SniffResult {
 				return result
 			}
 		}
-
 		pos += extLen
 	}
-
 	return result
 }
 
-// parseSNI 解析 SNI 扩展
 func (s *Sniffer) parseSNI(data []byte) string {
 	if len(data) < 5 {
 		return ""
 	}
-
-	// SNI List Length(2) + SNI Type(1) + SNI Length(2) + SNI
 	listLen := int(binary.BigEndian.Uint16(data[0:]))
 	if listLen+2 > len(data) {
 		return ""
 	}
-
 	pos := 2
 	for pos+3 <= 2+listLen {
 		nameType := data[pos]
 		nameLen := int(binary.BigEndian.Uint16(data[pos+1:]))
 		pos += 3
-
 		if pos+nameLen > len(data) {
 			break
 		}
-
-		// Name Type 0 = hostname
 		if nameType == 0 {
 			hostname := string(data[pos : pos+nameLen])
-			// 验证是有效域名
 			if isValidDomain(hostname) {
 				return hostname
 			}
 		}
-
 		pos += nameLen
 	}
-
 	return ""
 }
 
-// sniffHTTP 嗅探 HTTP 请求，提取 Host
 func (s *Sniffer) sniffHTTP(data []byte) SniffResult {
 	result := SniffResult{Protocol: "http", Success: false}
-
-	// 检查是否是 HTTP 请求
 	if len(data) < 16 {
 		return result
 	}
-
-	// 常见 HTTP 方法
 	methods := []string{"GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "OPTIONS ", "CONNECT ", "PATCH "}
 	isHTTP := false
 	for _, method := range methods {
@@ -643,25 +515,19 @@ func (s *Sniffer) sniffHTTP(data []byte) SniffResult {
 			break
 		}
 	}
-
 	if !isHTTP {
 		return result
 	}
-
-	// 解析 HTTP 请求
 	reader := bufio.NewReader(bytes.NewReader(data))
 	req, err := http.ReadRequest(reader)
 	if err != nil {
 		return result
 	}
-
 	host := req.Host
 	if host == "" {
 		host = req.Header.Get("Host")
 	}
-
 	if host != "" {
-		// 移除端口
 		if h, _, err := net.SplitHostPort(host); err == nil {
 			host = h
 		}
@@ -670,31 +536,17 @@ func (s *Sniffer) sniffHTTP(data []byte) SniffResult {
 			result.Success = true
 		}
 	}
-
 	return result
 }
 
-// sniffQUIC 嗅探 QUIC 初始包 (简化实现)
 func (s *Sniffer) sniffQUIC(data []byte) SniffResult {
 	result := SniffResult{Protocol: "quic", Success: false}
-
-	// QUIC Initial Packet 结构较复杂，这里做简化处理
-	// 完整实现需要解析 QUIC 帧格式
-
 	if len(data) < 50 {
 		return result
 	}
-
-	// 检查是否是 QUIC Long Header
 	if data[0]&0x80 == 0 {
 		return result
 	}
-
-	// QUIC 版本
-	// version := binary.BigEndian.Uint32(data[1:5])
-
-	// 尝试在数据中搜索 TLS ClientHello (QUIC 加密层内)
-	// 这是一个简化的启发式方法
 	for i := 0; i < len(data)-10; i++ {
 		if data[i] == 0x16 && data[i+1] == 0x03 {
 			if tlsResult := s.sniffTLS(data[i:]); tlsResult.Success {
@@ -703,45 +555,34 @@ func (s *Sniffer) sniffQUIC(data []byte) SniffResult {
 			}
 		}
 	}
-
 	return result
 }
 
-// isValidDomain 检查是否是有效域名
 func isValidDomain(s string) bool {
 	if len(s) == 0 || len(s) > 253 {
 		return false
 	}
-
-	// 不是 IP 地址
 	if net.ParseIP(s) != nil {
 		return false
 	}
-
-	// 基本域名格式检查
 	parts := strings.Split(s, ".")
 	if len(parts) < 2 {
 		return false
 	}
-
 	for _, part := range parts {
 		if len(part) == 0 || len(part) > 63 {
 			return false
 		}
-		// 简单检查：只包含字母、数字、连字符
 		for _, c := range part {
 			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-') {
 				return false
 			}
 		}
 	}
-
 	return true
 }
 
-// isIPAddress 检查是否是 IP 地址
 func isIPAddress(s string) bool {
-	// 处理带端口的情况
 	host, _, err := net.SplitHostPort(s)
 	if err != nil {
 		host = s
@@ -778,7 +619,6 @@ type Rule struct {
 	Strategy      string
 }
 
-// [v21.6] ProxySettings 结构体 - 新增 DNS 和 Sniffing 配置
 type ProxySettings struct {
 	Server          string `json:"server"`
 	ServerIP        string `json:"server_ip"`
@@ -788,13 +628,9 @@ type ProxySettings struct {
 	GlobalKeepAlive bool   `json:"global_keep_alive"`
 	S5              string `json:"s5"`
 
-	// [v21.6 新增] DNS 配置
-	DNS *DNSConfig `json:"dns,omitempty"`
-	
-	// [v21.6 新增] Sniffing 配置
+	DNS      *DNSConfig      `json:"dns,omitempty"`
 	Sniffing *SniffingConfig `json:"sniffing,omitempty"`
 
-	// 内部使用的字段
 	ForwarderSettings *ProxyForwarderSettings `json:"proxy_settings,omitempty"`
 	NodePool          []Node                  `json:"-"`
 }
@@ -808,7 +644,7 @@ type Inbound struct {
 	Tag      string          `json:"tag"`
 	Listen   string          `json:"listen"`
 	Protocol string          `json:"protocol"`
-	Sniffing *SniffingConfig `json:"sniffing,omitempty"` // [v21.6 新增]
+	Sniffing *SniffingConfig `json:"sniffing,omitempty"`
 }
 
 type Outbound struct {
@@ -825,8 +661,7 @@ var (
 	globalConfig     Config
 	proxySettingsMap = make(map[string]ProxySettings)
 	routingMap       []Rule
-	
-	// [v21.6 新增] 全局 DNS 解析器和嗅探器
+
 	globalDNSResolver *DNSResolver
 	globalSniffer     *Sniffer
 )
@@ -887,7 +722,6 @@ func parseRules(pool []Node) {
 	if s.Rules == "" {
 		return
 	}
-
 	rawRules := strings.ReplaceAll(s.Rules, "|", "\n")
 	lines := strings.Split(rawRules, "\n")
 	for _, line := range lines {
@@ -904,11 +738,9 @@ func parseRules(pool []Node) {
 			if len(parts) >= 3 {
 				strategy = strings.TrimSpace(parts[2])
 			}
-
 			var ruleType int
 			var ruleValue string
 			var compiledRegex *regexp.Regexp
-
 			if strings.HasPrefix(keyword, "regexp:") {
 				ruleType = MatchTypeRegex
 				ruleValue = strings.TrimPrefix(keyword, "regexp:")
@@ -926,7 +758,6 @@ func parseRules(pool []Node) {
 				ruleType = MatchTypeSubstring
 				ruleValue = keyword
 			}
-
 			var foundNode Node
 			aliasFound := false
 			for _, pNode := range pool {
@@ -939,7 +770,6 @@ func parseRules(pool []Node) {
 			if !aliasFound {
 				foundNode = parseNode(nodeStr)
 			}
-
 			if keyword != "" && foundNode.Domain != "" {
 				routingMap = append(routingMap, Rule{
 					Type:          ruleType,
@@ -969,23 +799,17 @@ func parseOutbounds() {
 						settings.NodePool = append(settings.NodePool, parseNode(trimmed))
 					}
 				}
-
 				if settings.S5 != "" {
 					settings.ForwarderSettings = &ProxyForwarderSettings{
 						Socks5Address: settings.S5,
 					}
 				}
-
-				// [v21.6 新增] 初始化 DNS 配置
 				if settings.DNS == nil {
 					settings.DNS = &defaultDNSConfig
 				}
-				
-				// [v21.6 新增] 初始化 Sniffing 配置
 				if settings.Sniffing == nil {
 					settings.Sniffing = &defaultSniffingConfig
 				}
-
 				proxySettingsMap[outbound.Tag] = settings
 				b, _ := json.Marshal(settings)
 				globalConfig.Outbounds[i].Settings = b
@@ -1008,7 +832,8 @@ func pingNode(node Node, token string, globalIP string, results chan<- TestResul
 	if backend.IP == "" {
 		backend.IP = globalIP
 	}
-	conn, err := dialZeusWebSocket(node.Domain, backend, token)
+	// [v22.0 MODIFIED] pingNode 不需要 Early Data，传空字符串
+	conn, err := dialZeusWebSocket(node.Domain, backend, token, "")
 	if err != nil {
 		results <- TestResult{Node: node, Error: err}
 		return
@@ -1124,11 +949,9 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 		return nil, err
 	}
 	parseOutbounds()
-	
-	// [v21.6 新增] 初始化全局 DNS 解析器和嗅探器
+
 	if s, ok := proxySettingsMap["proxy"]; ok {
 		parseRules(s.NodePool)
-		
 		if s.DNS != nil {
 			globalDNSResolver = NewDNSResolver(*s.DNS)
 			log.Printf("[Core] [DNS] 已启用 DNS 解析器 (策略: %s)", s.DNS.Strategy)
@@ -1136,7 +959,6 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 			globalDNSResolver = NewDNSResolver(defaultDNSConfig)
 			log.Printf("[Core] [DNS] 已启用默认 DNS 解析器 (策略: %s)", defaultDNSConfig.Strategy)
 		}
-		
 		if s.Sniffing != nil {
 			globalSniffer = NewSniffer(*s.Sniffing)
 			log.Printf("[Core] [Sniffing] 已启用流量嗅探 (协议: %v)", s.Sniffing.DestOverride)
@@ -1152,13 +974,13 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 	if len(globalConfig.Inbounds) == 0 {
 		return nil, errors.New("no inbounds")
 	}
-	
+
 	inbound := globalConfig.Inbounds[0]
 	listener, err := net.Listen("tcp", inbound.Listen)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	mode := "Single Node"
 	if s, ok := proxySettingsMap["proxy"]; ok {
 		if len(s.NodePool) > 1 {
@@ -1170,11 +992,12 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 			mode += fmt.Sprintf(" + %d Rules", len(routingMap))
 		}
 	}
-	
-	// [v21.6] 更新启动日志
-	log.Printf("[Core] Xlink Observer Engine (v21.6 IPv6 Enhanced) Listening on %s [%s]", inbound.Listen, mode)
-	log.Printf("[Core] [IPv6] 已启用 IPv6 优先模式，DNS 策略: %s", globalDNSResolver.config.Strategy)
-	
+
+	// [v22.0 MODIFIED] 更新启动日志
+	log.Printf("[Core] Xlink Observer Engine (v22.0 CF WAF Evasion) Listening on %s [%s]", inbound.Listen, mode)
+	log.Printf("[Core] [Early Data] 已启用协议头抢跑 — 协议头藏入 Sec-WebSocket-Protocol，上行首帧零特征")
+	log.Printf("[Core] [IPv6] DNS 策略: %s", globalDNSResolver.config.Strategy)
+
 	go func() {
 		for {
 			conn, err := listener.Accept()
@@ -1187,21 +1010,20 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 	return listener, nil
 }
 
-// [v21.6 重写] handleGeneralConnection - 添加 Sniffing 和 DNS 解析
 func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	defer conn.Close()
-	
+
 	buf := make([]byte, 1)
 	if _, err := io.ReadFull(conn, buf); err != nil {
 		return
 	}
-	
+
 	var target string
 	var err error
 	var firstFrame []byte
 	var mode int
-	var pendingData []byte // [v21.6] 用于 Sniffing 的待读取数据
-	
+	var pendingData []byte
+
 	switch buf[0] {
 	case 0x05:
 		target, err = handleSOCKS5(conn, inboundTag)
@@ -1209,31 +1031,23 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	default:
 		target, firstFrame, mode, err = handleHTTP(conn, buf, inboundTag)
 	}
-	
+
 	if err != nil {
 		return
 	}
 
-	// [v21.6 新增] Sniffing 处理流程
 	originalTarget := target
 	sniffedDomain := ""
-	
-	// 检查目标是否是 IP 地址（如果是域名则不需要 Sniffing）
+
 	host, port, _ := net.SplitHostPort(target)
 	if isIPAddress(host) && globalSniffer != nil && globalSniffer.config.Enabled {
-		// 目标是 IP 地址，需要 Sniffing 来恢复域名
-		
 		if mode == 1 {
-			// SOCKS5 模式：先发送成功响应，然后读取实际数据进行 Sniffing
 			conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-			mode = 0 // 标记已发送响应
-			
-			// 读取一些数据用于 Sniffing
+			mode = 0
 			sniffBuf := make([]byte, 2048)
 			conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 			n, readErr := conn.Read(sniffBuf)
-			conn.SetReadDeadline(time.Time{}) // 清除超时
-			
+			conn.SetReadDeadline(time.Time{})
 			if readErr == nil && n > 0 {
 				pendingData = sniffBuf[:n]
 				sniffResult := globalSniffer.Sniff(pendingData)
@@ -1243,15 +1057,12 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 				}
 			}
 		} else if mode == 2 {
-			// HTTPS CONNECT 模式：先发送成功响应，然后读取 TLS ClientHello
 			conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-			mode = 0 // 标记已发送响应
-			
+			mode = 0
 			sniffBuf := make([]byte, 2048)
 			conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 			n, readErr := conn.Read(sniffBuf)
 			conn.SetReadDeadline(time.Time{})
-			
 			if readErr == nil && n > 0 {
 				pendingData = sniffBuf[:n]
 				sniffResult := globalSniffer.Sniff(pendingData)
@@ -1261,7 +1072,6 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 				}
 			}
 		} else if mode == 3 && len(firstFrame) > 0 {
-			// HTTP 明文模式：从已有的 firstFrame 中 Sniff
 			sniffResult := globalSniffer.Sniff(firstFrame)
 			if sniffResult.Success {
 				sniffedDomain = sniffResult.Domain
@@ -1270,26 +1080,20 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 		}
 	}
 
-	// [v21.6 新增] DNS 解析处理
 	finalTarget := target
 	if sniffedDomain != "" {
-		// Sniffing 成功，使用域名进行 DNS 解析
 		if globalDNSResolver != nil && globalDNSResolver.config.Enabled {
 			resolvedIP, err := globalDNSResolver.ResolveIP(sniffedDomain)
 			if err == nil && resolvedIP != sniffedDomain {
-				// 使用解析后的 IP (可能是 IPv6)
 				finalTarget = net.JoinHostPort(resolvedIP, port)
 				log.Printf("[DNS] %s -> %s", sniffedDomain, resolvedIP)
 			} else {
-				// DNS 解析失败或返回域名本身，使用原始域名
 				finalTarget = net.JoinHostPort(sniffedDomain, port)
 			}
 		} else {
-			// DNS 未启用，直接使用域名
 			finalTarget = net.JoinHostPort(sniffedDomain, port)
 		}
 	} else if !isIPAddress(host) {
-		// 目标本身就是域名，进行 DNS 解析
 		if globalDNSResolver != nil && globalDNSResolver.config.Enabled {
 			resolvedIP, err := globalDNSResolver.ResolveIP(host)
 			if err == nil && resolvedIP != host {
@@ -1299,25 +1103,22 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 		}
 	}
 
-	// 如果目标发生变化，记录日志
 	if finalTarget != originalTarget {
 		log.Printf("[Core] Target rewritten: %s -> %s", originalTarget, finalTarget)
 	}
 
-	// 建立到远程的连接
 	wsConn, err := connectNanoTunnel(finalTarget, "proxy", append(pendingData, firstFrame...))
 	if err != nil {
 		log.Printf("[Core] Connect failed: %s -> %v", finalTarget, err)
 		return
 	}
-	
-	// 根据 mode 发送适当的响应（如果还没发送的话）
+
 	if mode == 1 {
 		conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 	} else if mode == 2 {
 		conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 	}
-	
+
 	pipeDirect(conn, wsConn, finalTarget)
 }
 
@@ -1342,6 +1143,18 @@ func match(rule Rule, target string) bool {
 	}
 }
 
+// ========================================================================================
+// [v22.0 核心改动] connectNanoTunnel — Early Data 抢跑机制
+//
+// 原 v21.7 流程:  WS握手 → sendNanoHeaderV2(协议头+载荷 作为首个WS二进制帧)
+// 新 v22.0 流程:  构建协议头 → Base64URL编码 → 藏入Sec-WebSocket-Protocol HTTP头 → WS握手
+//                 上行首帧不再携带任何协议特征，完美绕过 CF WAF 的 DPI 深度包检测
+//
+// [兼容性] 服务端 22.0 同时支持 Early Data 和传统首帧两种模式:
+//   - earlyDataHeader 非空 → 从 HTTP 头解码，注入为流的首帧
+//   - earlyDataHeader 为空 → 退化为从首个 WS 消息读取（兼容旧客户端）
+// ========================================================================================
+
 func connectNanoTunnel(target, outboundTag string, payload []byte) (*websocket.Conn, error) {
 	settings, ok := proxySettingsMap[outboundTag]
 	if !ok {
@@ -1357,6 +1170,37 @@ func connectNanoTunnel(target, outboundTag string, payload []byte) (*websocket.C
 	if settings.ForwarderSettings != nil {
 		socks5 = settings.ForwarderSettings.Socks5Address
 	}
+
+	// ═══════ [技术1: Early Data] 构建协议头并 Base64URL 编码 ═══════
+	headerBytes, err := buildNanoHeader(target, socks5, fallback)
+	if err != nil {
+		return nil, err
+	}
+
+	// 策略：协议头 + 载荷 ≤ 2048字节 → 全部编入 Early Data（一次到位）
+	//       超出则仅协议头编入 Early Data，载荷走首个 WS 二进制帧
+	const maxEarlyDataSize = 2048
+	var earlyDataB64 string
+	var remainingPayload []byte
+
+	if len(payload) > 0 && len(headerBytes)+len(payload) <= maxEarlyDataSize {
+		// 合并：协议头 + 载荷 → 一次性编入 Early Data
+		combined := make([]byte, 0, len(headerBytes)+len(payload))
+		combined = append(combined, headerBytes...)
+		combined = append(combined, payload...)
+		earlyDataB64 = base64.RawURLEncoding.EncodeToString(combined)
+		log.Printf("[Early Data] 合并模式: 协议头(%d) + 载荷(%d) = %d bytes → Base64(%d)",
+			len(headerBytes), len(payload), len(combined), len(earlyDataB64))
+	} else {
+		// 分离：仅协议头编入 Early Data
+		earlyDataB64 = base64.RawURLEncoding.EncodeToString(headerBytes)
+		remainingPayload = payload
+		if len(payload) > 0 {
+			log.Printf("[Early Data] 分离模式: 协议头(%d) → Base64(%d), 载荷(%d) → 首个WS帧",
+				len(headerBytes), len(earlyDataB64), len(payload))
+		}
+	}
+
 	tryConnectOnce := func() (*websocket.Conn, error) {
 		var targetNode Node
 		var logMsg string
@@ -1399,7 +1243,9 @@ func connectNanoTunnel(target, outboundTag string, payload []byte) (*websocket.C
 			backend.IP = settings.ServerIP
 		}
 		start := time.Now()
-		wsConn, err := dialZeusWebSocket(targetNode.Domain, backend, secretKey)
+
+		// [v22.0 MODIFIED] 传入 earlyDataB64，协议头藏入 HTTP 升级头
+		wsConn, err := dialZeusWebSocket(targetNode.Domain, backend, secretKey, earlyDataB64)
 		latency := time.Since(start).Milliseconds()
 		if err != nil {
 			return nil, err
@@ -1407,13 +1253,18 @@ func connectNanoTunnel(target, outboundTag string, payload []byte) (*websocket.C
 		if backend.IP != "" {
 			log.Printf("[Core] Tunnel -> %s (SNI) >>> %s:%s (Real) | Latency: %dms", targetNode.Domain, backend.IP, backend.Port, latency)
 		}
-		err = sendNanoHeaderV2(wsConn, target, payload, socks5, fallback)
-		if err != nil {
-			wsConn.Close()
-			return nil, err
+
+		// [v22.0 NEW] 仅当载荷未编入 Early Data 时，作为首个 WS 帧发送
+		if len(remainingPayload) > 0 {
+			if err := wsConn.WriteMessage(websocket.BinaryMessage, remainingPayload); err != nil {
+				wsConn.Close()
+				return nil, err
+			}
 		}
+
 		return wsConn, nil
 	}
+
 	conn, err := tryConnectOnce()
 	if err != nil && len(settings.NodePool) > 1 {
 		log.Printf("[Core] Connect failed: %v. Retry...", err)
@@ -1449,7 +1300,15 @@ func selectBackend(backends []Backend, key string) Backend {
 	return backends[0]
 }
 
-func dialZeusWebSocket(sni string, backend Backend, token string) (*websocket.Conn, error) {
+// ========================================================================================
+// [v22.0 MODIFIED] dialZeusWebSocket — 新增 earlyData 参数
+//
+// 当 earlyData 非空时，将其设置为 Sec-WebSocket-Protocol 请求头。
+// 服务端从该头部提取 Base64 编码的协议数据，注入为可读流的首帧。
+// 效果：WS 握手阶段即完成协议协商，上行首个 WS 数据帧完全是业务载荷，无任何协议指纹。
+// ========================================================================================
+
+func dialZeusWebSocket(sni string, backend Backend, token string, earlyData string) (*websocket.Conn, error) {
 	sniHost, sniPort, err := net.SplitHostPort(sni)
 	if err != nil {
 		sniHost = sni
@@ -1463,6 +1322,14 @@ func dialZeusWebSocket(sni string, backend Backend, token string) (*websocket.Co
 	requestHeader := http.Header{}
 	requestHeader.Add("Host", sniHost)
 	requestHeader.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+	// [v22.0 NEW] ═══════ Early Data: 协议头藏入 Sec-WebSocket-Protocol ═══════
+	// 使用直接赋值 requestHeader["Sec-WebSocket-Protocol"] 而非 Dialer.Subprotocols，
+	// 避免 gorilla/websocket 对响应头的子协议验证逻辑，提高鲁棒性。
+	if earlyData != "" {
+		requestHeader["Sec-WebSocket-Protocol"] = []string{earlyData}
+	}
+
 	dialer := websocket.Dialer{
 		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true, ServerName: sniHost},
 		HandshakeTimeout: 5 * time.Second,
@@ -1545,18 +1412,55 @@ func formatBytes(b int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
+// ========================================================================================
+// [v22.0 NEW] buildNanoHeader — 构建二进制协议头（不含载荷）
+//
+// 协议头格式: [HostLen(1)][Host(var)][Port(2)][S5Len(1)][S5(var)][FBLen(1)][FB(var)]
+// 该字节序列经 Base64URL 编码后，藏入 Sec-WebSocket-Protocol HTTP 头，
+// 使得 WebSocket 建立后的首个数据帧不再携带任何自定义协议特征。
+// ========================================================================================
+
+func buildNanoHeader(target string, s5 string, fb string) ([]byte, error) {
+	host, portStr, _ := net.SplitHostPort(target)
+	var port uint16
+	fmt.Sscanf(portStr, "%d", &port)
+
+	// 处理 IPv6 地址格式
+	if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+		host = ip.String()
+	}
+
+	hostBytes, s5Bytes, fbBytes := []byte(host), []byte(s5), []byte(fb)
+	if len(hostBytes) > 255 || len(s5Bytes) > 255 || len(fbBytes) > 255 {
+		return nil, errors.New("address length exceeds 255 bytes")
+	}
+
+	buf := new(bytes.Buffer)
+	buf.WriteByte(byte(len(hostBytes)))
+	buf.Write(hostBytes)
+	portBuf := make([]byte, 2)
+	binary.BigEndian.PutUint16(portBuf, port)
+	buf.Write(portBuf)
+	buf.WriteByte(byte(len(s5Bytes)))
+	if len(s5Bytes) > 0 {
+		buf.Write(s5Bytes)
+	}
+	buf.WriteByte(byte(len(fbBytes)))
+	if len(fbBytes) > 0 {
+		buf.Write(fbBytes)
+	}
+	return buf.Bytes(), nil
+}
+
+// [v22.0 DEPRECATED] sendNanoHeaderV2 — 旧版协议头发送（保留用于向后兼容参考）
+// 新版通过 Early Data 机制将协议头藏入 HTTP 升级头，不再需要此函数。
 func sendNanoHeaderV2(wsConn *websocket.Conn, target string, payload []byte, s5 string, fb string) error {
 	host, portStr, _ := net.SplitHostPort(target)
 	var port uint16
 	fmt.Sscanf(portStr, "%d", &port)
-	
-	// [v21.6] 处理 IPv6 地址格式
-	// 如果 host 是 IPv6 地址，确保格式正确
 	if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
-		// 是 IPv6 地址，保持原样（不加方括号，因为这是原始传输）
 		host = ip.String()
 	}
-	
 	hostBytes, s5Bytes, fbBytes := []byte(host), []byte(s5), []byte(fb)
 	if len(hostBytes) > 255 || len(s5Bytes) > 255 || len(fbBytes) > 255 {
 		return errors.New("address length exceeds 255 bytes")
@@ -1589,17 +1493,17 @@ func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) {
 	io.ReadFull(conn, header)
 	var host string
 	switch header[3] {
-	case 1: // IPv4
+	case 1:
 		b := make([]byte, 4)
 		io.ReadFull(conn, b)
 		host = net.IP(b).String()
-	case 3: // Domain
+	case 3:
 		b := make([]byte, 1)
 		io.ReadFull(conn, b)
 		d := make([]byte, b[0])
 		io.ReadFull(conn, d)
 		host = string(d)
-	case 4: // IPv6
+	case 4:
 		b := make([]byte, 16)
 		io.ReadFull(conn, b)
 		host = net.IP(b).String()
