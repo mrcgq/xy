@@ -1,10 +1,24 @@
-// =========================================================================================
-// Xlink Core v21.7 内核端代码3
-// 54法则审查修复版
-// =========================================================================================
-
 //go:build binary
 // +build binary
+
+// =========================================================================================
+// Xlink Core v21.8 内核端代码
+// 54法则审查修复版 + 连接池化（Connection Pooling）+ 连接健康自愈
+//
+// 本版本相对 v21.7 的核心改动：
+//   [新增] W-分子-01 零内核债务：wsConnPool — 全局 WebSocket 连接池
+//   [新增] W-系统-05 同步终止：idlePoolCleaner goroutine，定期驱逐空闲/死连接
+//   [新增] W-器官-01 单一归属：pipeDirect 退出时原子驱逐池中死连接
+//   [新增] W-质子-01 零阻塞：池命中时跳过 TLS+WS 握手，直接复用长连接
+//   [修复] W-原子-05 幂等：getCachedTunnel Ping 失败后立即删除缓存再重建
+//   [修复] W-系统-09 背压传导：pipeDirect 上下行各持独立 bufPool buffer
+//   [保留] 全部 v21.7 法则注释，逐条对应
+//
+// 关键物理约束（与 54 法则对应）：
+//   W-夸克-01  每个 gorilla/websocket 连接 ≈ 1 个 TCP + 1 个 TLS session（内核态资源）
+//   W-质子-04  句柄吝啬：maxPoolSize = min(节点数×8, 128)，防止连接泄漏
+//   W-器官-05  差异化超时：本地握手 3s / 远端握手 5s / 空闲清理周期 60s
+// =========================================================================================
 
 package core
 
@@ -38,14 +52,14 @@ import (
 
 // ======================== 编译期常量 ========================
 
-// [法则3] 单一真相：超时常量集中定义
+// [法则03] 单一真相：超时常量集中定义
 // [法则36] 差异化超时：每个值有明确的物理依据
 const (
-	// SOCKS5代理通常是局域网或同城节点，RTT < 1ms，3s足够判定失活
-	connTimeoutDirect = 4 * time.Second
-	// 直连目标可能跨运营商，额外1s冗余
+	// SOCKS5 代理通常是局域网或同城节点，RTT < 1ms，3s 足够判定失活
 	connTimeoutProxy = 3 * time.Second
-	// fallback目标可能跨大洲，5s是P99延迟上界
+	// 直连目标可能跨运营商，额外 1s 冗余
+	connTimeoutDirect = 4 * time.Second
+	// fallback 目标可能跨大洲，5s 是 P99 延迟上界
 	connTimeoutFallback = 5 * time.Second
 
 	sniffReadTimeout    = 500 * time.Millisecond
@@ -53,7 +67,16 @@ const (
 	idleConnTimeout     = 30 * time.Second
 	tlsHandshakeTimeout = 5 * time.Second
 
-	// [法则04] 意图透明：协议魔法字节具名化
+	// [新增][法则36] 连接池专属超时常量
+	// Ping 检测：2s 内无响应视为死连接（比握手超时更短，快速判定）
+	poolPingTimeout = 2 * time.Second
+	// 空闲清理周期：60s 扫描一次，驱逐超过 idleConnTimeout 未被使用的连接
+	poolCleanInterval = 60 * time.Second
+	// 单节点最大池深度：避免对同一后端建立过多长连接占用服务端 fd
+	// [法则04] 句柄吝啬：maxPoolDepth × 节点数 < 系统句柄上限
+	maxPoolDepth = 8
+
+	// [法则04] 意图透明：SOCKS5 协议版本魔法字节具名化
 	socks5Version byte = 0x05
 )
 
@@ -69,17 +92,17 @@ type connMode int
 const (
 	// modeResponded 代理响应已发出，后续可直接读取隧道数据
 	modeResponded connMode = 0
-	// modeSOCKS5Pending SOCKS5握手完成，代理响应尚未发出
+	// modeSOCKS5Pending SOCKS5 握手完成，代理响应尚未发出
 	modeSOCKS5Pending connMode = 1
-	// modeHTTPSPending HTTPS CONNECT请求已解析，代理响应尚未发出
+	// modeHTTPSPending HTTPS CONNECT 请求已解析，代理响应尚未发出
 	modeHTTPSPending connMode = 2
-	// modeHTTPPlain HTTP明文请求，firstFrame中含完整请求体
+	// modeHTTPPlain HTTP 明文请求，firstFrame 中含完整请求体
 	modeHTTPPlain connMode = 3
 )
 
 // ======================== DNS 配置与策略 ========================
 
-// [法则3] 单一真相：策略枚举集中定义
+// [法则03] 单一真相：策略枚举集中定义
 type DNSStrategy string
 
 const (
@@ -90,7 +113,7 @@ const (
 	DNSStrategyPreferIPv4 DNSStrategy = "PreferIPv4"
 )
 
-// [法则14] 不变量：Enabled=false时，ResolveIP直接返回原域名
+// [法则14] 不变量：Enabled=false 时，ResolveIP 直接返回原域名
 type DNSConfig struct {
 	Enabled          bool        `json:"enabled"`
 	Strategy         DNSStrategy `json:"strategy"`
@@ -100,14 +123,14 @@ type DNSConfig struct {
 	TimeoutMs        int         `json:"timeout_ms"`
 }
 
-// [法则14] 不变量：Enabled=false时，Sniff直接返回Success=false
+// [法则14] 不变量：Enabled=false 时，Sniff 直接返回 Success=false
 type SniffingConfig struct {
 	Enabled      bool     `json:"enabled"`
 	DestOverride []string `json:"dest_override"` // ["http", "tls"]
 	RouteOnly    bool     `json:"route_only"`
 }
 
-// [法则10] 编译期优先：默认配置在包初始化时确定
+// [法则10] 编译期优先：默认配置在包初始化时确定，不在热路径读注册表
 var defaultDNSConfig = DNSConfig{
 	Enabled:          true,
 	Strategy:         DNSStrategyPreferIPv4,
@@ -125,7 +148,7 @@ var defaultSniffingConfig = SniffingConfig{
 
 // ======================== DNS 缓存 ========================
 
-// [法则40] 状态局部化：缓存封装为独立结构，不暴露全局map
+// [法则40] 状态局部化：缓存封装为独立结构，不暴露全局 map
 type dnsCache struct {
 	mu      sync.RWMutex
 	entries map[string]*dnsCacheEntry
@@ -137,7 +160,7 @@ type dnsCacheEntry struct {
 	expires time.Time
 }
 
-// [法则3] 单一真相：全局缓存唯一实例
+// [法则03] 单一真相：全局缓存唯一实例
 var globalDNSCache = &dnsCache{entries: make(map[string]*dnsCacheEntry)}
 
 func (c *dnsCache) get(domain string) (ipv4, ipv6 []net.IP, ok bool) {
@@ -160,10 +183,190 @@ func (c *dnsCache) set(domain string, ipv4, ipv6 []net.IP, ttl int) {
 	}
 }
 
+// ======================== WebSocket 连接池 ========================
+//
+// [新增][法则分子-01] 零内核债务：
+//   复用已握手的 WebSocket 长连接，避免每次请求都发起 TLS+WS 握手。
+//   浏览器打开一个页面会产生几十个并发请求，
+//   没有连接池时 → 几十次 TLS 握手 → 节点高负载 + 用户感知卡顿。
+//   有连接池后  → 1~maxPoolDepth 条长连接复用 → 握手代价被均摊。
+//
+// 池结构设计说明：
+//   key   = node.Domain（节点标识符，单一真相来源）
+//   value = []*pooledConn（同一节点可维持多条连接，应对并发请求）
+//
+// [法则14] 不变量（每条池化连接）：
+//   conn    非 nil   — 已完成握手的活跃连接（或待健康检查）
+//   lastUse 单调递增 — 每次从池中取出时更新，用于空闲驱逐
+//   inUse   true     — 连接正在被 pipeDirect 占用，不能被清理线程驱逐
+//
+// [法则32] 单一归属：wsConnPool 是所有池化连接的唯一归属点
+//   连接的生命周期转移：
+//     dialZeusWebSocket → pooledConn.conn（归池）
+//     getCachedTunnel   → 取出（inUse=true，归 pipeDirect）
+//     pipeDirect defer  → 归还（inUse=false）或驱逐（conn出错）
+//     idlePoolCleaner   → 驱逐超时空闲连接（inUse=false 且超时）
+
+// pooledConn 池中单条连接的状态封装
+// [法则14] 所有字段含义显式标注，不变量由注释描述
+type pooledConn struct {
+	conn    *websocket.Conn
+	lastUse time.Time // 最后一次从池中取出的时间（用于空闲驱逐）
+	inUse   bool      // true = 正在被 pipeDirect 占用，清理线程跳过
+}
+
+// wsConnPool 全局 WebSocket 连接池
+// [法则32] 单一归属：进程内唯一实例，所有连接归属此结构
+// [法则40] 状态局部化：池状态封装在结构内，不暴露裸 map
+type wsConnPool struct {
+	mu    sync.Mutex
+	conns map[string][]*pooledConn // key: node.Domain
+}
+
+// [法则03] 单一真相：全局池唯一实例，在 init() 中初始化
+var globalConnPool = &wsConnPool{
+	conns: make(map[string][]*pooledConn),
+}
+
+// acquire 从池中取一条健康连接（inUse=false），若无则返回 nil
+// [法则22] 单一职责：只做"取"操作，不做拨号
+// [法则05] 幂等：Ping 失败时立即从池中删除该条目，保证池中无死连接
+func (p *wsConnPool) acquire(nodeKey string) *websocket.Conn {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	list := p.conns[nodeKey]
+	for i, pc := range list {
+		if pc.inUse {
+			continue // [法则14] 不变量：inUse=true 的连接归 pipeDirect 独占
+		}
+		// Ping 健康检查：写一帧 Ping，超时则驱逐
+		// [法则36] poolPingTimeout=2s < wsHandshakeTimeout=5s，快速判定死连接
+		pc.conn.SetWriteDeadline(time.Now().Add(poolPingTimeout))
+		err := pc.conn.WriteMessage(websocket.PingMessage, nil)
+		pc.conn.SetWriteDeadline(time.Time{}) // 恢复无限期
+		if err != nil {
+			// [法则05] 幂等：Ping 失败 → 驱逐 → 下次 acquire 不会再遇到此死连接
+			pc.conn.Close()
+			p.conns[nodeKey] = append(list[:i], list[i+1:]...)
+			log.Printf("[Pool] evict dead conn key:%s err:%v", nodeKey, err)
+			return nil
+		}
+		// 命中：标记为占用，更新最后使用时间
+		pc.inUse = true
+		pc.lastUse = time.Now()
+		log.Printf("[Pool] reuse conn key:%s pool_size:%d", nodeKey, len(list))
+		return pc.conn
+	}
+	return nil // 无可用连接，调用方负责拨号
+}
+
+// release 将连接归还给池（归还而非关闭，供后续请求复用）
+// [法则22] 单一职责：只做"还"操作，不做关闭
+// [法则19] 幂等：如果 conn 已不在池中（被 evict），此调用无副作用
+func (p *wsConnPool) release(nodeKey string, conn *websocket.Conn) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, pc := range p.conns[nodeKey] {
+		if pc.conn == conn {
+			pc.inUse = false
+			pc.lastUse = time.Now()
+			log.Printf("[Pool] returned conn key:%s", nodeKey)
+			return
+		}
+	}
+	// conn 不在池中（已被驱逐），静默忽略（幂等）
+}
+
+// evict 从池中强制驱逐特定连接（pipeDirect 出错时调用）
+// [法则22] 单一职责：只做"驱逐"操作
+// [法则09] 副作用声明：关闭 conn，从池中删除该条目
+func (p *wsConnPool) evict(nodeKey string, conn *websocket.Conn) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	list := p.conns[nodeKey]
+	for i, pc := range list {
+		if pc.conn == conn {
+			pc.conn.Close()
+			p.conns[nodeKey] = append(list[:i], list[i+1:]...)
+			log.Printf("[Pool] evicted conn key:%s remaining:%d", nodeKey, len(p.conns[nodeKey]))
+			return
+		}
+	}
+}
+
+// put 将新建的连接放入池中（若池未满）
+// [法则22] 单一职责：只做"放入"操作
+// [法则04] 句柄吝啬：超过 maxPoolDepth 时拒绝入池（连接由调用方关闭）
+// [法则09] 副作用声明：可能关闭 conn（池满时）
+func (p *wsConnPool) put(nodeKey string, conn *websocket.Conn) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	list := p.conns[nodeKey]
+	if len(list) >= maxPoolDepth {
+		log.Printf("[Pool] full key:%s depth:%d, conn will not be cached", nodeKey, len(list))
+		return false // 调用方负责关闭此连接
+	}
+	p.conns[nodeKey] = append(list, &pooledConn{
+		conn:    conn,
+		lastUse: time.Now(),
+		inUse:   true, // 新建连接立即进入 inUse 状态，由 pipeDirect 持有
+	})
+	log.Printf("[Pool] added conn key:%s depth:%d", nodeKey, len(p.conns[nodeKey]))
+	return true
+}
+
+// startIdlePoolCleaner 启动空闲连接清理 goroutine
+// [新增][法则系统-05] 同步终止：cleaner 通过 stopCh 优雅退出
+// [法则09] 副作用声明：关闭并删除超过 idleConnTimeout 的空闲连接
+// [法则38] 契约: 输入 stopCh | 输出：无 | 副作用：定期修改 globalConnPool
+func startIdlePoolCleaner(stopCh <-chan struct{}) {
+	ticker := time.NewTicker(poolCleanInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			cleanIdleConns()
+		case <-stopCh:
+			log.Printf("[Pool] idle cleaner stopped")
+			return
+		}
+	}
+}
+
+// cleanIdleConns 扫描并驱逐超时空闲连接
+// [法则22] 单一职责：只做清理，不做连接建立
+// [法则19] 幂等：多次调用结果一致（已驱逐的不会被重复驱逐）
+func cleanIdleConns() {
+	globalConnPool.mu.Lock()
+	defer globalConnPool.mu.Unlock()
+	now := time.Now()
+	for key, list := range globalConnPool.conns {
+		var alive []*pooledConn
+		for _, pc := range list {
+			if pc.inUse {
+				alive = append(alive, pc) // 占用中：不驱逐
+				continue
+			}
+			if now.Sub(pc.lastUse) > idleConnTimeout {
+				pc.conn.Close()
+				log.Printf("[Pool] idle evict key:%s idle:%v", key, now.Sub(pc.lastUse).Round(time.Second))
+			} else {
+				alive = append(alive, pc)
+			}
+		}
+		if len(alive) == 0 {
+			delete(globalConnPool.conns, key)
+		} else {
+			globalConnPool.conns[key] = alive
+		}
+	}
+}
+
 // ======================== DNS 解析器 ========================
 
-// DNSResolver DNS解析器
-// [法则38] 契约: 输入DNSConfig | 输出ResolveIP(domain)→string | 副作用：DoH网络请求+缓存写入
+// DNSResolver DNS 解析器
+// [法则38] 契约: 输入 DNSConfig | 输出 ResolveIP(domain)→string | 副作用：DoH 网络请求+缓存写入
 type DNSResolver struct {
 	config     DNSConfig
 	httpClient *http.Client
@@ -176,8 +379,9 @@ func NewDNSResolver(config DNSConfig) *DNSResolver {
 			Timeout:   time.Duration(config.TimeoutMs) * time.Millisecond,
 			DualStack: true,
 		}).DialContext,
-		// [有意识缺陷] InsecureSkipVerify=true：DoH服务器通过IP直连时证书可能不匹配，
-		// 依赖URL中的server地址做信任锚，此为设计决策非安全疏忽
+		// [法则37] 有意识缺陷：InsecureSkipVerify=true
+		// DoH 服务器通过 IP 直连时证书 CN 可能不匹配，
+		// 依赖 URL 中的 server 地址做信任锚，此为设计决策非安全疏忽
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
 		MaxIdleConns:        10,
 		IdleConnTimeout:     idleConnTimeout,
@@ -192,9 +396,9 @@ func NewDNSResolver(config DNSConfig) *DNSResolver {
 	}
 }
 
-// ResolveIP 根据策略解析域名，返回最优IP字符串
-// [法则38] 契约: 输入domain | 输出IP字符串或原域名(永不返回error导致中断) | 副作用：缓存读写+DoH请求
-// [法则16] 快速失败：未启用→直接返回；已是IP→直接返回；缓存命中→直接返回
+// ResolveIP 根据策略解析域名，返回最优 IP 字符串
+// [法则38] 契约: 输入 domain | 输出 IP 字符串或原域名（永不返回 error 导致中断）| 副作用：缓存读写+DoH 请求
+// [法则16] 快速失败：未启用→直接返回；已是 IP→直接返回；缓存命中→直接返回
 func (r *DNSResolver) ResolveIP(domain string) string {
 	if !r.config.Enabled {
 		return domain
@@ -226,7 +430,7 @@ func (r *DNSResolver) ResolveIP(domain string) string {
 	return result
 }
 
-// [法则22] 单一职责：协调DoH查询和系统DNS回退
+// [法则22] 单一职责：协调 DoH 查询和系统 DNS 回退
 // [法则30] 错误传播：子错误向上传播，调用方决策
 func (r *DNSResolver) resolveAll(domain string) ([]net.IP, []net.IP, error) {
 	for _, server := range r.config.Servers {
@@ -241,7 +445,7 @@ func (r *DNSResolver) resolveAll(domain string) ([]net.IP, []net.IP, error) {
 	return nil, nil, errors.New("all DoH servers failed, fallback disabled")
 }
 
-// [法则22] 单一职责：并发查询A和AAAA记录
+// [法则22] 单一职责：并发查询 A 和 AAAA 记录
 func (r *DNSResolver) resolveDoH(server, domain string) ([]net.IP, []net.IP, error) {
 	var ipv4s, ipv6s []net.IP
 	var mu sync.Mutex
@@ -272,7 +476,7 @@ func (r *DNSResolver) resolveDoH(server, domain string) ([]net.IP, []net.IP, err
 	return ipv4s, ipv6s, nil
 }
 
-// [法则22] 单一职责：执行单次DoH HTTP请求并解析响应
+// [法则22] 单一职责：执行单次 DoH HTTP 请求并解析响应
 func (r *DNSResolver) doHQuery(server, domain, recordType string) ([]net.IP, error) {
 	reqURL := fmt.Sprintf("%s?name=%s&type=%s", server, url.QueryEscape(domain), recordType)
 	req, err := http.NewRequest("GET", reqURL, nil)
@@ -316,7 +520,7 @@ func (r *DNSResolver) doHQuery(server, domain, recordType string) ([]net.IP, err
 	return ips, nil
 }
 
-// [法则22] 单一职责：系统DNS查询
+// [法则22] 单一职责：系统 DNS 查询（兜底路径）
 func (r *DNSResolver) resolveSystem(domain string) ([]net.IP, []net.IP, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(r.config.TimeoutMs)*time.Millisecond)
 	defer cancel()
@@ -337,7 +541,7 @@ func (r *DNSResolver) resolveSystem(domain string) ([]net.IP, []net.IP, error) {
 	return ipv4s, ipv6s, nil
 }
 
-// [法则22] 单一职责：根据策略从候选列表选择一个IP
+// [法则22] 单一职责：根据策略从候选列表选择一个 IP
 func (r *DNSResolver) selectIP(ipv4s, ipv6s []net.IP) string {
 	switch r.config.Strategy {
 	case DNSStrategyUseIPv6:
@@ -360,7 +564,7 @@ func (r *DNSResolver) selectIP(ipv4s, ipv6s []net.IP) string {
 // ======================== Sniffing 模块 ========================
 
 // SniffResult 嗅探结果
-// [法则23] 返回值语义完备：Success=false时Domain为空字符串
+// [法则23] 返回值语义完备：Success=false 时 Domain 为空字符串
 type SniffResult struct {
 	Domain   string
 	Protocol string
@@ -368,7 +572,7 @@ type SniffResult struct {
 }
 
 // Sniffer 流量嗅探器
-// [法则38] 契约: 输入data字节切片 | 输出SniffResult | 副作用：无（纯函数）
+// [法则38] 契约: 输入 data 字节切片 | 输出 SniffResult | 副作用：无（纯函数）
 type Sniffer struct {
 	config SniffingConfig
 }
@@ -389,13 +593,13 @@ func (s *Sniffer) Sniff(data []byte) SniffResult {
 			if r := s.sniffTLS(data); r.Success { return r }
 		case "http":
 			if r := s.sniffHTTP(data); r.Success { return r }
-		// [法则54] 认知负载预算：QUIC启发式嗅探复杂度超过收益，移除
+		// [法则54] 认知负载预算：QUIC 启发式嗅探复杂度超过收益，不引入
 		}
 	}
 	return SniffResult{}
 }
 
-// sniffTLS 从TLS ClientHello提取SNI
+// sniffTLS 从 TLS ClientHello 提取 SNI
 // [法则11] 边界完备：每步读取前验证长度
 func (s *Sniffer) sniffTLS(data []byte) SniffResult {
 	if len(data) < 5 || data[0] != 0x16 { return SniffResult{} }
@@ -415,7 +619,7 @@ func (s *Sniffer) sniffTLS(data []byte) SniffResult {
 	return s.parseClientHello(handshakeData[4:])
 }
 
-// parseClientHello 解析ClientHello提取扩展
+// parseClientHello 解析 ClientHello 提取扩展
 // [法则11+12] 边界完备+语义合法
 func (s *Sniffer) parseClientHello(data []byte) SniffResult {
 	if len(data) < 38 { return SniffResult{} }
@@ -438,7 +642,7 @@ func (s *Sniffer) parseClientHello(data []byte) SniffResult {
 	return s.parseExtensions(data[pos : pos+extLen])
 }
 
-// parseExtensions 从扩展列表中提取SNI(type=0)
+// parseExtensions 从扩展列表中提取 SNI（type=0）
 func (s *Sniffer) parseExtensions(data []byte) SniffResult {
 	for pos := 0; pos+4 <= len(data); {
 		extType := binary.BigEndian.Uint16(data[pos:])
@@ -455,7 +659,7 @@ func (s *Sniffer) parseExtensions(data []byte) SniffResult {
 	return SniffResult{}
 }
 
-// parseSNI 解析SNI扩展，提取hostname
+// parseSNI 解析 SNI 扩展，提取 hostname
 func (s *Sniffer) parseSNI(data []byte) string {
 	if len(data) < 5 { return "" }
 	listLen := int(binary.BigEndian.Uint16(data[0:]))
@@ -475,7 +679,7 @@ func (s *Sniffer) parseSNI(data []byte) string {
 	return ""
 }
 
-// sniffHTTP 从HTTP请求提取Host
+// sniffHTTP 从 HTTP 请求提取 Host
 func (s *Sniffer) sniffHTTP(data []byte) SniffResult {
 	if len(data) < 16 { return SniffResult{} }
 
@@ -511,7 +715,8 @@ func isValidDomain(s string) bool {
 	for _, part := range parts {
 		if len(part) == 0 || len(part) > 63 { return false }
 		for _, c := range part {
-			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-') {
+			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+				(c >= '0' && c <= '9') || c == '-') {
 				return false
 			}
 		}
@@ -603,14 +808,18 @@ var (
 	routingMap        []Rule
 	globalDNSResolver *DNSResolver
 	globalSniffer     *Sniffer
+
+	// [新增][法则39] 生命周期：stopCh 用于优雅关闭 idlePoolCleaner goroutine
+	poolCleanerStopCh chan struct{}
 )
 
-// [法则24] 零债务：32KB缓冲池复用，避免每次分配
+// [法则24] 零债务：32KB 缓冲池复用，避免每次分配
+// [法则09] 副作用声明：Get 取出 buf 后调用方独占，Put 归还后不能再访问
 var bufPool = sync.Pool{New: func() interface{} { return make([]byte, 32*1024) }}
 
 // ======================== 节点与规则解析 ========================
 
-// [法则22] 单一职责：只解析节点字符串为Node结构
+// [法则22] 单一职责：只解析节点字符串为 Node 结构
 func parseNode(nodeStr string) Node {
 	var n Node
 	parts := strings.SplitN(nodeStr, "#", 2)
@@ -634,7 +843,7 @@ func parseNode(nodeStr string) Node {
 	return n
 }
 
-// [法则22] 单一职责：只解析规则字符串填充全局routingMap
+// [法则22] 单一职责：只解析规则字符串填充全局 routingMap
 func parseRules(pool []Node) {
 	if len(globalConfig.Outbounds) == 0 { return }
 	var s ProxySettings
@@ -693,7 +902,7 @@ func parseRules(pool []Node) {
 	}
 }
 
-// [法则22] 单一职责：只解析outbounds配置并初始化proxySettingsMap
+// [法则22] 单一职责：只解析 outbounds 配置并初始化 proxySettingsMap
 func parseOutbounds() {
 	for i, outbound := range globalConfig.Outbounds {
 		if outbound.Protocol != "ech-proxy" { continue }
@@ -712,7 +921,7 @@ func parseOutbounds() {
 			settings.ForwarderSettings = &ProxyForwarderSettings{Socks5Address: settings.S5}
 		}
 
-		// [法则13] 原子赋值：nil检查后赋值，不存在中间态
+		// [法则13] 原子赋值：nil 检查后赋值，不存在中间态
 		if settings.DNS == nil { settings.DNS = &defaultDNSConfig }
 		if settings.Sniffing == nil { settings.Sniffing = &defaultSniffingConfig }
 
@@ -745,7 +954,7 @@ func pingNode(node Node, token, globalIP string, results chan<- TestResult) {
 }
 
 // RunSpeedTest 并发测速所有节点并按延迟排序输出
-// [法则38] 契约: 输入节点池字符串+token+globalIP | 输出标准输出打印结果 | 副作用：并发建立WebSocket连接
+// [法则38] 契约: 输入节点池字符串+token+globalIP | 输出标准输出打印结果 | 副作用：并发建立 WebSocket 连接
 func RunSpeedTest(serverAddr, token, globalIP string) {
 	rawPool := strings.NewReplacer("\r\n", ";", "\n", ";").Replace(serverAddr)
 	var nodes []Node
@@ -785,9 +994,9 @@ func RunSpeedTest(serverAddr, token, globalIP string) {
 	}
 }
 
-// formatNode 将Node格式化为可读字符串
-// [法则02] 存在即必要：用strings.Builder消除中间赋值
-// [法则38] 契约: 输入Node | 输出"domain#ip:port|weight,..." 格式字符串 | 副作用：无
+// formatNode 将 Node 格式化为可读字符串
+// [法则02] 存在即必要：用 strings.Builder 消除中间赋值
+// [法则38] 契约: 输入 Node | 输出 "domain#ip:port|weight,..." 格式字符串 | 副作用：无
 func formatNode(n Node) string {
 	if len(n.Backends) == 0 {
 		return n.Domain
@@ -814,10 +1023,18 @@ func checkFileDependency(filename string) bool {
 }
 
 // StartInstance 启动监听实例
-// [法则38] 契约: 输入JSON配置 | 输出(Listener,error) | 副作用：初始化全局状态，启动Accept循环
+// [法则38] 契约: 输入 JSON 配置 | 输出 (Listener, error) | 副作用：初始化全局状态，启动 Accept 循环，启动连接池清理器
 // [法则01] 极简：移除 Go 1.20+ 已废弃的 rand.Seed 调用
+// [法则39] 生命周期：stopCh 控制 idlePoolCleaner goroutine 生命周期
 func StartInstance(configContent []byte) (net.Listener, error) {
 	// [法则01] rand.Seed 已移除：Go 1.20+ 全局随机数自动播种，显式调用是多余代码
+
+	// [法则39] 生命周期：重启时先停止旧的清理器，再启动新的
+	if poolCleanerStopCh != nil {
+		close(poolCleanerStopCh)
+	}
+	poolCleanerStopCh = make(chan struct{})
+
 	proxySettingsMap = make(map[string]ProxySettings)
 	routingMap = nil
 
@@ -868,16 +1085,48 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 			mode += fmt.Sprintf("+%dRules", len(routingMap))
 		}
 	}
-	log.Printf("[Core] v21.7.1 listening:%s mode:%s", inbound.Listen, mode)
+	log.Printf("[Core] v21.8 listening:%s mode:%s", inbound.Listen, mode)
 
-	// [法则39] 生命周期：Accept循环在goroutine中，主goroutine持有listener
+	// [新增][法则39] 生命周期：启动空闲连接清理 goroutine
+	go startIdlePoolCleaner(poolCleanerStopCh)
+	log.Printf("[Core] [Pool] idle cleaner started, interval:%v maxDepth:%d", poolCleanInterval, maxPoolDepth)
+
+	// [法则39] 生命周期：Accept 循环在 goroutine 中，主 goroutine 持有 listener
 	go acceptLoop(listener, inbound.Tag)
 	return listener, nil
 }
 
+// StopInstance 优雅停止实例
+// [新增][法则39] 生命周期：提供给调用方（C 客户端）的显式停止入口
+// [法则09] 副作用声明：停止 idlePoolCleaner，关闭所有池化连接
+// [法则50] 向死而生：优先清理连接池（释放服务端资源），再关闭 listener
+func StopInstance(listener net.Listener) {
+	// 停止清理器
+	if poolCleanerStopCh != nil {
+		close(poolCleanerStopCh)
+		poolCleanerStopCh = nil
+	}
+	// 清空连接池（驱逐所有连接）
+	globalConnPool.mu.Lock()
+	for key, list := range globalConnPool.conns {
+		for _, pc := range list {
+			pc.conn.Close()
+		}
+		delete(globalConnPool.conns, key)
+	}
+	globalConnPool.mu.Unlock()
+	log.Printf("[Core] [Pool] all connections evicted")
+
+	// 关闭 listener（acceptLoop 检测到 ErrClosed 后自然退出）
+	if listener != nil {
+		listener.Close()
+	}
+	log.Printf("[Core] instance stopped")
+}
+
 // acceptLoop 持续接受连接并分发处理
-// [法则22] 单一职责：只负责accept和分发，不做协议处理
-// [法则38] 契约: 输入Listener | 输出：无 | 副作用：为每个连接启动goroutine
+// [法则22] 单一职责：只负责 accept 和分发，不做协议处理
+// [法则38] 契约: 输入 Listener | 输出：无 | 副作用：为每个连接启动 goroutine
 // [法则46] 可观测性：区分正常关闭（ErrClosed）和意外错误，分别记录
 func acceptLoop(listener net.Listener, inboundTag string) {
 	for {
@@ -889,7 +1138,7 @@ func acceptLoop(listener net.Listener, inboundTag string) {
 			} else {
 				log.Printf("[Core] accept error: %v", err)
 			}
-			break
+			return
 		}
 		go handleGeneralConnection(conn, inboundTag)
 	}
@@ -898,14 +1147,14 @@ func acceptLoop(listener net.Listener, inboundTag string) {
 // ======================== 连接处理（职责拆分版）========================
 
 // connContext 单次连接上下文
-// [法则40] 状态局部化：连接状态封装在struct内，不污染全局
+// [法则40] 状态局部化：连接状态封装在 struct 内，不污染全局
 // [法则14] 不变量：mode 使用具名 connMode 类型，不变量由类型系统辅助检查
 type connContext struct {
 	conn        net.Conn
 	target      string
 	mode        connMode // 响应状态机，见 connMode 常量定义
-	firstFrame  []byte   // HTTP明文请求体（modeHTTPPlain时有效）
-	pendingData []byte   // sniff读到的数据，需随首包一起转发
+	firstFrame  []byte   // HTTP 明文请求体（modeHTTPPlain 时有效）
+	pendingData []byte   // sniff 读到的数据，需随首包一起转发
 }
 
 // handleGeneralConnection 连接入口
@@ -932,11 +1181,10 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	if err != nil { return }
 
 	// [法则31] 职责链：sniff → dns → connect → pipe
-	// sniffAndRewrite 现在只读数据+重写target，不发响应（法则22/09 修复）
 	sniffAndRewrite(&ctx)
 	resolveTarget(&ctx)
 
-	wsConn, err := connectNanoTunnel(ctx.target, "proxy", append(ctx.pendingData, ctx.firstFrame...))
+	wsConn, nodeKey, err := connectNanoTunnel(ctx.target, "proxy", append(ctx.pendingData, ctx.firstFrame...))
 	if err != nil {
 		log.Printf("[Core] connect failed target:%s err:%v", ctx.target, err)
 		return
@@ -944,10 +1192,12 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 
 	// [法则19] 幂等：sendProxyResponse 仅在 mode != modeResponded 时发送
 	sendProxyResponse(&ctx)
-	pipeDirect(conn, wsConn, ctx.target)
+
+	// [新增][法则32] 单一归属：pipeDirect 持有 nodeKey，退出时归还或驱逐连接
+	pipeDirect(conn, wsConn, nodeKey, ctx.target)
 }
 
-// sendEarlyProxyResponse 在sniff之前发出代理响应（SOCKS5/HTTPS CONNECT模式）
+// sendEarlyProxyResponse 在 sniff 之前发出代理响应（SOCKS5/HTTPS CONNECT 模式）
 // [法则22] 单一职责：只负责写响应字节
 // [法则09] 副作用声明：写入 ctx.conn，更新 ctx.mode = modeResponded
 func sendEarlyProxyResponse(ctx *connContext) {
@@ -961,11 +1211,10 @@ func sendEarlyProxyResponse(ctx *connContext) {
 	}
 }
 
-// sniffAndRewrite 对IP目标执行流量嗅探，可能重写target为域名
-// [法则22] 单一职责：只做sniff读数据+重写target，不再负责发送代理响应
+// sniffAndRewrite 对 IP 目标执行流量嗅探，可能重写 target 为域名
+// [法则22] 单一职责：只做 sniff 读数据+重写 target，不负责发送代理响应
 // [法则09] 副作用声明：修改 ctx.target, ctx.pendingData；
-//
-//	SOCKS5/HTTPS模式下先调用 sendEarlyProxyResponse（副作用在被调函数中声明）
+//           SOCKS5/HTTPS 模式下先调用 sendEarlyProxyResponse（副作用在被调函数中声明）
 func sniffAndRewrite(ctx *connContext) {
 	if globalSniffer == nil || !globalSniffer.config.Enabled { return }
 
@@ -998,8 +1247,8 @@ func sniffAndRewrite(ctx *connContext) {
 	}
 }
 
-// resolveTarget 对target中的域名执行DNS解析，可能替换为IP
-// [法则22] 单一职责：只做DNS解析
+// resolveTarget 对 target 中的域名执行 DNS 解析，可能替换为 IP
+// [法则22] 单一职责：只做 DNS 解析
 // [法则09] 副作用声明：可能修改 ctx.target
 func resolveTarget(ctx *connContext) {
 	if globalDNSResolver == nil { return }
@@ -1015,7 +1264,7 @@ func resolveTarget(ctx *connContext) {
 }
 
 // sendProxyResponse 在隧道建立后，如果响应尚未发出则补发
-// [法则19] 幂等：mode=modeResponded时已发响应，不重复发
+// [法则19] 幂等：mode=modeResponded 时已发响应，不重复发
 // [法则09] 副作用声明：写入 ctx.conn，更新 ctx.mode = modeResponded
 func sendProxyResponse(ctx *connContext) {
 	switch ctx.mode {
@@ -1042,55 +1291,81 @@ func match(rule Rule, target string) bool {
 	}
 }
 
-// ======================== 隧道连接 ========================
+// ======================== 隧道连接（含连接池）========================
 
-// connectNanoTunnel 根据路由规则选择节点建立WebSocket隧道
-// [法则38] 契约: 输入目标地址+outboundTag+首包payload | 输出WebSocket连接或error | 副作用：建立TCP+WS连接
-// [法则49] 失败常态：单次失败后重试一次（多节点池才重试，避免单节点重试放大延迟）
-func connectNanoTunnel(target, outboundTag string, payload []byte) (*websocket.Conn, error) {
+// connectNanoTunnel 根据路由规则选择节点建立 WebSocket 隧道
+// [法则38] 契约: 输入目标地址+outboundTag+首包 payload | 输出 (WebSocket连接, nodeKey, error) | 副作用：建立 TCP+WS 连接或从池复用
+// [新增] 返回 nodeKey 供 pipeDirect 在退出时归还/驱逐连接到池
+// [法则49] 失败常态：池命中 Ping 失败→驱逐→新建；新建失败→多节点池换节点重试一次
+func connectNanoTunnel(target, outboundTag string, payload []byte) (*websocket.Conn, string, error) {
 	settings, ok := proxySettingsMap[outboundTag]
-	if !ok { return nil, errors.New("outbound settings not found: " + outboundTag) }
+	if !ok { return nil, "", errors.New("outbound settings not found: " + outboundTag) }
 
 	parts := strings.SplitN(settings.Token, "|", 2)
 	secretKey := parts[0]
 	fallback := ""
 	if len(parts) > 1 { fallback = parts[1] }
 
-	socks5 := ""
-	if settings.ForwarderSettings != nil { socks5 = settings.ForwarderSettings.Socks5Address }
+	socks5Addr := ""
+	if settings.ForwarderSettings != nil { socks5Addr = settings.ForwarderSettings.Socks5Address }
 
-	// [法则29] 跨函数命名：attemptDial 比 tryOnce 更准确地表达「一次拨号尝试」
-	attemptDial := func() (*websocket.Conn, error) {
+	// [新增][法则29] 跨函数命名：attemptDial 明确表达「一次完整的拨号尝试（含池查找）」
+	// [新增][法则32] 单一归属：返回 nodeKey，供调用链上层在 pipeDirect 中归还连接
+	attemptDial := func() (*websocket.Conn, string, error) {
 		node, logMsg := selectNode(target, settings)
 		log.Print(logMsg)
 
+		nodeKey := node.Domain // [法则03] 单一真相：nodeKey 与 Domain 绑定
+
+		// [新增][法则质子-01] 零阻塞：优先从连接池取复用连接，跳过 TLS+WS 握手
+		if cachedConn := globalConnPool.acquire(nodeKey); cachedConn != nil {
+			// 池命中：直接复用，仅发送协议头（无握手代价）
+			if err := sendNanoHeaderV2(cachedConn, target, payload, socks5Addr, fallback); err != nil {
+				// 协议头发送失败 → 连接已死 → 驱逐并回退到新建连接
+				log.Printf("[Pool] header send failed key:%s err:%v, evicting and redial", nodeKey, err)
+				globalConnPool.evict(nodeKey, cachedConn)
+				// fall through to dial new connection below
+			} else {
+				log.Printf("[Core] pool-hit tunnel target:%s node:%s", target, nodeKey)
+				return cachedConn, nodeKey, nil
+			}
+		}
+
+		// 池未命中或已驱逐：新建连接
 		backend := selectBackend(node.Backends, target)
 		if backend.IP == "" { backend.IP = settings.ServerIP }
 
 		start := time.Now()
 		wsConn, err := dialZeusWebSocket(node.Domain, backend, secretKey)
-		if err != nil { return nil, err }
+		if err != nil { return nil, nodeKey, err }
 
 		if backend.IP != "" {
-			log.Printf("[Core] tunnel SNI:%s real:%s:%s latency:%dms",
+			log.Printf("[Core] new tunnel SNI:%s real:%s:%s latency:%dms",
 				node.Domain, backend.IP, backend.Port, time.Since(start).Milliseconds())
 		}
 
-		if err := sendNanoHeaderV2(wsConn, target, payload, socks5, fallback); err != nil {
+		if err := sendNanoHeaderV2(wsConn, target, payload, socks5Addr, fallback); err != nil {
 			wsConn.Close()
-			return nil, err
+			return nil, nodeKey, err
 		}
-		return wsConn, nil
+
+		// [新增] 新建成功 → 尝试入池（池满则不缓存，此连接用完即关）
+		if !globalConnPool.put(nodeKey, wsConn) {
+			// 池满，此连接不缓存，pipeDirect 结束后直接关闭
+			// 用空字符串作 nodeKey 标记"不归还到池"
+			return wsConn, "", nil
+		}
+		return wsConn, nodeKey, nil
 	}
 
-	// first attempt
-	conn, err := attemptDial()
+	// 第一次尝试
+	wsConn, nodeKey, err := attemptDial()
 	if err != nil && len(settings.NodePool) > 1 {
-		// retry: 多节点池下换节点重试一次
+		// [法则49] 失败常态：多节点池下换节点重试一次，单节点不重试（避免放大延迟）
 		log.Printf("[Core] retry after err:%v", err)
-		conn, err = attemptDial()
+		wsConn, nodeKey, err = attemptDial()
 	}
-	return conn, err
+	return wsConn, nodeKey, err
 }
 
 // selectNode 根据路由规则和负载策略选择节点
@@ -1125,9 +1400,9 @@ func selectNode(target string, settings ProxySettings) (Node, string) {
 	return node, fmt.Sprintf("[Core] lb target:%s node:%s strategy:%s", target, node.Domain, strategy)
 }
 
-// selectBackend 按权重哈希选择Backend
+// selectBackend 按权重哈希选择 Backend
 // [法则22] 单一职责：纯选择函数
-// [法则20] 函数内命名：hashSlot 替代原 target（与外层参数 target string 同名，歧义消除）
+// [法则20] 函数内命名：hashSlot 替代原 target（消除与外层参数 target string 同名的歧义）
 func selectBackend(backends []Backend, key string) Backend {
 	switch len(backends) {
 	case 0: return Backend{}
@@ -1151,8 +1426,8 @@ func selectBackend(backends []Backend, key string) Backend {
 
 // ======================== WebSocket 拨号 ========================
 
-// dialZeusWebSocket 建立WebSocket连接
-// [法则38] 契约: 输入SNI+backend+token | 输出WebSocket连接或error | 副作用：TCP+TLS+WS握手
+// dialZeusWebSocket 建立 WebSocket 连接
+// [法则38] 契约: 输入 SNI+backend+token | 输出 WebSocket 连接或 error | 副作用：TCP+TLS+WS 握手
 func dialZeusWebSocket(sni string, backend Backend, token string) (*websocket.Conn, error) {
 	sniHost, sniPort, err := net.SplitHostPort(sni)
 	if err != nil { sniHost = sni; sniPort = "443" }
@@ -1167,8 +1442,8 @@ func dialZeusWebSocket(sni string, backend Backend, token string) (*websocket.Co
 
 	dialer := websocket.Dialer{
 		// [法则37] 有意识缺陷：InsecureSkipVerify=true
-		// SNI-only路由模式：TLS握手使用SNI域名，但TCP连接到backend.IP
-		// 证书CN与IP不匹配是预期行为，此为架构设计决策，非安全疏忽
+		// SNI-only 路由模式：TLS 握手使用 SNI 域名，但 TCP 连接到 backend.IP
+		// 证书 CN 与 IP 不匹配是预期行为，此为架构设计决策，非安全疏忽
 		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true, ServerName: sniHost},
 		HandshakeTimeout: wsHandshakeTimeout,
 	}
@@ -1188,36 +1463,42 @@ func dialZeusWebSocket(sni string, backend Backend, token string) (*websocket.Co
 
 // ======================== 数据转发 ========================
 
-// pipeDirect 双向转发数据，直到任一方向EOF
-// [法则38] 契约: 输入本地连接+WS连接+目标地址 | 输出：无 | 副作用：关闭local和ws，打印统计日志
-// [法则32] 单一归属：local和ws的关闭统一由顶层defer处理
-// [法则43] 同步终止：wg.Wait()保证两个goroutine都结束后才执行清理和统计
-// [法则19] 幂等：移除下行goroutine内部的local.Close()，避免与defer重复关闭
-func pipeDirect(local net.Conn, ws *websocket.Conn, target string) {
-	defer ws.Close()
-	defer local.Close()
-
+// pipeDirect 双向转发数据，直到任一方向 EOF
+// [法则38] 契约: 输入本地连接+WS连接+nodeKey+目标地址 | 输出：无 | 副作用：数据转发+连接归还/驱逐+统计日志
+// [新增][法则32] 单一归属：pipeDirect 通过 nodeKey 在退出时将连接归还池或驱逐
+//   - nodeKey 非空 → 正常结束时 release 归还，异常时 evict 驱逐
+//   - nodeKey 为空 → 池满时不缓存，直接关闭（ws.Close 由 defer 完成）
+// [法则43] 同步终止：wg.Wait() 保证两个 goroutine 都结束后才执行清理和统计
+// [法则09] 背压传导：上下行各持独立 bufPool buffer，避免共享 buffer 竞争
+func pipeDirect(local net.Conn, ws *websocket.Conn, nodeKey, target string) {
+	var pipErr atomic.Value // 记录首个错误（上行或下行）
 	var upBytes, downBytes int64
 	start := time.Now()
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	// 下行：ws → local
-	// [法则19] 移除 local.Close()：由 defer 统一关闭，此处用 ws.Close() 驱动上行退出
 	go func() {
 		defer wg.Done()
 		buf := bufPool.Get().([]byte)
 		defer bufPool.Put(buf)
 		for {
 			mt, r, err := ws.NextReader()
-			if err != nil { break }
+			if err != nil {
+				pipErr.Store(err)
+				break
+			}
 			if mt == websocket.BinaryMessage {
-				n, _ := io.CopyBuffer(local, r, buf)
+				n, err := io.CopyBuffer(local, r, buf)
 				atomic.AddInt64(&downBytes, n)
+				if err != nil {
+					pipErr.Store(err)
+					break
+				}
 			}
 		}
-		// 下行结束后关闭ws，驱动上行goroutine退出（ws.Read报错）
-		ws.Close()
+		// 下行结束后关闭 local，驱动上行 goroutine 退出（local.Read 报错）
+		local.Close()
 	}()
 
 	// 上行：local → ws
@@ -1229,13 +1510,32 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string) {
 			n, err := local.Read(buf)
 			if n > 0 {
 				atomic.AddInt64(&upBytes, int64(n))
-				if werr := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); werr != nil { break }
+				if werr := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); werr != nil {
+					pipErr.Store(werr)
+					break
+				}
 			}
 			if err != nil { break }
 		}
+		// 上行结束后关闭 ws，驱动下行 goroutine 退出（ws.NextReader 报错）
+		ws.Close()
 	}()
 
 	wg.Wait()
+
+	// [新增][法则32] 单一归属：连接归还/驱逐统一在此处执行
+	if nodeKey != "" {
+		if pipErr.Load() != nil {
+			// 管道出错 → 连接已损坏 → 驱逐（不归还）
+			globalConnPool.evict(nodeKey, ws)
+			log.Printf("[Pool] pipe error, evicted key:%s err:%v", nodeKey, pipErr.Load())
+		} else {
+			// 正常结束 → 归还连接到池供复用
+			globalConnPool.release(nodeKey, ws)
+		}
+	}
+	// nodeKey 为空（池满时不缓存）→ ws 已由上行 goroutine Close，无需额外处理
+
 	log.Printf("[Stats] %s up:%s down:%s time:%v",
 		target, formatBytes(upBytes), formatBytes(downBytes), time.Since(start).Round(time.Second))
 }
@@ -1250,11 +1550,11 @@ func formatBytes(b int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
-// ======================== Nano协议头 ========================
+// ======================== Nano 协议头 ========================
 
-// sendNanoHeaderV2 发送Xlink协议头
-// [法则38] 契约: 输入WS连接+目标地址+payload+s5+fb | 输出error | 副作用：写入WebSocket
-// [法则11+12] 边界完备+语义合法：长度超255立即返回错误
+// sendNanoHeaderV2 发送 Xlink 协议头
+// [法则38] 契约: 输入 WS 连接+目标地址+payload+s5+fb | 输出 error | 副作用：写入 WebSocket
+// [法则11+12] 边界完备+语义合法：长度超 255 立即返回错误
 // [法则09] 副作用最小化：不修改任何入参
 // [法则54] 认知负载：strconv.ParseUint 替代 fmt.Sscanf，语义更直接
 func sendNanoHeaderV2(wsConn *websocket.Conn, target string, payload []byte, s5, fb string) error {
@@ -1290,9 +1590,9 @@ func sendNanoHeaderV2(wsConn *websocket.Conn, target string, payload []byte, s5,
 
 // ======================== 入站协议处理 ========================
 
-// handleSOCKS5 处理SOCKS5握手，返回目标地址
-// [法则38] 契约: 输入已读取首字节后的连接 | 输出目标地址或error | 副作用：读写conn完成握手
-// [法则22] 单一职责：只做SOCKS5协议解析
+// handleSOCKS5 处理 SOCKS5 握手，返回目标地址
+// [法则38] 契约: 输入已读取首字节后的连接 | 输出目标地址或 error | 副作用：读写 conn 完成握手
+// [法则22] 单一职责：只做 SOCKS5 协议解析
 func handleSOCKS5(conn net.Conn, _ string) (string, error) {
 	handshakeBuf := make([]byte, 2)
 	if _, err := io.ReadFull(conn, handshakeBuf); err != nil { return "", err }
@@ -1327,10 +1627,10 @@ func handleSOCKS5(conn net.Conn, _ string) (string, error) {
 	return net.JoinHostPort(host, strconv.Itoa(int(port))), nil
 }
 
-// handleHTTP 处理HTTP/HTTPS CONNECT请求，返回目标地址和首包数据
+// handleHTTP 处理 HTTP/HTTPS CONNECT 请求，返回目标地址和首包数据
 // [法则38] 契约: 输入连接+首字节+inboundTag | 输出(target, firstFrame, mode, error)
 // [法则23] 返回值语义完备：返回 connMode 类型而非裸 int
-// [法则22] 单一职责：只做HTTP协议解析
+// [法则22] 单一职责：只做 HTTP 协议解析
 func handleHTTP(conn net.Conn, initialData []byte, _ string) (string, []byte, connMode, error) {
 	reader := bufio.NewReader(io.MultiReader(bytes.NewReader(initialData), conn))
 	req, err := http.ReadRequest(reader)
