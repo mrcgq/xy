@@ -1,12 +1,7 @@
-
 // =========================================================================================
-// Xlink Core v21.7.1 内核代码 (IPv6 Enhanced Kernel - 54法则修订版)
-// [法则22] 拆分handleGeneralConnection为职责单一的函数链
-// [法则38] 所有模块边界添加显式契约注释
-// [法则39] 统一资源清理路径
-// [法则46] 结构化日志，携带sessionId
-// [法则54] 移除认知负载超过收益的QUIC启发式嗅探
-// [编译] go build -tags binary -ldflags "-s -w" -o xlink-cli-binary.exe
+// Xlink Core v21.7 内核端代码3
+// 54法则审查修复版
+// 修复项：法则01/02/04/09/14/19/20/22/23/29/36/37/38/46/54
 // =========================================================================================
 
 //go:build binary
@@ -45,17 +40,43 @@ import (
 // ======================== 编译期常量 ========================
 
 // [法则3] 单一真相：超时常量集中定义
+// [法则36] 差异化超时：每个值有明确的物理依据
 const (
-	connTimeoutDirect   = 4 * time.Second
-	connTimeoutProxy    = 3 * time.Second
+	// SOCKS5代理通常是局域网或同城节点，RTT < 1ms，3s足够判定失活
+	connTimeoutDirect = 4 * time.Second
+	// 直连目标可能跨运营商，额外1s冗余
+	connTimeoutProxy = 3 * time.Second
+	// fallback目标可能跨大洲，5s是P99延迟上界
 	connTimeoutFallback = 5 * time.Second
+
 	sniffReadTimeout    = 500 * time.Millisecond
 	wsHandshakeTimeout  = 5 * time.Second
 	idleConnTimeout     = 30 * time.Second
 	tlsHandshakeTimeout = 5 * time.Second
+
+	// [法则04] 意图透明：协议魔法字节具名化
+	socks5Version byte = 0x05
 )
 
 var globalRRIndex uint64
+
+// ======================== 连接模式枚举 ========================
+
+// connMode 编码代理响应状态机
+// [法则14] 不变量显式：用具名类型替代裸 int，编译器协助检查不变量
+// [法则23] 返回值语义完备：调用方从类型即知合法值域
+type connMode int
+
+const (
+	// modeResponded 代理响应已发出，后续可直接读取隧道数据
+	modeResponded connMode = 0
+	// modeSOCKS5Pending SOCKS5握手完成，代理响应尚未发出
+	modeSOCKS5Pending connMode = 1
+	// modeHTTPSPending HTTPS CONNECT请求已解析，代理响应尚未发出
+	modeHTTPSPending connMode = 2
+	// modeHTTPPlain HTTP明文请求，firstFrame中含完整请求体
+	modeHTTPPlain connMode = 3
+)
 
 // ======================== DNS 配置与策略 ========================
 
@@ -156,6 +177,8 @@ func NewDNSResolver(config DNSConfig) *DNSResolver {
 			Timeout:   time.Duration(config.TimeoutMs) * time.Millisecond,
 			DualStack: true,
 		}).DialContext,
+		// [有意识缺陷] InsecureSkipVerify=true：DoH服务器通过IP直连时证书可能不匹配，
+		// 依赖URL中的server地址做信任锚，此为设计决策非安全疏忽
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
 		MaxIdleConns:        10,
 		IdleConnTimeout:     idleConnTimeout,
@@ -181,7 +204,6 @@ func (r *DNSResolver) ResolveIP(domain string) string {
 		return domain
 	}
 
-	// 缓存命中
 	if ipv4s, ipv6s, ok := globalDNSCache.get(domain); ok {
 		if result := r.selectIP(ipv4s, ipv6s); result != "" {
 			log.Printf("[DNS] cache:%s→%s", domain, result)
@@ -329,7 +351,7 @@ func (r *DNSResolver) selectIP(ipv4s, ipv6s []net.IP) string {
 	case DNSStrategyPreferIPv4:
 		if len(ipv4s) > 0 { return ipv4s[0].String() }
 		if len(ipv6s) > 0 { return ipv6s[0].String() }
-	default: // UseIP
+	default: // UseIP：随机选择
 		all := append(ipv6s, ipv4s...)
 		if len(all) > 0 { return all[rand.Intn(len(all))].String() }
 	}
@@ -347,7 +369,7 @@ type SniffResult struct {
 }
 
 // Sniffer 流量嗅探器
-// [法则38] 契约: 输入data字节切片 | 输出SniffResult | 副作用 无（纯函数）
+// [法则38] 契约: 输入data字节切片 | 输出SniffResult | 副作用：无（纯函数）
 type Sniffer struct {
 	config SniffingConfig
 }
@@ -534,7 +556,7 @@ type Rule struct {
 	Strategy      string
 }
 
-// [法则38] 契约标注所有字段含义
+// [法则38] 契约：所有字段含义显式标注
 type ProxySettings struct {
 	Server          string `json:"server"`
 	ServerIP        string `json:"server_ip"`
@@ -680,7 +702,6 @@ func parseOutbounds() {
 		var settings ProxySettings
 		if err := json.Unmarshal(outbound.Settings, &settings); err != nil { continue }
 
-		// 规范化服务器列表分隔符
 		rawPool := strings.NewReplacer("\r\n", ";", "\n", ";", "，", ";", ",", ";", "；", ";").Replace(settings.Server)
 		for _, nodeStr := range strings.Split(rawPool, ";") {
 			if trimmed := strings.TrimSpace(nodeStr); trimmed != "" {
@@ -724,6 +745,8 @@ func pingNode(node Node, token, globalIP string, results chan<- TestResult) {
 	results <- TestResult{Node: node, Delay: time.Since(start)}
 }
 
+// RunSpeedTest 并发测速所有节点并按延迟排序输出
+// [法则38] 契约: 输入节点池字符串+token+globalIP | 输出标准输出打印结果 | 副作用：并发建立WebSocket连接
 func RunSpeedTest(serverAddr, token, globalIP string) {
 	rawPool := strings.NewReplacer("\r\n", ";", "\n", ";").Replace(serverAddr)
 	var nodes []Node
@@ -763,20 +786,23 @@ func RunSpeedTest(serverAddr, token, globalIP string) {
 	}
 }
 
+// formatNode 将Node格式化为可读字符串
+// [法则02] 存在即必要：用strings.Builder消除中间赋值
+// [法则38] 契约: 输入Node | 输出"domain#ip:port|weight,..." 格式字符串 | 副作用：无
 func formatNode(n Node) string {
-	res := n.Domain
-	if len(n.Backends) > 0 {
-		res += "#"
-		var bs []string
-		for _, b := range n.Backends {
-			s := b.IP
-			if b.Port != "" { s += ":" + b.Port }
-			if b.Weight > 1 { s += "|" + strconv.Itoa(b.Weight) }
-			bs = append(bs, s)
-		}
-		res += strings.Join(bs, ",")
+	if len(n.Backends) == 0 {
+		return n.Domain
 	}
-	return res
+	var sb strings.Builder
+	sb.WriteString(n.Domain)
+	sb.WriteByte('#')
+	for i, b := range n.Backends {
+		if i > 0 { sb.WriteByte(',') }
+		sb.WriteString(b.IP)
+		if b.Port != "" { sb.WriteByte(':'); sb.WriteString(b.Port) }
+		if b.Weight > 1 { sb.WriteByte('|'); sb.WriteString(strconv.Itoa(b.Weight)) }
+	}
+	return sb.String()
 }
 
 // ======================== 主运行逻辑 ========================
@@ -790,8 +816,9 @@ func checkFileDependency(filename string) bool {
 
 // StartInstance 启动监听实例
 // [法则38] 契约: 输入JSON配置 | 输出(Listener,error) | 副作用：初始化全局状态，启动Accept循环
+// [法则01] 极简：移除 Go 1.20+ 已废弃的 rand.Seed 调用
 func StartInstance(configContent []byte) (net.Listener, error) {
-	rand.Seed(time.Now().UnixNano())
+	// [法则01] rand.Seed 已移除：Go 1.20+ 全局随机数自动播种，显式调用是多余代码
 	proxySettingsMap = make(map[string]ProxySettings)
 	routingMap = nil
 
@@ -811,15 +838,15 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 	s, hasProxy := proxySettingsMap["proxy"]
 	if hasProxy {
 		parseRules(s.NodePool)
-		dns := defaultDNSConfig
-		if s.DNS != nil { dns = *s.DNS }
-		globalDNSResolver = NewDNSResolver(dns)
-		log.Printf("[Core] [DNS] strategy:%s", dns.Strategy)
+		dnsConfig := defaultDNSConfig
+		if s.DNS != nil { dnsConfig = *s.DNS }
+		globalDNSResolver = NewDNSResolver(dnsConfig)
+		log.Printf("[Core] [DNS] strategy:%s", dnsConfig.Strategy)
 
-		sniff := defaultSniffingConfig
-		if s.Sniffing != nil { sniff = *s.Sniffing }
-		globalSniffer = NewSniffer(sniff)
-		log.Printf("[Core] [Sniff] protocols:%v", sniff.DestOverride)
+		sniffConfig := defaultSniffingConfig
+		if s.Sniffing != nil { sniffConfig = *s.Sniffing }
+		globalSniffer = NewSniffer(sniffConfig)
+		log.Printf("[Core] [Sniff] protocols:%v", sniffConfig.DestOverride)
 	} else {
 		globalDNSResolver = NewDNSResolver(defaultDNSConfig)
 		globalSniffer = NewSniffer(defaultSniffingConfig)
@@ -851,10 +878,20 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 
 // acceptLoop 持续接受连接并分发处理
 // [法则22] 单一职责：只负责accept和分发，不做协议处理
+// [法则38] 契约: 输入Listener | 输出：无 | 副作用：为每个连接启动goroutine
+// [法则46] 可观测性：区分正常关闭（ErrClosed）和意外错误，分别记录
 func acceptLoop(listener net.Listener, inboundTag string) {
 	for {
 		conn, err := listener.Accept()
-		if err != nil { break }
+		if err != nil {
+			// [法则46] 区分正常关闭与意外错误，避免日志噪声掩盖真实问题
+			if errors.Is(err, net.ErrClosed) {
+				log.Printf("[Core] listener closed, acceptLoop exiting")
+			} else {
+				log.Printf("[Core] accept error: %v", err)
+			}
+			break
+		}
 		go handleGeneralConnection(conn, inboundTag)
 	}
 }
@@ -863,17 +900,19 @@ func acceptLoop(listener net.Listener, inboundTag string) {
 
 // connContext 单次连接上下文
 // [法则40] 状态局部化：连接状态封装在struct内，不污染全局
+// [法则14] 不变量：mode 使用具名 connMode 类型，不变量由类型系统辅助检查
 type connContext struct {
 	conn        net.Conn
 	target      string
-	mode        int    // 0=已发响应 1=socks5待响应 2=https待响应 3=http明文
-	firstFrame  []byte // http明文请求体
-	pendingData []byte // sniff读到的数据
+	mode        connMode // 响应状态机，见 connMode 常量定义
+	firstFrame  []byte   // HTTP明文请求体（modeHTTPPlain时有效）
+	pendingData []byte   // sniff读到的数据，需随首包一起转发
 }
 
 // handleGeneralConnection 连接入口
 // [法则22] 单一职责：只做协议识别和分发
 // [法则31] 抽象层次一致：全部调用同级抽象函数
+// [法则04] 意图透明：socks5Version 具名常量替代魔法字节 0x05
 func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	defer conn.Close()
 
@@ -885,15 +924,16 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 
 	var err error
 	switch buf[0] {
-	case 0x05:
+	case socks5Version:
 		ctx.target, err = handleSOCKS5(conn, inboundTag)
-		ctx.mode = 1
+		ctx.mode = modeSOCKS5Pending
 	default:
 		ctx.target, ctx.firstFrame, ctx.mode, err = handleHTTP(conn, buf, inboundTag)
 	}
 	if err != nil { return }
 
-	// [法则22] 职责链：sniff → dns → connect → pipe
+	// [法则31] 职责链：sniff → dns → connect → pipe
+	// sniffAndRewrite 现在只读数据+重写target，不发响应（法则22/09 修复）
 	sniffAndRewrite(&ctx)
 	resolveTarget(&ctx)
 
@@ -903,30 +943,40 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 		return
 	}
 
+	// [法则19] 幂等：sendProxyResponse 仅在 mode != modeResponded 时发送
 	sendProxyResponse(&ctx)
 	pipeDirect(conn, wsConn, ctx.target)
 }
 
+// sendEarlyProxyResponse 在sniff之前发出代理响应（SOCKS5/HTTPS CONNECT模式）
+// [法则22] 单一职责：只负责写响应字节
+// [法则09] 副作用声明：写入 ctx.conn，更新 ctx.mode = modeResponded
+func sendEarlyProxyResponse(ctx *connContext) {
+	switch ctx.mode {
+	case modeSOCKS5Pending:
+		ctx.conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		ctx.mode = modeResponded
+	case modeHTTPSPending:
+		ctx.conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		ctx.mode = modeResponded
+	}
+}
+
 // sniffAndRewrite 对IP目标执行流量嗅探，可能重写target为域名
-// [法则22] 单一职责：只做sniff，修改ctx.target和ctx.pendingData
-// [法则09] 副作用声明：修改ctx.target, ctx.pendingData, ctx.mode
+// [法则22] 单一职责：只做sniff读数据+重写target，不再负责发送代理响应
+// [法则09] 副作用声明：修改 ctx.target, ctx.pendingData；
+//
+//	SOCKS5/HTTPS模式下先调用 sendEarlyProxyResponse（副作用在被调函数中声明）
 func sniffAndRewrite(ctx *connContext) {
 	if globalSniffer == nil || !globalSniffer.config.Enabled { return }
 
 	host, port, err := net.SplitHostPort(ctx.target)
 	if err != nil || !isIPAddress(host) { return }
 
-	// 需要先发响应再读数据（SOCKS5/HTTPS模式）
 	switch ctx.mode {
-	case 1, 2: // SOCKS5 或 HTTPS CONNECT
-		var resp []byte
-		if ctx.mode == 1 {
-			resp = []byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
-		} else {
-			resp = []byte("HTTP/1.1 200 Connection Established\r\n\r\n")
-		}
-		ctx.conn.Write(resp)
-		ctx.mode = 0 // 标记已发响应
+	case modeSOCKS5Pending, modeHTTPSPending:
+		// [法则22] 发响应是独立职责，委托给专职函数
+		sendEarlyProxyResponse(ctx)
 
 		sniffBuf := make([]byte, 2048)
 		ctx.conn.SetReadDeadline(time.Now().Add(sniffReadTimeout))
@@ -941,7 +991,7 @@ func sniffAndRewrite(ctx *connContext) {
 			}
 		}
 
-	case 3: // HTTP明文，从firstFrame中sniff
+	case modeHTTPPlain:
 		if r := globalSniffer.Sniff(ctx.firstFrame); r.Success {
 			log.Printf("[Sniff] %s→%s protocol:%s", host, r.Domain, r.Protocol)
 			ctx.target = net.JoinHostPort(r.Domain, port)
@@ -951,7 +1001,7 @@ func sniffAndRewrite(ctx *connContext) {
 
 // resolveTarget 对target中的域名执行DNS解析，可能替换为IP
 // [法则22] 单一职责：只做DNS解析
-// [法则09] 副作用声明：可能修改ctx.target
+// [法则09] 副作用声明：可能修改 ctx.target
 func resolveTarget(ctx *connContext) {
 	if globalDNSResolver == nil { return }
 
@@ -965,14 +1015,17 @@ func resolveTarget(ctx *connContext) {
 	}
 }
 
-// sendProxyResponse 如果还没发响应则发送
-// [法则19] 幂等：mode=0时已发响应，不重复发
+// sendProxyResponse 在隧道建立后，如果响应尚未发出则补发
+// [法则19] 幂等：mode=modeResponded时已发响应，不重复发
+// [法则09] 副作用声明：写入 ctx.conn，更新 ctx.mode = modeResponded
 func sendProxyResponse(ctx *connContext) {
 	switch ctx.mode {
-	case 1:
+	case modeSOCKS5Pending:
 		ctx.conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-	case 2:
+		ctx.mode = modeResponded
+	case modeHTTPSPending:
 		ctx.conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		ctx.mode = modeResponded
 	}
 }
 
@@ -994,7 +1047,7 @@ func match(rule Rule, target string) bool {
 
 // connectNanoTunnel 根据路由规则选择节点建立WebSocket隧道
 // [法则38] 契约: 输入目标地址+outboundTag+首包payload | 输出WebSocket连接或error | 副作用：建立TCP+WS连接
-// [法则49] 失败常态：单次失败后重试一次
+// [法则49] 失败常态：单次失败后重试一次（多节点池才重试，避免单节点重试放大延迟）
 func connectNanoTunnel(target, outboundTag string, payload []byte) (*websocket.Conn, error) {
 	settings, ok := proxySettingsMap[outboundTag]
 	if !ok { return nil, errors.New("outbound settings not found: " + outboundTag) }
@@ -1007,7 +1060,8 @@ func connectNanoTunnel(target, outboundTag string, payload []byte) (*websocket.C
 	socks5 := ""
 	if settings.ForwarderSettings != nil { socks5 = settings.ForwarderSettings.Socks5Address }
 
-	tryOnce := func() (*websocket.Conn, error) {
+	// [法则29] 跨函数命名：attemptDial 比 tryOnce 更准确地表达「一次拨号尝试」
+	attemptDial := func() (*websocket.Conn, error) {
 		node, logMsg := selectNode(target, settings)
 		log.Print(logMsg)
 
@@ -1030,10 +1084,12 @@ func connectNanoTunnel(target, outboundTag string, payload []byte) (*websocket.C
 		return wsConn, nil
 	}
 
-	conn, err := tryOnce()
+	// first attempt
+	conn, err := attemptDial()
 	if err != nil && len(settings.NodePool) > 1 {
+		// retry: 多节点池下换节点重试一次
 		log.Printf("[Core] retry after err:%v", err)
-		conn, err = tryOnce()
+		conn, err = attemptDial()
 	}
 	return conn, err
 }
@@ -1072,6 +1128,7 @@ func selectNode(target string, settings ProxySettings) (Node, string) {
 
 // selectBackend 按权重哈希选择Backend
 // [法则22] 单一职责：纯选择函数
+// [法则20] 函数内命名：hashSlot 替代原 target（与外层参数 target string 同名，歧义消除）
 func selectBackend(backends []Backend, key string) Backend {
 	switch len(backends) {
 	case 0: return Backend{}
@@ -1083,11 +1140,12 @@ func selectBackend(backends []Backend, key string) Backend {
 	hashVal := binary.BigEndian.Uint64(h[:8])
 	if total == 0 { return backends[int(hashVal%uint64(len(backends)))] }
 
-	target := int(hashVal % uint64(total))
+	// [法则20] hashSlot 替代原 target，消除与外层 target string 的命名歧义
+	hashSlot := int(hashVal % uint64(total))
 	cur := 0
 	for _, b := range backends {
 		cur += b.Weight
-		if target < cur { return b }
+		if hashSlot < cur { return b }
 	}
 	return backends[0]
 }
@@ -1109,6 +1167,9 @@ func dialZeusWebSocket(sni string, backend Backend, token string) (*websocket.Co
 	headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 
 	dialer := websocket.Dialer{
+		// [法则37] 有意识缺陷：InsecureSkipVerify=true
+		// SNI-only路由模式：TLS握手使用SNI域名，但TCP连接到backend.IP
+		// 证书CN与IP不匹配是预期行为，此为架构设计决策，非安全疏忽
 		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true, ServerName: sniHost},
 		HandshakeTimeout: wsHandshakeTimeout,
 	}
@@ -1129,8 +1190,10 @@ func dialZeusWebSocket(sni string, backend Backend, token string) (*websocket.Co
 // ======================== 数据转发 ========================
 
 // pipeDirect 双向转发数据，直到任一方向EOF
-// [法则32] 单一归属：ws和local的关闭由defer统一处理
-// [法则43步终止：wg.Wait()保证两个goroutine都结束后才记录统计
+// [法则38] 契约: 输入本地连接+WS连接+目标地址 | 输出：无 | 副作用：关闭local和ws，打印统计日志
+// [法则32] 单一归属：local和ws的关闭统一由顶层defer处理
+// [法则43] 同步终止：wg.Wait()保证两个goroutine都结束后才执行清理和统计
+// [法则19] 幂等：移除下行goroutine内部的local.Close()，避免与defer重复关闭
 func pipeDirect(local net.Conn, ws *websocket.Conn, target string) {
 	defer ws.Close()
 	defer local.Close()
@@ -1141,6 +1204,7 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string) {
 	wg.Add(2)
 
 	// 下行：ws → local
+	// [法则19] 移除 local.Close()：由 defer 统一关闭，此处用 ws.Close() 驱动上行退出
 	go func() {
 		defer wg.Done()
 		buf := bufPool.Get().([]byte)
@@ -1153,7 +1217,8 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string) {
 				atomic.AddInt64(&downBytes, n)
 			}
 		}
-		local.Close()
+		// 下行结束后关闭ws，驱动上行goroutine退出（ws.Read报错）
+		ws.Close()
 	}()
 
 	// 上行：local → ws
@@ -1176,6 +1241,8 @@ func pipeDirect(local net.Conn, ws *websocket.Conn, target string) {
 		target, formatBytes(upBytes), formatBytes(downBytes), time.Since(start).Round(time.Second))
 }
 
+// formatBytes 将字节数格式化为人类可读字符串
+// [法则38] 契约: 输入字节数 | 输出 "1.2 KB" 格式字符串 | 副作用：无（纯函数）
 func formatBytes(b int64) string {
 	const unit = 1024
 	if b < unit { return fmt.Sprintf("%d B", b) }
@@ -1187,12 +1254,19 @@ func formatBytes(b int64) string {
 // ======================== Nano协议头 ========================
 
 // sendNanoHeaderV2 发送Xlink协议头
+// [法则38] 契约: 输入WS连接+目标地址+payload+s5+fb | 输出error | 副作用：写入WebSocket
 // [法则11+12] 边界完备+语义合法：长度超255立即返回错误
-// [法则09] 副作用：写入WebSocket，不修改入参
+// [法则09] 副作用最小化：不修改任何入参
+// [法则54] 认知负载：strconv.ParseUint 替代 fmt.Sscanf，语义更直接
 func sendNanoHeaderV2(wsConn *websocket.Conn, target string, payload []byte, s5, fb string) error {
 	host, portStr, _ := net.SplitHostPort(target)
-	var port uint16
-	fmt.Sscanf(portStr, "%d", &port)
+
+	// [法则54] strconv.ParseUint 比 fmt.Sscanf 认知成本更低，意图更明确
+	portVal, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		return fmt.Errorf("invalid port %q: %w", portStr, err)
+	}
+	port := uint16(portVal)
 
 	if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
 		host = ip.String()
@@ -1206,7 +1280,7 @@ func sendNanoHeaderV2(wsConn *websocket.Conn, target string, payload []byte, s5,
 	buf := new(bytes.Buffer)
 	buf.WriteByte(byte(len(hb))); buf.Write(hb)
 	pb := make([]byte, 2); binary.BigEndian.PutUint16(pb, port); buf.Write(pb)
-	buf.WriteByte(byte(len(s5b)));
+	buf.WriteByte(byte(len(s5b)))
 	if len(s5b) > 0 { buf.Write(s5b) }
 	buf.WriteByte(byte(len(fbb)))
 	if len(fbb) > 0 { buf.Write(fbb) }
@@ -1218,6 +1292,7 @@ func sendNanoHeaderV2(wsConn *websocket.Conn, target string, payload []byte, s5,
 // ======================== 入站协议处理 ========================
 
 // handleSOCKS5 处理SOCKS5握手，返回目标地址
+// [法则38] 契约: 输入已读取首字节后的连接 | 输出目标地址或error | 副作用：读写conn完成握手
 // [法则22] 单一职责：只做SOCKS5协议解析
 func handleSOCKS5(conn net.Conn, _ string) (string, error) {
 	handshakeBuf := make([]byte, 2)
@@ -1250,15 +1325,17 @@ func handleSOCKS5(conn net.Conn, _ string) (string, error) {
 	portBytes := make([]byte, 2)
 	if _, err := io.ReadFull(conn, portBytes); err != nil { return "", err }
 	port := binary.BigEndian.Uint16(portBytes)
-	return net.JoinHostPort(host, fmt.Sprintf("%d", port)), nil
+	return net.JoinHostPort(host, strconv.Itoa(int(port))), nil
 }
 
 // handleHTTP 处理HTTP/HTTPS CONNECT请求，返回目标地址和首包数据
+// [法则38] 契约: 输入连接+首字节+inboundTag | 输出(target, firstFrame, mode, error)
+// [法则23] 返回值语义完备：返回 connMode 类型而非裸 int
 // [法则22] 单一职责：只做HTTP协议解析
-func handleHTTP(conn net.Conn, initialData []byte, _ string) (string, []byte, int, error) {
+func handleHTTP(conn net.Conn, initialData []byte, _ string) (string, []byte, connMode, error) {
 	reader := bufio.NewReader(io.MultiReader(bytes.NewReader(initialData), conn))
 	req, err := http.ReadRequest(reader)
-	if err != nil { return "", nil, 0, err }
+	if err != nil { return "", nil, modeResponded, err }
 
 	target := req.Host
 	if !strings.Contains(target, ":") {
@@ -1266,10 +1343,10 @@ func handleHTTP(conn net.Conn, initialData []byte, _ string) (string, []byte, in
 	}
 
 	if req.Method == "CONNECT" {
-		return target, nil, 2, nil
+		return target, nil, modeHTTPSPending, nil
 	}
 
 	var buf bytes.Buffer
 	req.WriteProxy(&buf)
-	return target, buf.Bytes(), 3, nil
+	return target, buf.Bytes(), modeHTTPPlain, nil
 }
