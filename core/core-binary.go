@@ -1,3 +1,4 @@
+
 //go:build binary
 // +build binary
 
@@ -688,7 +689,10 @@ func parseNode(nodeStr string) Node {
 	var n Node
 	parts := strings.SplitN(nodeStr, "#", 2)
 	n.Domain = strings.TrimSpace(parts[0])
-	if len(parts) != 2 || parts[1] == "" {
+	if len(parts) != 2 || strings.TrimSpace(parts[1]) == "" {
+		// 没有 # 分隔符，或 # 后为空：域名本身作为唯一 Backend
+		// 端口留空，由 dialZeusWebSocket 从 SNI 端口继承（默认443）
+		n.Backends = append(n.Backends, Backend{IP: n.Domain, Port: "", Weight: 1})
 		return n
 	}
 
@@ -802,8 +806,15 @@ func parseOutbounds() {
 			continue
 		}
 
-		rawPool := strings.NewReplacer("\r\n", ";", "\n", ";", "，", ";", ",", ";", "；", ";").Replace(settings.Server)
-		for _, nodeStr := range strings.Split(rawPool, ";") {
+		// 统一所有分隔符为换行符，再按行切分
+		// 客户端通过 EscapeJson 将 \n 转义写入JSON，Go解析JSON后还原为真正换行符
+		rawPool := strings.NewReplacer(
+			"\r\n", "\n",
+			";", "\n",
+			"；", "\n",
+			"，", "\n",
+		).Replace(settings.Server)
+		for _, nodeStr := range strings.Split(rawPool, "\n") {
 			if trimmed := strings.TrimSpace(nodeStr); trimmed != "" {
 				settings.NodePool = append(settings.NodePool, parseNode(trimmed))
 			}
